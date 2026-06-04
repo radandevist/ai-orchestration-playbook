@@ -2,6 +2,10 @@
 
 All notable changes to the AI Orchestration Playbook are recorded here. This is a **living document** — it is updated from real use, as sessions expose new failure modes and better patterns. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.1] - 2026-06-04 — README install + how-to-use guide
+
+- Expanded `README.md` with concrete installation commands (per-agent `git clone` + the exact global-instruction reference line), a project-onboarding recipe (adapter download + AGENTS.md pointer), and a **"How to use it"** guide: the seven-phase run shape, the three gates where the agent pauses for the human (decision-gate, merge authorization, outward-facing actions), what the human can rely on, and how to feed improvements back into the playbook/adapters.
+
 ## [0.1.0] - 2026-06-04 — Initial playbook
 
 Initial extraction of the orchestration working-style, distilled from the 2026-05-30/31 PublyApp session.
