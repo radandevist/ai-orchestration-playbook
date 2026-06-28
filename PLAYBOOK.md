@@ -29,7 +29,7 @@ These hold on every run, for every agent. They override speed, convenience, and 
 3. **Never merge without explicit, per-request human authorization.** A human says "merge X" each time. Prior approval of one merge never implies the next.
    *Why:* merging is the one irreversible, outward-facing step; it's the human's call, every time.
 
-4. **The review loop is mandatory before integration.** Every executor result gets an independent review pass (ideally cross-model) before it's integrated. Feed findings back until clean.
+4. **The review loop is mandatory before integration.** Every executor result gets an independent review pass (ideally cross-model) before it's integrated. Feed findings back until clean. Reviews must be rigorous: cover the full requirements coverage matrix plus affected-risk analysis — tests, performance, security, robustness, completeness, design patterns, code reuse (DRY), code elegance, and better-approach pressure while sticking to locked decisions/specs/plans.
    *Why:* an executor checking its own work is not a second opinion; the review loop is what catches the plausible-but-wrong result. Skipping it is the most expensive shortcut there is.
 
 5. **Effort ceiling — default high; xhigh requires ledgered escalation.** Cap executor/review effort at `high` by default. `xhigh` is allowed only with a ledgered escalation reason: final integration review, security/auth change, high-risk billing/data operation, architecture dispute, or pre-merge gate. Every xhigh use must be recorded in the run preflight ledger.
@@ -37,6 +37,9 @@ These hold on every run, for every agent. They override speed, convenience, and 
 
 6. **Persist + link.** Squash bodies are written to the project `dump_dir` automatically; every PR carries a linked tracking issue (sub-issue of the relevant epic where one exists).
    *Why:* the issue tree is how the human tracks work; an unlinked PR or a lost squash body leaves the record incomplete.
+
+7. **Subagents do not write durable notes directly.** Delegated subagents are vault-read-only by default. The orchestrator owns all durable documentation, session notes, logs, and knowledge-base writes. Subagents surface findings, corrections, and discoveries in their return payload — the orchestrator persists them. Emergency continuity handoffs are the only exception: a subagent may write a minimal handoff record before context/process loss, under a designated handoff directory.
+   *Why:* multiple subagents writing independent notes fragments the record, duplicates effort, and creates drift. One orchestrator writing the coherent narrative prevents this.
 
 7. **Dispatch only from a clean, named checkpoint.** Before each write-wave, the source branch/worktree state must be reproducible: committed, or explicitly stashed and described.
    *Why:* an uncommitted parent tree makes later waves impossible to separate cleanly, complicates rescue, and turns review/revert into guesswork.
@@ -107,18 +110,18 @@ A dispatch brief must be **self-contained**: an executor with no prior context s
 **Skeleton (required elements):**
 
 1. **Header** — execution mode + effort. Effort ≤ `high` by default; `xhigh` requires a ledgered escalation reason (see §1.5). *(Resolve executor + effort from adapter `executor`.)*
-2. **Checkpoint state** — the brief states the exact starting checkpoint (branch/head commit, or explicit stash/WIP note) so the executor is writing from a named baseline.
-3. **Absolute-path discipline** — every version-control command uses an **absolute** repo/worktree path, never a bare relative path.
-   *Why:* a stuck or surprising working directory silently misroutes commands (e.g. writes landing in the wrong tree, or a `--body-file` reading from nowhere). Absolute paths are immune.
-4. **Worktree setup** — create/locate the isolated worktree at adapter `worktree_root`.
-5. **Required reading** — the exact files the executor must read before acting (so it follows existing patterns instead of inventing).
-6. **The work** — the concrete change, scoped to file-disjoint targets.
-7. **Verification** — the project's **setup step first** (adapter `setup_cmd`), then the normal targeted gates (`build_cmd` / `test_cmd` / `lint_cmd`), and the adapter's **full acceptance gate** (`acceptance_cmd`) whenever the change is broad, mechanical, generated, or rebased. State expected outcomes.
-8. **Guard path** — if the repo relies on hooks, CI checks, or soft gates, the brief names the **actual enforcement path** from the adapter (`push_guard`), not a guessed one (for example: active `core.hooksPath`, required workflow, or "soft gate only").
-9. **Commit + PR** — a **pre-written commit message and PR body** (don't make the executor compose them), and the explicit `Refs #NNN` vs `Closes #NNN` choice.
-10. **Continuity plan** — if quota/rate-limit or session-loss is plausible, include the adapter's fallback/model ladder and whether the run must be durable. When multiple viable model/provider families are available, the orchestrator should pick from that ladder automatically rather than requiring repeated human routing, and should spread heavy execution/review load across the available families when practical. Use task fit and adapter policy as tiebreakers; escalate to the human only when a specific named provider/model is truly required or the available routes are ambiguous/unusable.
-11. **STOP-and-report escape hatches** — the specific conditions under which the executor must halt and report rather than guess (non-additive conflict, unexpected build error, scope surprise).
-12. **Constraints block** — never push/commit the default branch; never merge; `--force-with-lease` only (never plain `--force`); `--no-verify` only on a feature-branch force-push; effort ceiling.
+2. **Context sourcing** — the orchestrator discovers vault, playbook, adapter, and skills ONCE, then passes distilled context to each subagent. Subagents do not re-run proactive loading.
+3. **Checkpoint state** — the brief states the exact starting checkpoint (branch/head commit, or explicit stash/WIP note) so the executor is writing from a named baseline.
+4. **Absolute-path discipline** — every version-control command uses an **absolute** repo/worktree path, never a bare relative path.
+5. **Worktree setup** — create/locate the isolated worktree at adapter `worktree_root`.
+6. **Required reading** — the exact files the executor must read before acting (so it follows existing patterns instead of inventing).
+7. **The work** — the concrete change, scoped to file-disjoint targets.
+8. **Verification** — the project's **setup step first** (adapter `setup_cmd`), then the normal targeted gates (`build_cmd` / `test_cmd` / `lint_cmd`), and the adapter's **full acceptance gate** (`acceptance_cmd`) whenever the change is broad, mechanical, generated, or rebased. State expected outcomes.
+9. **Guard path** — if the repo relies on hooks, CI checks, or soft gates, the brief names the **actual enforcement path** from the adapter (`push_guard`), not a guessed one (for example: active `core.hooksPath`, required workflow, or "soft gate only").
+10. **Commit + PR** — a **pre-written commit message and PR body** (don't make the executor compose them), and the explicit `Refs #NNN` vs `Closes #NNN` choice.
+11. **Continuity plan** — if quota/rate-limit or session-loss is plausible, include the adapter's fallback/model ladder and whether the run must be durable. When multiple viable model/provider families are available, the orchestrator should pick from that ladder automatically rather than requiring repeated human routing, and should spread heavy execution/review load across the available families when practical. Use task fit and adapter policy as tiebreakers; escalate to the human only when a specific named provider/model is truly required or the available routes are ambiguous/unusable.
+12. **STOP-and-report escape hatches** — the specific conditions under which the executor must halt and report rather than guess (non-additive conflict, unexpected build error, scope surprise).
+13. **Constraints block** — never push/commit the default branch; never merge; `--force-with-lease` only (never plain `--force`); `--no-verify` only on a feature-branch force-push; effort ceiling.
 
 *Example (PublyApp/.NET) — a single-PR brief, abbreviated:*
 
