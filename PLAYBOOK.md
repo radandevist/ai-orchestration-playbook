@@ -233,7 +233,8 @@ decision: dispatch|degraded|stop
 
 **Rule:** No dispatch until a valid row exists with `decision: dispatch`. If any mandatory field is unknown, safety/scope checks fail, or required items have no declared failure_action, the decision defaults to `stop` — not optimism. The concrete path (`~/.hermes/...` etc.) is specified by the agent's adapter or global config.
 
-### Two enforcement paths
+### Two paths
 
-1. **LLM-orchestrator path** (interactive dispatch): the orchestrator writes the rich row (risk, routes, required[], token_tools) from its own reasoning before dispatching subagents. Enforced by the brief contract (§3) and the playbook's own rules.
-2. **Mechanical dispatch path** (autonomous/kanban workers): a pre-spawn helper writes a minimal mechanical row (available fields only). The `required[]` and `token_tools.active` fields are the orchestrator's responsibility. Both must be present before the row's `decision` is `dispatch`.
+1. **LLM-orchestrator path** (interactive dispatch): the orchestrator writes the rich row (risk, routes, required[], token_tools) from its own reasoning before dispatching subagents. This is a true gate — `decision: stop` blocks dispatch. Enforced by the brief contract (§3) and the orchestrator's own discipline.
+
+2. **Mechanical dispatch path** (autonomous/kanban workers): a pre-spawn helper writes a minimal observational row with `decision: log-only`. The mechanical path cannot compute `required[]`, `token_tools.active`, or `task_risk` — those fields are the LLM orchestrator's responsibility. This path is a **log**, not a gate. The gate for autonomous work lives upstream: pre-spawn guards, profile concurrency caps, and stale-timeout detection.
