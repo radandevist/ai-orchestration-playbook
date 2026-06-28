@@ -178,3 +178,62 @@ Every repo supplies `<repo>/.ai/orchestration-adapter.md` as **fielded descripti
 | `additive_merge_files` | `.oxlintrc.json`, `.editorconfig`, `AGENTS.md`, `packages/lint-ts/src/index.js`, `docs/guides/lint-rules.md` |
 | `dump_dir` | `.dump/` |
 | `issue_hierarchy` | epics (e.g. lint framework, arch guards, handler contract) + native sub-issues via `gh api --method POST repos/<owner>/<repo>/issues/<PARENT>/sub_issues -F sub_issue_id=<childDbId>` |
+
+---
+
+## §5 — Token discipline
+
+Portable token-saving tactics, independent of which agent loads them. Each tactic states its trigger, enforcement point, and per-run evidence requirement.
+
+### 5.1 Model tiering by task value
+Decomposition, planning, spec review, and routine dispatch use fast/cheap models. Reserve expensive models (xhigh, Opus) for final integration review, high-risk/security/auth changes, architectural disputes, and pre-merge gates only. Every xhigh use requires a ledgered escalation reason (see §6).
+
+### 5.2 Targeted verification
+Per-task inner loops use focused test runs (targeted files, --last-failed, smoke checks). The full acceptance gate runs once after rebase (rebase can invalidate per-task results). These are sequential gates, not alternatives. Neither skips the other.
+
+### 5.3 Milestone batching
+Batch low-risk edits into a milestone before running verification, rather than running the full gate after every sub-task.
+
+### 5.4 Installed tooling
+| Tool | What it does | Usage |
+|------|-------------|-------|
+| RTK | Compresses noisy shell output (test logs, git status, build traces) before it enters context | Prefix command: `rtk git ...`, `rtk test ...`, `rtk grep ...` |
+| CodeGraph | Queries a code graph index — skip whole-file reads in large repos | `codegraph explore "question"` before grep; build index with `codegraph init` |
+| Context-Mode | Routes heavy tool output through a sandbox, returns only the summary | `ctx_batch_execute`, `ctx_execute_file`, `ctx_search` |
+| Caveman | Terse prose (note: benchmarks show +7% tokens, +3% cost) | Dormant — do not invoke |
+| Ponytail | 7-rung lazy-senior-dev ladder before writing code (-54% LOC, -22% tokens) | Active on all agents. Levels: lite/full/ultra/off |
+
+Tools report three states: `missing` (not installed), `available` (installed, ready), `active` (used this run). Only `active` counts toward token optimization in the preflight ledger.
+
+### 5.5 Context hygiene
+- Keep system/project files (CLAUDE.md, AGENTS.md) under 1KB each. Invariants only.
+- Use surgical file context — reference specific files and functions, not full repos.
+- Start fresh (/clear, /new) between unrelated tasks. Long sessions compound costs exponentially.
+- Disconnect unused MCP servers — each adds thousands of tokens per message in tool definitions.
+
+## §6 — Preflight dispatch ledger
+
+Before dispatching any executor or subagent, append one JSONL preflight row to the run ledger. The ledger is the executable dispatch gate that unifies route choice, quota, risk, required checks, token-tool evidence, bypass safety, and source-of-truth conflict detection.
+
+**Format:** Append-only JSONL at `<orchestration_home>/orchestration/ledger/YYYY-MM-DD.jsonl`. One row per dispatch. Created before any subagent is dispatched.
+
+**Schema (required fields — unknown = stop):**
+
+```
+run_id, timestamp
+task_risk: {level: low|medium|high|critical, reasons: []}
+scope: {repo, worktree, branch, dirty_state}
+routes: {implementer: {provider, model, quota_signal}, reviewer: {provider, model, quota_signal}, fallbacks: []}
+required: [{name, check, status: pass|fail|unknown, failure_action: stop|degraded|ask}]
+token_tools: {rtk, codegraph, context-mode, ponytail: active|available|missing}
+bypass: {codex_bypass: bool, claude_bypass: bool, invariant_asserted: bool}
+verification: {tier: targeted|milestone|full}
+decision: dispatch|degraded|stop
+```
+
+**Rule:** No dispatch until a valid row exists with `decision: dispatch`. If any mandatory field is unknown, safety/scope checks fail, or required items have no declared failure_action, the decision defaults to `stop` — not optimism. The concrete path (`~/.hermes/...` etc.) is specified by the agent's adapter or global config.
+
+### Two enforcement paths
+
+1. **LLM-orchestrator path** (interactive dispatch): the orchestrator writes the rich row (risk, routes, required[], token_tools) from its own reasoning before dispatching subagents. Enforced by the brief contract (§3) and the playbook's own rules.
+2. **Mechanical dispatch path** (autonomous/kanban workers): a pre-spawn helper writes a minimal mechanical row (available fields only). The `required[]` and `token_tools.active` fields are the orchestrator's responsibility. Both must be present before the row's `decision` is `dispatch`.
