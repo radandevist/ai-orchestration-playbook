@@ -8,6 +8,8 @@
 
 **Who reads it.** Any orchestrating agent — Claude, Hermes, or a future agent. The document is agent-neutral. Agent-specific quirks belong in that agent's own global instructions, never here.
 
+**Proactive usage rule.** An orchestrating agent should load and follow this playbook automatically when multi-step software work is detected, not wait for the human to ask. It is up to the orchestrator to judge applicability: read-only advisory, trivial one-step edits, or pure planning without execution do not need the full playbook. In ambiguous cases, ask rather than skip.
+
 **How to use it.** Before starting an orchestration run in a repository, **read that repo's `.ai/orchestration-adapter.md`** (§4). It supplies the concrete commands, branch name, worktree convention, and known failure modes that the generic principles below resolve against. If the adapter is missing, that's your first STOP — onboard the repo (see the project's README install steps) before orchestrating.
 
 **On the examples.** Worked examples are tagged *"Example (PublyApp/.NET):"*. They are **illustration, not law** — a sample from the project this playbook was first distilled from. On a different stack, read the principle and the example's *shape*, then resolve the specifics from your adapter.
@@ -30,7 +32,7 @@ These hold on every run, for every agent. They override speed, convenience, and 
 4. **The review loop is mandatory before integration.** Every executor result gets an independent review pass (ideally cross-model) before it's integrated. Feed findings back until clean.
    *Why:* an executor checking its own work is not a second opinion; the review loop is what catches the plausible-but-wrong result. Skipping it is the most expensive shortcut there is.
 
-5. **Effort ceiling = high; never xhigh.** Cap executor/review effort at `high`. `xhigh` is banned.
+5. **Effort ceiling — default high; xhigh requires ledgered escalation.** Cap executor/review effort at `high` by default. `xhigh` is allowed only with a ledgered escalation reason: final integration review, security/auth change, high-risk billing/data operation, architecture dispute, or pre-merge gate. Every xhigh use must be recorded in the run preflight ledger.
    *Why:* a deliberate cost/quality ceiling set by the human; `high` is the most capable tier in scope.
 
 6. **Persist + link.** Squash bodies are written to the project `dump_dir` automatically; every PR carries a linked tracking issue (sub-issue of the relevant epic where one exists).
@@ -104,7 +106,7 @@ A dispatch brief must be **self-contained**: an executor with no prior context s
 
 **Skeleton (required elements):**
 
-1. **Header** — execution mode + effort. Effort ≤ `high` (never `xhigh`; §1.5). *(Resolve executor + effort from adapter `executor`.)*
+1. **Header** — execution mode + effort. Effort ≤ `high` by default; `xhigh` requires a ledgered escalation reason (see §1.5). *(Resolve executor + effort from adapter `executor`.)*
 2. **Checkpoint state** — the brief states the exact starting checkpoint (branch/head commit, or explicit stash/WIP note) so the executor is writing from a named baseline.
 3. **Absolute-path discipline** — every version-control command uses an **absolute** repo/worktree path, never a bare relative path.
    *Why:* a stuck or surprising working directory silently misroutes commands (e.g. writes landing in the wrong tree, or a `--body-file` reading from nowhere). Absolute paths are immune.
@@ -114,7 +116,7 @@ A dispatch brief must be **self-contained**: an executor with no prior context s
 7. **Verification** — the project's **setup step first** (adapter `setup_cmd`), then the normal targeted gates (`build_cmd` / `test_cmd` / `lint_cmd`), and the adapter's **full acceptance gate** (`acceptance_cmd`) whenever the change is broad, mechanical, generated, or rebased. State expected outcomes.
 8. **Guard path** — if the repo relies on hooks, CI checks, or soft gates, the brief names the **actual enforcement path** from the adapter (`push_guard`), not a guessed one (for example: active `core.hooksPath`, required workflow, or "soft gate only").
 9. **Commit + PR** — a **pre-written commit message and PR body** (don't make the executor compose them), and the explicit `Refs #NNN` vs `Closes #NNN` choice.
-10. **Continuity plan** — if quota/rate-limit or session-loss is plausible, include the adapter's fallback/model ladder and whether the run must be durable.
+10. **Continuity plan** — if quota/rate-limit or session-loss is plausible, include the adapter's fallback/model ladder and whether the run must be durable. When multiple viable model/provider families are available, the orchestrator should pick from that ladder automatically rather than requiring repeated human routing, and should spread heavy execution/review load across the available families when practical. Use task fit and adapter policy as tiebreakers; escalate to the human only when a specific named provider/model is truly required or the available routes are ambiguous/unusable.
 11. **STOP-and-report escape hatches** — the specific conditions under which the executor must halt and report rather than guess (non-additive conflict, unexpected build error, scope surprise).
 12. **Constraints block** — never push/commit the default branch; never merge; `--force-with-lease` only (never plain `--force`); `--no-verify` only on a feature-branch force-push; effort ceiling.
 
@@ -147,7 +149,7 @@ Every repo supplies `<repo>/.ai/orchestration-adapter.md` as **fielded descripti
 | `worktree_root` | Path convention for isolated worktrees (e.g. `.claude/worktrees/<short-name>`). |
 | `host_parallelism` | Safe concurrency ceiling / batching rule for this host and repo (especially when builds/tests are heavy). |
 | `executor` | Which executor to dispatch + its default effort (≤ `high`). |
-| `model_ladder` | Preferred fallback order when the primary executor/model rate-limits or hits quota. |
+| `model_ladder` | Preferred fallback order when the primary executor/model rate-limits or hits quota, including any approved cross-family alternates so the orchestrator can route automatically without repeatedly asking the human. |
 | `push_guard` | The real enforcement path for push/merge policy (active hook path, CI gate, soft gate, or `none`). |
 | `known_quirks` | **Highest-value field.** Hard-won host/tooling failure modes + their fixes. |
 | `additive_merge_files` | Files whose merge conflicts are resolved *additively* (keep both sides); anything else → STOP. |
