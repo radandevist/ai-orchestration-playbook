@@ -29,8 +29,8 @@ These hold on every run, for every agent. They override speed, convenience, and 
 3. **Never merge without explicit, per-request human authorization.** A human says "merge X" each time. Prior approval of one merge never implies the next.
    *Why:* merging is the one irreversible, outward-facing step; it's the human's call, every time.
 
-4. **The review loop is mandatory before integration.** Every executor result gets an independent review pass (ideally cross-model) before it's integrated. Feed findings back until clean. Reviews must be rigorous: cover the full requirements coverage matrix plus affected-risk analysis — tests, performance, security, robustness, completeness, design patterns, code reuse (DRY), code elegance, and better-approach pressure while sticking to locked decisions/specs/plans.
-   *Why:* an executor checking its own work is not a second opinion; the review loop is what catches the plausible-but-wrong result. Skipping it is the most expensive shortcut there is.
+4. **The review loop is mandatory before integration, and the reviewer must be a different model family than the implementer.** Every executor result gets an independent review pass before it's integrated. The reviewer runs on a different provider/model family than produced the result (Codex implements → Claude reviews, and vice versa) — never review Codex output with Codex. Feed findings back until clean. Reviews must be rigorous: cover the full requirements coverage matrix plus affected-risk analysis — tests, performance, security, robustness, completeness, design patterns, code reuse (DRY), code elegance, and better-approach pressure while sticking to locked decisions/specs/plans.
+   *Why:* an executor checking its own work is not a second opinion; cross-family review is what catches the plausible-but-wrong result. Same-family review also doubles that family's token spend on one task — the review re-ingests the full diff and coverage matrix on the same context window. Routing the review to the other family both sharpens the check and halves the per-family input cost.
 
 5. **Effort ceiling — default high; xhigh requires ledgered escalation.** Cap executor/review effort at `high` by default. `xhigh` is allowed only with a ledgered escalation reason: final integration review, security/auth change, high-risk billing/data operation, architecture dispute, or pre-merge gate. Every xhigh use must be recorded in the run preflight ledger.
    *Why:* a deliberate cost/quality ceiling set by the human; `high` is the most capable tier in scope.
@@ -188,8 +188,10 @@ Every repo supplies `<repo>/.ai/orchestration-adapter.md` as **fielded descripti
 
 Portable token-saving tactics, independent of which agent loads them. Each tactic states its trigger, enforcement point, and per-run evidence requirement.
 
+**Cost reality — optimize input, not reasoning.** On a real run, ~99% of an executor's token spend is **input/context** (briefs, injected instruction files, required-reading, re-ingested diffs); output and reasoning tokens are typically <1% combined. Effort tiering and the xhigh ceiling (§5.1, §1.5) cap that <1% — necessary for quality control, but they do **not** move the bill. Token savings come from cutting input volume: instruction-file size (§5.5), cross-family review routing (§5.6), brief distillation (§3.2), and not re-shipping context on retries.
+
 ### 5.1 Model tiering by task value
-Decomposition, planning, spec review, and routine dispatch use fast/cheap models. Reserve expensive models (xhigh, Opus) for final integration review, high-risk/security/auth changes, architectural disputes, and pre-merge gates only. Every xhigh use requires a ledgered escalation reason (see §6).
+Decomposition, planning, spec review, and routine dispatch use fast/cheap models. Reserve expensive models (xhigh, Opus) for final integration review, high-risk/security/auth changes, architectural disputes, and pre-merge gates only. Every xhigh use requires a ledgered escalation reason (see §6). *(This controls quality and the <1% reasoning slice, not the input bill — see Cost reality above.)*
 
 ### 5.2 Targeted verification
 Per-task inner loops use focused test runs (targeted files, --last-failed, smoke checks). The full acceptance gate runs once after rebase (rebase can invalidate per-task results). These are sequential gates, not alternatives. Neither skips the other.
@@ -209,10 +211,14 @@ Batch low-risk edits into a milestone before running verification, rather than r
 Tools report three states: `missing` (not installed), `available` (installed, ready), `active` (used this run). Only `active` counts toward token optimization in the preflight ledger.
 
 ### 5.5 Context hygiene
-- Keep system/project files (CLAUDE.md, AGENTS.md) under 1KB each. Invariants only.
+- Keep system/project files (CLAUDE.md, AGENTS.md) under 1KB each — invariants only. These inject on **every** turn, so a fat instruction file is a fixed multiplier on the whole session. Don't restate what a hook, MCP server, or the playbook already injects; point to it instead. Re-measure after edits (`wc -c`); an 11KB AGENTS.md is ~10x its budget.
 - Use surgical file context — reference specific files and functions, not full repos.
 - Start fresh (/clear, /new) between unrelated tasks. Long sessions compound costs exponentially.
 - Disconnect unused MCP servers — each adds thousands of tokens per message in tool definitions.
+- Never re-ship full context on retry. On quota/rate-limit (429) or a flaked dispatch, stop and re-route — do **not** resend the entire brief on a fixed retry cycle. A retry storm that re-ingests the brief every N seconds is pure wasted input; kill the executor/broker rather than letting it loop.
+
+### 5.6 Cross-family review routing
+The mandatory review (§1.4) runs on a **different model family than the implementer**. This is a token tactic as much as a quality one: reviewing Codex output with Codex makes one task two full-context Codex passes (the review re-ingests the diff + the rigorous coverage matrix). Routing the review to the other family halves the per-family input load on the heavy path and gives a genuinely independent check. Record the implementer/reviewer route split in the preflight ledger (§6) — a row where both are the same family is a STOP-and-reconsider, not a dispatch.
 
 ## §6 — Preflight dispatch ledger
 
