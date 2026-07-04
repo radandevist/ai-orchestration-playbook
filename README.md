@@ -2,13 +2,44 @@
 
 ![type: documentation](https://img.shields.io/badge/type-documentation-blue)
 ![scope: agent-neutral](https://img.shields.io/badge/scope-agent--neutral-green)
-![dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen)
 
 > **One captain. Many hands. You hold the merge button.**
 
 A portable, agent-neutral operating model for orchestrating **batches** of software work through AI coding agents — Claude Code, Codex CLI, Hermes, or any future agent. It is **documentation only**: no code, no scripts, no runtime. You clone it once and point your agent at it.
 
 The agent-facing artifact is **[`PLAYBOOK.md`](./PLAYBOOK.md)** — a single self-contained document an orchestrating agent loads before a run and follows throughout.
+
+---
+
+## Dependencies
+
+The playbook is documentation-only, but it assumes a working AI coding agent setup. You need at least one agent runtime; the rest are optional but make the playbook significantly more effective.
+
+### Required (at least one)
+
+| Agent | What it does | Install |
+|-------|--------------|---------|
+| **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** | Anthropic's CLI agent — executors, reviews, dispatch | `npm install -g @anthropic-ai/claude-code` |
+| **[Codex CLI](https://github.com/openai/codex)** | OpenAI's CLI agent — executors, reviews, dispatch | `npm install -g @openai/codex` |
+| **[Hermes Agent](https://hermes-agent.nousresearch.com)** | Nous Research's agent — captains, executors, dispatch | `curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \| bash` |
+
+### Recommended (token optimization & code intelligence)
+
+The playbook references these tools in §5.4 (Installed tooling). They compress context, query code graphs, and enforce minimal-diff discipline — all reduce token spend during orchestrated runs.
+
+| Tool | What it does | Where |
+|------|--------------|-------|
+| **[RTK](https://github.com/nousresearch/rtk)** | Compresses noisy shell output before it enters agent context | `rtk git ...`, `rtk test ...`, `rtk grep ...` |
+| **[CodeGraph](https://github.com/nousresearch/codegraph)** | Queries a code graph index — skip whole-file reads in large repos | `codegraph explore "question"` |
+| **[Ponytail](https://github.com/nousresearch/ponytail)** | 7-rung lazy-dev ladder — enforces minimal diffs before writing code | Active on all agents. Levels: lite/full/ultra/off |
+
+### Also used by the playbook
+
+| Tool | Role |
+|------|------|
+| **[gh CLI](https://cli.github.com)** | GitHub operations: PR creation, branch management, issue linking |
+| **git worktrees** | Isolated branches for each executor — built into git, no install needed |
+| **Agent skills** (e.g. [Superpowers](https://github.com/nousresearch/superpowers)) | TDD, verification-before-completion, brainstorming — loaded per task shape |
 
 ---
 
