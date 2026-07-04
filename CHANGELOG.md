@@ -2,6 +2,11 @@
 
 All notable changes to the AI Orchestration Playbook are recorded here. This is a **living document** — it is updated from real use, as sessions expose new failure modes and better patterns. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.3] - 2026-07-04 — Parallelism gates on heavy jobs, not agent headcount
+
+- Clarified §2.3 dispatch STOP-triggers: concurrency is bounded by concurrent **heavy-resource** jobs (Docker/e2e stacks, full builds/test suites), **not** subagent headcount — lightweight agents (investigations, reviews, design, non-Docker impl, unit/typecheck/lint) run many-in-parallel. Serialize only the heavy jobs.
+- Host-specific ceilings stay in the repo adapter's `host_parallelism` field (per §4/§5.5), keeping the portable playbook lean rather than encoding one box's core/RAM counts.
+
 ## [0.1.2] - 2026-07-04 — Captain lanes for parallel quota speed
 
 - Added the **one captain per work board** rule: multi-clone work should use one hot orchestrator that owns queue/context/routing, while executors run as bounded one-shot packets into target clones/worktrees.

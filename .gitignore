@@ -1,3 +1,6 @@
 .DS_Store
 Thumbs.db
 *.swp
+
+# Runtime dispatch ledgers (run data, not playbook content)
+orchestration/
