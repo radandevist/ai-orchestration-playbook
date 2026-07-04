@@ -41,8 +41,11 @@ These hold on every run, for every agent. They override speed, convenience, and 
 7. **Subagents do not write durable notes directly.** Delegated subagents are vault-read-only by default. The orchestrator owns all durable documentation, session notes, logs, and knowledge-base writes. Subagents surface findings, corrections, and discoveries in their return payload — the orchestrator persists them. Emergency continuity handoffs are the only exception: a subagent may write a minimal handoff record before context/process loss, under a designated handoff directory.
    *Why:* multiple subagents writing independent notes fragments the record, duplicates effort, and creates drift. One orchestrator writing the coherent narrative prevents this.
 
-7. **Dispatch only from a clean, named checkpoint.** Before each write-wave, the source branch/worktree state must be reproducible: committed, or explicitly stashed and described.
+8. **Dispatch only from a clean, named checkpoint.** Before each write-wave, the source branch/worktree state must be reproducible: committed, or explicitly stashed and described.
    *Why:* an uncommitted parent tree makes later waves impossible to separate cleanly, complicates rescue, and turns review/revert into guesswork.
+
+9. **One captain per work board.** When a goal spans several clones/worktrees of the same product, run one hot orchestrator as the captain. The captain owns the queue, context, routing, review loop, and integration; executors are bounded one-shot packets launched into a target clone/worktree.
+   *Why:* two or three full-context orchestrators on the same board duplicate the most expensive input. Speed comes from provider lanes and surgical bursts, not parallel captains re-reading the same world.
 
 ---
 
@@ -69,8 +72,9 @@ Each phase below states a portable **principle**, the **why**, a tagged **exampl
 **Principle.** Run N executors concurrently, each in its **own isolated worktree**, each handed one **self-contained brief** (§3).
 **Why.** Isolation prevents executors from colliding on the working tree; self-contained briefs keep an executor from needing context it doesn't have.
 If the run must outlive the current orchestrator session (overnight work, disconnect-prone client, quota-reset wait), make it **durable**: materialize a run directory with prompts, reports, status markers, and a monitor entrypoint, then launch only as many concurrent executors as the adapter says the host can sustain.
+For multi-clone work, start one captain from the adapter `captain_root` (usually the parent directory above sibling clones), keep a hot backlog of 3-5 ready packets, and dispatch bounded one-shot workers into `clone_roots`. Use provider lanes, not free-for-all sessions: each heavy Claude/Codex lane takes the next surgical packet that fits its role and current headroom; local/cheap lanes handle prep, tests, logs, summaries, and mechanical checks. Burst heavy concurrency only when packets are independently briefable (file-disjoint edits, cross-family reviews, competing design probes, or separated debugging probes).
 *Example (PublyApp/.NET):* 7 parallel executor briefs, one per triage PR, each in `.claude/worktrees/<short-name>`.
-**STOP triggers:** concurrent count exceeds host capacity → batch in waves; a task isn't truly file-disjoint from a sibling in the same wave → re-decompose; the parent session may disappear before children finish and no durable monitor path exists → harden the run first.
+**STOP triggers:** more than one hot captain is steering the same board → collapse to one captain; concurrent **heavy-resource** jobs (Docker/e2e stacks, full builds/test suites) exceed host capacity → serialize those — agent *headcount* is not the cap, lightweight agents run many-in-parallel; a task isn't truly file-disjoint from a sibling in the same wave → re-decompose; the parent session may disappear before children finish and no durable monitor path exists → harden the run first.
 
 ### 2.4 Rescue
 
@@ -107,9 +111,11 @@ When the human explicitly optimizes for latency, you may batch several low-risk 
 
 A dispatch brief must be **self-contained**: an executor with no prior context should be able to act correctly from it alone. Use this skeleton; fill placeholders from the adapter (§4).
 
+The captain keeps a hot backlog of the next 3-5 packets. A packet is ready only when it names the lane, target clone/worktree, exact files or symbols, expected artifact, validation command, and STOP conditions. If the packet needs broad history or repo exploration, it is not ready for parallel dispatch.
+
 **Skeleton (required elements):**
 
-1. **Header** — execution mode + effort. Effort ≤ `high` by default; `xhigh` requires a ledgered escalation reason (see §1.5). *(Resolve executor + effort from adapter `executor`.)*
+1. **Header** — packet id, provider lane, target clone/worktree, execution mode + effort. Effort ≤ `high` by default; `xhigh` requires a ledgered escalation reason (see §1.5). *(Resolve executor + effort from adapter `executor` / `provider_lanes`.)*
 2. **Context sourcing** — the orchestrator discovers vault, playbook, adapter, and skills ONCE, then passes distilled context to each subagent. Subagents do not re-run proactive loading.
 3. **Checkpoint state** — the brief states the exact starting checkpoint (branch/head commit, or explicit stash/WIP note) so the executor is writing from a named baseline.
 4. **Absolute-path discipline** — every version-control command uses an **absolute** repo/worktree path, never a bare relative path.
@@ -150,9 +156,14 @@ Every repo supplies `<repo>/.ai/orchestration-adapter.md` as **fielded descripti
 | `acceptance_cmd` | The full post-rebase / pre-merge gate. This is the command that catches same-surface integration failures a touched-suite can miss. |
 | `client_regen_cmd` | API-client (or other generated-artifact) regeneration command, or `none`. |
 | `worktree_root` | Path convention for isolated worktrees (e.g. `.claude/worktrees/<short-name>`). |
+| `captain_root` | Directory from which one captain can coordinate this repo and any sibling clones. Use `repo root` for a single-clone setup. |
+| `clone_roots` | Known sibling clone/worktree roots the captain may dispatch into, or `none` for a single clone. |
 | `host_parallelism` | Safe concurrency ceiling / batching rule for this host and repo (especially when builds/tests are heavy). |
 | `executor` | Which executor to dispatch + its default effort (≤ `high`). |
 | `model_ladder` | Preferred fallback order when the primary executor/model rate-limits or hits quota, including any approved cross-family alternates so the orchestrator can route automatically without repeatedly asking the human. |
+| `provider_lanes` | Approved Claude/Codex/local lanes, their default roles, and which lane owns review/fix/design/verification packets. |
+| `hot_backlog` | Number of pre-shaped packets the captain should keep ready (default 3-5), plus where packet/board files live if durable. |
+| `packet_template` | Path to the repo's packet template, or `~/ai-orchestration-playbook/captain-packet-template.md`. |
 | `push_guard` | The real enforcement path for push/merge policy (active hook path, CI gate, soft gate, or `none`). |
 | `known_quirks` | **Highest-value field.** Hard-won host/tooling failure modes + their fixes. |
 | `additive_merge_files` | Files whose merge conflicts are resolved *additively* (keep both sides); anything else → STOP. |
@@ -173,9 +184,14 @@ Every repo supplies `<repo>/.ai/orchestration-adapter.md` as **fielded descripti
 | `acceptance_cmd` | `just build-api`; `just test-analyzers`; `pnpm lint`; `just tsc-front` |
 | `client_regen_cmd` | `just generate-client` |
 | `worktree_root` | `.claude/worktrees/<short-name>` |
+| `captain_root` | repo parent when coordinating sibling clones; otherwise repo root |
+| `clone_roots` | sibling local clones/worktrees approved by the adapter, or `none` |
 | `host_parallelism` | at most 3 concurrent executor waves; never run multiple heavy `dotnet` / `pnpm` verification jobs at once |
 | `executor` | `codex:codex-rescue` @ effort `high` |
 | `model_ladder` | primary `codex:codex-rescue` @ `high`; on quota/rate-limit fall back per repo policy to the next approved executor without changing the orchestration contract |
+| `provider_lanes` | Codex lane for repo edits/verification/review packets; Claude lane for architecture/design/review packets; local lane for grep/log/test prep |
+| `hot_backlog` | keep 3-5 ready packets in the run `dump_dir`; do not launch broad exploratory packets |
+| `packet_template` | `~/ai-orchestration-playbook/captain-packet-template.md` |
 | `push_guard` | active hook path is Husky (`core.hooksPath=.husky/_`); `.husky/pre-push` blocks direct pushes to `develop`; feature-branch policies beyond that are soft/brief-driven unless CI says otherwise |
 | `known_quirks` | sticky working-directory → use absolute paths for every `git -C` and `--body-file`; a fresh worktree needs `dotnet restore` before `just build-api` (recipe uses `--no-restore`); `pnpm` OOMs on the lint-ts test suite → verify lint locally, don't block on it; GitHub `--delete-branch` fails while the branch's worktree is still checked out → remove worktree first; after rebases, rerun the full acceptance gate, not just touched tests |
 | `additive_merge_files` | `.oxlintrc.json`, `.editorconfig`, `AGENTS.md`, `packages/lint-ts/src/index.js`, `docs/guides/lint-rules.md` |
@@ -220,6 +236,9 @@ Tools report three states: `missing` (not installed), `available` (installed, re
 ### 5.6 Cross-family review routing
 The mandatory review (§1.4) runs on a **different model family than the implementer**. This is a token tactic as much as a quality one: reviewing Codex output with Codex makes one task two full-context Codex passes (the review re-ingests the diff + the rigorous coverage matrix). Routing the review to the other family halves the per-family input load on the heavy path and gives a genuinely independent check. Record the implementer/reviewer route split in the preflight ledger (§6) — a row where both are the same family is a STOP-and-reconsider, not a dispatch.
 
+### 5.7 Parallel-session discipline
+When the human would otherwise open 2-3 orchestration sessions for sibling clones, use the captain/lane model instead (§1.9, §2.3). Keep one hot captain and launch bounded one-shot packets into clones. Track waste as **fresh input per completed packet**, not raw activity: if multiple packets re-ship the same broad context, stop and distill the stable prefix once before launching more. Do not throttle useful independent packets just because they are parallel; throttle duplicate context and heavy-resource jobs.
+
 ## §6 — Preflight dispatch ledger
 
 Before dispatching any executor or subagent, append one JSONL preflight row to the run ledger. The ledger is the executable dispatch gate that unifies route choice, quota, risk, required checks, token-tool evidence, bypass safety, and source-of-truth conflict detection.
@@ -230,9 +249,11 @@ Before dispatching any executor or subagent, append one JSONL preflight row to t
 
 ```
 run_id, timestamp
+captain: {session_id, board_dir, packet_id, lane: claude|codex|local|other, target_clone, hot_backlog_size}
 task_risk: {level: low|medium|high|critical, reasons: []}
 scope: {repo, worktree, branch, dirty_state}
 routes: {implementer: {provider, model, quota_signal}, reviewer: {provider, model, quota_signal}, fallbacks: []}
+context_budget: {packet_size: tiny|small|medium|large, stable_prefix_reused: bool, fresh_input_estimate: low|medium|high, duplicate_context_risk: low|medium|high}
 required: [{name, check, status: pass|fail|unknown, failure_action: stop|degraded|ask}]
 token_tools: {rtk, codegraph, context-mode, ponytail: active|available|missing}
 bypass: {codex_bypass: bool, claude_bypass: bool, invariant_asserted: bool}
@@ -244,6 +265,6 @@ decision: dispatch|degraded|stop
 
 ### Two paths
 
-1. **LLM-orchestrator path** (interactive dispatch): the orchestrator writes the rich row (risk, routes, required[], token_tools) from its own reasoning before dispatching subagents. This is a true gate — `decision: stop` blocks dispatch. Enforced by the brief contract (§3) and the orchestrator's own discipline.
+1. **LLM-orchestrator path** (interactive dispatch): the captain writes the rich row (`captain`, risk, routes, `context_budget`, required[], token_tools) from its own reasoning before dispatching subagents. This is a true gate — `decision: stop` blocks dispatch. Enforced by the packet/brief contract (§3) and the orchestrator's own discipline.
 
-2. **Mechanical dispatch path** (autonomous/kanban workers): a pre-spawn helper writes a minimal observational row with `decision: log-only`. The mechanical path cannot compute `required[]`, `token_tools.active`, or `task_risk` — those fields are the LLM orchestrator's responsibility. This path is a **log**, not a gate. The gate for autonomous work lives upstream: pre-spawn guards, profile concurrency caps, and stale-timeout detection.
+2. **Mechanical dispatch path** (autonomous/kanban workers): a pre-spawn helper writes a minimal observational row with `decision: log-only`. The mechanical path cannot compute `required[]`, `token_tools.active`, `task_risk`, or nuanced `context_budget` — those fields are the LLM captain's responsibility. This path is a **log**, not a gate. The gate for autonomous work lives upstream: pre-spawn guards, profile concurrency caps, and stale-timeout detection.

@@ -13,12 +13,22 @@
 -->
 
 - **default_branch:** `<protected main/integration branch — never pushed/committed directly>`
+- **setup_cmd:** `<fresh-worktree bootstrap command(s): restore/install/sync>`
 - **build_cmd:** `<command that builds the project>`
 - **test_cmd:** `<command(s) to run the relevant tests, incl. filtering syntax if any>`
 - **lint_cmd:** `<lint / type-check / format-check command(s)>`
-- **client_regen_cmd:** `<API-client / generated-artifact regen command, or `none`>`
+- **acceptance_cmd:** `<full post-rebase / pre-merge gate>`
+- **client_regen_cmd:** `<API-client / generated-artifact regen command, or none>`
 - **worktree_root:** `<isolated-worktree path convention, e.g. .worktrees/<short-name>>`
+- **captain_root:** `<absolute parent/coordination directory for one captain, or repo root>`
+- **clone_roots:** `<sibling clone/worktree roots the captain may dispatch into, or none>`
+- **host_parallelism:** `<safe heavy-resource concurrency rule for this repo/host>`
 - **executor:** `<which executor to dispatch + default effort (≤ high)>`
+- **model_ladder:** `<fallback order when the primary model/provider rate-limits or hits quota>`
+- **provider_lanes:** `<approved Claude/Codex/local lanes and their default roles>`
+- **hot_backlog:** `<target ready packet count, usually 3-5, plus durable board/packet path if any>`
+- **packet_template:** `<repo-specific template path, or ~/ai-orchestration-playbook/captain-packet-template.md>`
+- **push_guard:** `<actual push/merge enforcement path: hook, CI gate, soft gate, or none>`
 - **known_quirks:** `<HIGHEST-VALUE FIELD: hard-won host/tooling failure modes + their fixes. Add to this whenever a run exposes a new one.>`
 - **additive_merge_files:** `<files whose merge conflicts are resolved additively (keep both sides); anything else → STOP>`
 - **dump_dir:** `<where squash bodies + working artifacts are written>`

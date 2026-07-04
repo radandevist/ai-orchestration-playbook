@@ -4,7 +4,7 @@ A portable, agent-neutral playbook for orchestrating multi-task software work th
 
 This repo is consumed by AI orchestrating agents (Claude, Hermes, and others). It is documentation only — no code, no scripts.
 
-**The model in one sentence:** an *orchestrating agent* never touches project code itself — it decomposes work, dispatches *executors* in isolated git worktrees, runs an independent review pass on each result, and integrates — while you (the human) make the judgment calls and authorize every merge.
+**The model in one sentence:** one *captain orchestrating agent* owns the board and never touches project code itself — it decomposes work, dispatches bounded *executors* in isolated git worktrees/clones, runs an independent review pass on each result, and integrates — while you (the human) make the judgment calls and authorize every merge.
 
 ---
 
@@ -12,6 +12,7 @@ This repo is consumed by AI orchestrating agents (Claude, Hermes, and others). I
 
 - [`PLAYBOOK.md`](./PLAYBOOK.md) — the agent-facing operating model (read top-to-bottom before a run).
 - [`adapter-template.md`](./adapter-template.md) — copy into a repo to bind the playbook to that project.
+- [`captain-packet-template.md`](./captain-packet-template.md) — board + packet template for one-captain, multi-clone/provider-lane runs.
 - [`CHANGELOG.md`](./CHANGELOG.md) — living-doc version log.
 
 ---
@@ -82,13 +83,14 @@ The playbook's generic principles resolve against this adapter, so a project's s
 
 ## How to use it (running an orchestrated session)
 
-Once installed and the repo is onboarded, you drive a session through your agent in plain language. Here's the shape of a run and where **you** stay in control.
+Once installed and the repo is onboarded, you drive a session through your agent in plain language. For a multi-clone effort, open one captain session from the parent/coordination directory, then let it dispatch bounded packets into the target clones named by the adapter. Here's the shape of a run and where **you** stay in control.
 
 ### 1. Kick it off
 
 Tell the agent what you want, at batch scale. Examples:
 - *"Orchestrate the fixes for these 7 issues in parallel."*
 - *"Split this 3000-line service per the proposal and land each extraction as its own PR."*
+- *"Coordinate these DigitalPrevention clones from the parent directory; use one captain and dispatch packets into the right clone."*
 
 The agent reads `PLAYBOOK.md` + the repo's adapter, then runs the **seven-phase loop** (`PLAYBOOK.md` §2):
 
