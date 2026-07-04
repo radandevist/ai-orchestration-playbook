@@ -81,6 +81,14 @@ The playbook references these tools in §5.4 (Installed tooling). They compress 
 
 ---
 
+## Install in one prompt
+
+```text
+Clone https://github.com/radandevist/ai-orchestration-playbook to ~/ai-orchestration-playbook, detect the active agent (Claude Code, Codex CLI, Hermes, or other), and add this line to that agent's correct global instruction file:
+
+For multi-task orchestration, follow `~/ai-orchestration-playbook/PLAYBOOK.md` and the current repository's `.ai/orchestration-adapter.md`.
+```
+
 ## Quick start
 
 Three steps, once per host. After that, your agent loads the playbook automatically whenever it detects multi-step work.
