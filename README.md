@@ -17,29 +17,30 @@ The playbook is documentation-only, but it assumes a working AI coding agent set
 
 ### Required (at least one)
 
-| Agent | What it does | Install |
+|| Agent | What it does | Install |
 |-------|--------------|---------|
-| **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** | Anthropic's CLI agent — executors, reviews, dispatch | `npm install -g @anthropic-ai/claude-code` |
-| **[Codex CLI](https://github.com/openai/codex)** | OpenAI's CLI agent — executors, reviews, dispatch | `npm install -g @openai/codex` |
-| **[Hermes Agent](https://hermes-agent.nousresearch.com)** | Nous Research's agent — captains, executors, dispatch | `curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \| bash` |
+|| **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** | Anthropic's CLI agent — executors, reviews, dispatch | `npm install -g @anthropic-ai/claude-code` |
+|| **[Codex CLI](https://github.com/openai/codex)** | OpenAI's CLI agent — executors, reviews, dispatch | `npm install -g @openai/codex` |
+|| **[Hermes Agent](https://hermes-agent.nousresearch.com)** | Nous Research's agent — captains, executors, dispatch | `curl -fsSL https://hermes-agent.nousresearch.com/install.sh \| bash` |
 
 ### Recommended (token optimization & code intelligence)
 
 The playbook references these tools in §5.4 (Installed tooling). They compress context, query code graphs, and enforce minimal-diff discipline — all reduce token spend during orchestrated runs.
 
-| Tool | What it does | Where |
-|------|--------------|-------|
-| **[RTK](https://github.com/nousresearch/rtk)** | Compresses noisy shell output before it enters agent context | `rtk git ...`, `rtk test ...`, `rtk grep ...` |
-| **[CodeGraph](https://github.com/nousresearch/codegraph)** | Queries a code graph index — skip whole-file reads in large repos | `codegraph explore "question"` |
-| **[Ponytail](https://github.com/nousresearch/ponytail)** | 7-rung lazy-dev ladder — enforces minimal diffs before writing code | Active on all agents. Levels: lite/full/ultra/off |
+|| Tool | What it does | Install / Usage |
+|------|--------------|-----------------|
+|| **[RTK](https://github.com/rtk-ai/rtk)** | Compresses noisy shell output before it enters agent context | `cargo install rtk-cli` · usage: `rtk git ...`, `rtk test ...`, `rtk grep ...` |
+|| **[CodeGraph](https://github.com/colbymchenry/codegraph)** | Queries a code graph index — skip whole-file reads in large repos | `npx @colbymchenry/codegraph` · usage: `codegraph explore "question"` |
+|| **[Context-Mode](https://github.com/mksglu/context-mode)** | Routes heavy tool output through a sandbox, returns only the summary | `npm install -g context-mode` · usage: `ctx_batch_execute`, `ctx_execute_file`, `ctx_search` |
+|| **[Ponytail](https://github.com/DietrichGebert/ponytail)** | 7-rung lazy-dev ladder — enforces minimal diffs before writing code | `npx skills add DietrichGebert/ponytail` · active on all agents. Levels: lite/full/ultra/off |
 
 ### Also used by the playbook
 
-| Tool | Role |
-|------|------|
-| **[gh CLI](https://cli.github.com)** | GitHub operations: PR creation, branch management, issue linking |
-| **git worktrees** | Isolated branches for each executor — built into git, no install needed |
-| **Agent skills** (e.g. [Superpowers](https://github.com/nousresearch/superpowers)) | TDD, verification-before-completion, brainstorming — loaded per task shape |
+|| Tool | Role |
+||------|------|
+|| **[gh CLI](https://cli.github.com)** | GitHub operations: PR creation, branch management, issue linking |
+|| **git worktrees** | Isolated branches for each executor — built into git, no install needed |
+|| **Agent skills** (e.g. [Superpowers](https://github.com/obra/superpowers)) | TDD, verification-before-completion, brainstorming — loaded per task shape |
 
 ---
 
