@@ -220,14 +220,18 @@ Batch low-risk edits into a milestone before running verification, rather than r
 |------|-------------|-------|
 | RTK | Compresses noisy shell output (test logs, git status, build traces) before it enters context | Prefix command: `rtk git ...`, `rtk test ...`, `rtk grep ...` |
 | CodeGraph | Queries a code graph index — skip whole-file reads in large repos | `codegraph explore "question"` before grep; build index with `codegraph init` |
-| Context-Mode | Routes heavy tool output through a sandbox, returns only the summary | `ctx_batch_execute`, `ctx_execute_file`, `ctx_search` |
+| Context-Mode | Routes heavy tool output through a sandbox, returns only the summary | Available on demand; do not auto-inject its plugin unless a run will actually use `ctx_batch_execute`, `ctx_execute_file`, or `ctx_search` |
 | Caveman | Terse prose (note: benchmarks show +7% tokens, +3% cost) | Dormant — do not invoke |
-| Ponytail | 7-rung lazy-senior-dev ladder before writing code (-54% LOC, -22% tokens) | Active on all agents. Levels: lite/full/ultra/off |
+| Ponytail | 7-rung lazy-senior-dev ladder before writing code (-54% LOC, -22% tokens) | Available on demand; do not auto-inject globally. Use lite/full/ultra only when the task benefits from the ladder |
+| Claude Codex plugin | Lets Claude Code delegate through Codex | Enable only for Claude Code lanes that actually dispatch Codex; keep unrelated Claude plugins disabled by default |
 
 Tools report three states: `missing` (not installed), `available` (installed, ready), `active` (used this run). Only `active` counts toward token optimization in the preflight ledger.
 
 ### 5.5 Context hygiene
 - Keep system/project files (CLAUDE.md, AGENTS.md) under 1KB each — invariants only. These inject on **every** turn, so a fat instruction file is a fixed multiplier on the whole session. Don't restate what a hook, MCP server, or the playbook already injects; point to it instead. Re-measure after edits (`wc -c`); an 11KB AGENTS.md is ~10x its budget.
+- Keep agent plugin/skill/tool surfaces lean by default. Enable only the plugin/skill/toolsets needed for the current lane; park heavy narrative/style plugins, broad skill banks, browser/media tools, and delegation schemas unless the task explicitly needs them. A useful default is: memory + skills + file + terminal + web/search + code execution + session search + cron/todo/clarify; add browser/vision/image/audio/delegation only for that run.
+- Default interactive/routine agents to cheap models and low/medium reasoning; expose named escalation lanes (`*-high`, `*-xhigh`, Opus/Max) for deliberate use. If a one-line/status prompt can burn premium-window percentage points, the default lane is wrong.
+- Re-measure prompt surfaces after config changes: Claude Code `claude -p 'status' --output-format json --max-turns 1`; Codex `codex debug prompt-input 'status'` byte count; Hermes `hermes tools list` plus config/toolset inspection. Record before/after in the ledger or closeout note.
 - Use surgical file context — reference specific files and functions, not full repos.
 - Start fresh (/clear, /new) between unrelated tasks. Long sessions compound costs exponentially.
 - Disconnect unused MCP servers — each adds thousands of tokens per message in tool definitions.
