@@ -73,7 +73,8 @@ Each phase below states a portable **principle**, the **why**, a tagged **exampl
 **Why.** Isolation prevents executors from colliding on the working tree; self-contained briefs keep an executor from needing context it doesn't have.
 If the run must outlive the current orchestrator session (overnight work, disconnect-prone client, quota-reset wait), make it **durable**: materialize a run directory with prompts, reports, status markers, and a monitor entrypoint, then launch only as many concurrent executors as the adapter says the host can sustain.
 For multi-clone work, start one captain from the adapter `captain_root` (usually the parent directory above sibling clones), keep a hot backlog of 3-5 ready packets, and dispatch bounded one-shot workers into `clone_roots`. Use provider lanes, not free-for-all sessions: each heavy Claude/Codex lane takes the next surgical packet that fits its role and current headroom; local/cheap lanes handle prep, tests, logs, summaries, and mechanical checks. Burst heavy concurrency only when packets are independently briefable (file-disjoint edits, cross-family reviews, competing design probes, or separated debugging probes).
-*Example (PublyApp/.NET):* 7 parallel executor briefs, one per triage PR, each in `.claude/worktrees/<short-name>`.
+**Name each worktree after the pull request it produces, never after the issue** (`pr<NUMBER>`, e.g. `pr994`). One issue routinely spawns several competing implementations, and the moment it does, issue-named directories collide and the human can no longer tell which tree holds which attempt. The PR number is also what a reviewer actually searches for. Because that number does not exist until the branch is pushed, create the worktree under a provisional slug, push and open the PR immediately, then `git worktree move` it onto its `pr<NUMBER>` name — the provisional window is minutes, not days.
+*Example (PublyApp/.NET):* 7 parallel executor briefs, one per triage PR, each in `.worktrees/pr<NUMBER>`.
 **STOP triggers:** more than one hot captain is steering the same board → collapse to one captain; concurrent **heavy-resource** jobs (Docker/e2e stacks, full builds/test suites) exceed host capacity → serialize those — agent *headcount* is not the cap, lightweight agents run many-in-parallel; a task isn't truly file-disjoint from a sibling in the same wave → re-decompose; the parent session may disappear before children finish and no durable monitor path exists → harden the run first.
 
 ### 2.4 Rescue
@@ -155,7 +156,7 @@ Every repo supplies `<repo>/.ai/orchestration-adapter.md` as **fielded descripti
 | `lint_cmd` | Lint / type-check / format-check command(s). |
 | `acceptance_cmd` | The full post-rebase / pre-merge gate. This is the command that catches same-surface integration failures a touched-suite can miss. |
 | `client_regen_cmd` | API-client (or other generated-artifact) regeneration command, or `none`. |
-| `worktree_root` | Path convention for isolated worktrees (e.g. `.claude/worktrees/<short-name>`). |
+| `worktree_root` | Path convention for isolated worktrees, **including the naming rule**. Name a worktree after the pull request it produces — `pr<NUMBER>` — never after the issue. One issue routinely spawns several competing implementations, and issue-named directories collide the moment it does; the PR number is also what a reviewer searches for. Since the number does not exist until the branch is pushed, create under a provisional slug, open the PR immediately, then `git worktree move` onto the final name. Never construct a worktree path by string-building from the convention — read it from `git worktree list --porcelain`, which stays correct after a rename. |
 | `captain_root` | Directory from which one captain can coordinate this repo and any sibling clones. Use `repo root` for a single-clone setup. |
 | `clone_roots` | Known sibling clone/worktree roots the captain may dispatch into, or `none` for a single clone. |
 | `host_parallelism` | Safe concurrency ceiling / batching rule for this host and repo (especially when builds/tests are heavy). |
@@ -183,7 +184,7 @@ Every repo supplies `<repo>/.ai/orchestration-adapter.md` as **fielded descripti
 | `lint_cmd` | `pnpm lint`; `just tsc-front` |
 | `acceptance_cmd` | `just build-api`; `just test-analyzers`; `pnpm lint`; `just tsc-front` |
 | `client_regen_cmd` | `just generate-client` |
-| `worktree_root` | `.claude/worktrees/<short-name>` |
+| `worktree_root` | `.worktrees/pr<NUMBER>` (e.g. `.worktrees/pr994`), inside the clone — never a sibling of it |
 | `captain_root` | repo parent when coordinating sibling clones; otherwise repo root |
 | `clone_roots` | sibling local clones/worktrees approved by the adapter, or `none` |
 | `host_parallelism` | at most 3 concurrent executor waves; never run multiple heavy `dotnet` / `pnpm` verification jobs at once |
