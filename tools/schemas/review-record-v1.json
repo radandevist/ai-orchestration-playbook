@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-orchestration-playbook/schemas/review-record-v1.json",
+  "title": "Structured Adversarial Review Record",
+  "description": "Machine authority for an independent cross-family PR review. The gate promotes mandatory scopes to BLOCKS_PR independently of reviewer labels.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "repository",
+    "pr_number",
+    "reviewed_commit",
+    "implementer_family",
+    "reviewer_family",
+    "verdict",
+    "findings",
+    "intentionally_not_findings"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^[^/]+/[^/]+$"
+    },
+    "pr_number": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "reviewed_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "implementer_family": {
+      "type": "string",
+      "minLength": 1
+    },
+    "reviewer_family": {
+      "type": "string",
+      "minLength": 1
+    },
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "CHANGES_REQUIRED",
+        "APPROVED_WITH_FOLLOW_UPS",
+        "APPROVED",
+        "INCONCLUSIVE"
+      ]
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    },
+    "intentionally_not_findings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "required": [
+        "id",
+        "root_cause",
+        "severity",
+        "disposition",
+        "scope",
+        "summary",
+        "evidence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "root_cause": {
+          "type": "string",
+          "minLength": 1
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "CRITICAL",
+            "MAJOR",
+            "MEDIUM",
+            "MINOR",
+            "NOTE"
+          ]
+        },
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "BLOCKS_PR",
+            "FOLLOW_UP_ISSUE",
+            "NOTE_ONLY"
+          ]
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "follow_up_issue": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "if": {
+        "properties": {
+          "disposition": {
+            "const": "FOLLOW_UP_ISSUE"
+          }
+        },
+        "required": ["disposition"]
+      },
+      "then": {
+        "required": ["follow_up_issue"]
+      }
+    }
+  }
+}
