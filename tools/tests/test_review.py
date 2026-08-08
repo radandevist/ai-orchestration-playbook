@@ -1,4 +1,3 @@
-import json
 import unittest
 from pathlib import Path
 
@@ -618,6 +617,33 @@ class ConfiguredFamilySpellingTests(unittest.TestCase):
                 ):
                     validate_review(record)
 
+    def test_namespace_that_conflicts_with_head_is_ambiguous(self):
+        for spelling in ("anthropic/gpt-5", "openrouter/anthropic/gpt-5"):
+            with self.subTest(spelling=spelling):
+                with self.assertRaisesRegex(ReviewValidationError, "ambiguous"):
+                    normalize_family(spelling)
+
+    def test_conflicting_namespaces_are_ambiguous(self):
+        for spelling in (
+            "anthropic/openai/wizard-9000",
+            "xai/anthropic/wizard-9000",
+        ):
+            with self.subTest(spelling=spelling):
+                with self.assertRaisesRegex(ReviewValidationError, "ambiguous"):
+                    normalize_family(spelling)
+
+    def test_namespace_fallback_saves_an_unresolvable_head(self):
+        results = []
+        for spelling in (
+            "anthropic/wizard-9000",
+            "openrouter/anthropic/wizard-9000",
+        ):
+            try:
+                results.append(normalize_family(spelling))
+            except ReviewValidationError as error:
+                results.append(f"rejected: {error}")
+        self.assertEqual(["anthropic", "anthropic"], results)
+
 
 class GeneratedSchemaTests(unittest.TestCase):
     def published_schema(self):
@@ -635,15 +661,6 @@ class GeneratedSchemaTests(unittest.TestCase):
             "tools/schemas/review-record-v1.json drifted from contract.py - regenerate "
             "with PYTHONPATH=tools python3 -m pr_closure.contract",
         )
-
-    def test_schema_documents_every_deliberate_python_only_semantic(self):
-        from pr_closure.contract import SEMANTIC_ASYMMETRIES
-
-        comment = json.loads(self.published_schema()).get("$comment", "")
-        for asymmetry in SEMANTIC_ASYMMETRIES:
-            with self.subTest(asymmetry=asymmetry):
-                self.assertIn(asymmetry, comment)
-
 
 if __name__ == "__main__":
     unittest.main()

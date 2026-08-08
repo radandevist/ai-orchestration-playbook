@@ -5,6 +5,7 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
+from pr_closure.contract import SEMANTIC_ASYMMETRIES
 from pr_closure.review import ReviewValidationError, validate_review
 
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "review-record-v1.json"
@@ -64,20 +65,22 @@ def _follow_up_issue_on(disposition):
 
 
 def agreement_corpus():
-    """(label, record, expected_schema_valid, expected_python_valid) tuples.
+    """(label, record, schema_valid, python_valid, asymmetry_id) tuples.
 
     Agreement and deliberate asymmetry are both first-class members; no assertion
-    privileges either outcome.
+    privileges either outcome. Every deliberate schema-accepts/Python-rejects case
+    names the independently declared semantic asymmetry that explains it.
     """
 
-    def add(label, mutate, schema_ok, python_ok):
+    def add(label, mutate, schema_ok, python_ok, asymmetry_id=None):
         record = _valid_record()
         mutate(record)
-        cases.append((label, record, schema_ok, python_ok))
+        cases.append((label, record, schema_ok, python_ok, asymmetry_id))
 
     cases = []
 
     add("valid record", lambda r: None, True, True)
+    add("large pr_number remains valid", lambda r: r.update({"pr_number": 100001}), True, True)
 
     add("unknown top-level key", lambda r: r.update({"rogue": "x"}), False, False)
     add(
@@ -122,6 +125,13 @@ def agreement_corpus():
     )
     add("empty local_evidence", lambda r: r.update({"local_evidence": []}), False, False)
     add("empty ci_evidence", lambda r: r.update({"ci_evidence": []}), False, False)
+    add("boolean pr_number", lambda r: r.update({"pr_number": True}), False, False)
+    add(
+        "boolean follow_up_issue",
+        lambda r: r["findings"][0].update({"follow_up_issue": True}),
+        False,
+        False,
+    )
 
     add(
         "blank summary",
@@ -228,26 +238,50 @@ def agreement_corpus():
         lambda r: r["findings"].append(dict(r["findings"][0], severity="MAJOR")),
         True,
         False,
+        "duplicate_finding_ids",
     )
     add(
         "unknown family wizard-9000",
         lambda r: r.update({"implementer_family": "wizard-9000"}),
         True,
         False,
+        "unknown_model_family",
     )
     add(
         "third-party lookalike claude-killer",
         lambda r: r.update({"implementer_family": "claude-killer"}),
         True,
         False,
+        "third_party_lookalike",
     )
     add(
         "same family under different spellings",
         lambda r: r.update({"reviewer_family": "deepseek-v4-flash"}),
         True,
         False,
+        "same_model_family",
     )
-    add("schema_version 1.0", lambda r: r.update({"schema_version": 1.0}), True, False)
+    add(
+        "schema_version 1.0",
+        lambda r: r.update({"schema_version": 1.0}),
+        True,
+        False,
+        "exact_integer_types",
+    )
+    add(
+        "pr_number 42.0",
+        lambda r: r.update({"pr_number": 42.0}),
+        True,
+        False,
+        "exact_integer_types",
+    )
+    add(
+        "follow_up_issue 900.0",
+        lambda r: r["findings"][0].update({"follow_up_issue": 900.0}),
+        True,
+        False,
+        "exact_integer_types",
+    )
 
     return cases
 
@@ -282,7 +316,7 @@ class SchemaPythonDifferentialTests(unittest.TestCase):
     def test_every_corpus_case_matches_its_declared_outcome(self):
         validator = Draft202012Validator(_schema())
         mismatches = []
-        for label, record, schema_ok, python_ok in agreement_corpus():
+        for label, record, schema_ok, python_ok, _ in agreement_corpus():
             got_schema = validator.is_valid(record)
             try:
                 validate_review(record)
@@ -299,11 +333,31 @@ class SchemaPythonDifferentialTests(unittest.TestCase):
         self.assertEqual([], mismatches)
 
     def test_corpus_declares_both_agreement_and_deliberate_asymmetry(self):
-        outcomes = {row[2:] for row in agreement_corpus()}
+        outcomes = {row[2:4] for row in agreement_corpus()}
         self.assertTrue((True, True) in outcomes)
         self.assertTrue((False, False) in outcomes)
         self.assertTrue((True, False) in outcomes)
         self.assertNotIn((False, True), outcomes)
+
+    def test_asymmetry_registry_is_complete_and_published(self):
+        declared = {item.id: item.description for item in SEMANTIC_ASYMMETRIES}
+        covered = set()
+        errors = []
+        for label, _, schema_ok, python_ok, asymmetry_id in agreement_corpus():
+            is_deliberate_asymmetry = (schema_ok, python_ok) == (True, False)
+            if is_deliberate_asymmetry and asymmetry_id is None:
+                errors.append(f"{label}: missing asymmetry id")
+            if not is_deliberate_asymmetry and asymmetry_id is not None:
+                errors.append(f"{label}: unexpected asymmetry id {asymmetry_id!r}")
+            if asymmetry_id is not None:
+                covered.add(asymmetry_id)
+        self.assertEqual([], errors)
+        self.assertEqual(set(declared), covered)
+
+        comment = _schema().get("$comment", "")
+        for asymmetry_id, description in declared.items():
+            with self.subTest(asymmetry_id=asymmetry_id):
+                self.assertIn(f"{asymmetry_id}: {description}", comment)
 
     def test_explicit_null_follow_up_cases_isolate_the_key_presence_rule(self):
         isolated = [
@@ -319,18 +373,19 @@ class SchemaPythonDifferentialTests(unittest.TestCase):
 
     def test_corpus_covers_each_structural_group(self):
         counts = {}
-        for label, _, schema_ok, python_ok in agreement_corpus():
+        for label, _, schema_ok, python_ok, _ in agreement_corpus():
             group = _group_of(label)
             counts[group] = counts.get(group, 0) + 1
         self.assertEqual(
             {
                 "valid": 1,
-                "structural": 13,
+                "boundary": 1,
+                "structural": 15,
                 "whitespace": 12,
                 "null_follow_up": 3,
                 "paired_empty": 2,
                 "trailing_newline": 3,
-                "asymmetric": 5,
+                "asymmetric": 7,
             },
             counts,
         )
@@ -344,6 +399,8 @@ def _disposition_of(row):
 def _group_of(label):
     if label == "valid record":
         return "valid"
+    if label == "large pr_number remains valid":
+        return "boundary"
     if label.startswith("explicit null follow_up_issue"):
         return "null_follow_up"
     if label in (
@@ -359,6 +416,8 @@ def _group_of(label):
         "third-party lookalike claude-killer",
         "same family under different spellings",
         "schema_version 1.0",
+        "pr_number 42.0",
+        "follow_up_issue 900.0",
     ):
         return "asymmetric"
     if "blank " in label:
