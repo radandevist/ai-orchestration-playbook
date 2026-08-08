@@ -1,19 +1,40 @@
 from __future__ import annotations
 
 import re
-from typing import List, Mapping, Tuple
+from typing import List, Mapping, Optional, Tuple
 
 from pr_closure.model import Disposition, Finding, ReviewRecord, Severity, Verdict
 
-COMMIT_ID_RE = re.compile(r"^[0-9a-f]{40}$")
+COMMIT_ID_RE = re.compile(r"[0-9a-f]{40}")
+REPOSITORY_RE = re.compile(r"[^/]+/[^/]+")
 
 TOP_LEVEL_FIELDS = (
     "schema_version",
     "repository",
     "pr_number",
+    "reviewed_branch",
     "reviewed_commit",
     "implementer_family",
     "reviewer_family",
+    "local_evidence",
+    "ci_evidence",
+    "verdict",
+    "findings",
+    "intentionally_not_findings",
+    "base_commit",
+    "comparison_range",
+)
+
+REQUIRED_TOP_LEVEL_FIELDS = (
+    "schema_version",
+    "repository",
+    "pr_number",
+    "reviewed_branch",
+    "reviewed_commit",
+    "implementer_family",
+    "reviewer_family",
+    "local_evidence",
+    "ci_evidence",
     "verdict",
     "findings",
     "intentionally_not_findings",
@@ -28,6 +49,18 @@ FINDING_FIELDS = (
     "summary",
     "evidence",
     "follow_up_issue",
+    "bad_case_evidence",
+    "good_case_evidence",
+)
+
+REQUIRED_FINDING_FIELDS = (
+    "id",
+    "root_cause",
+    "severity",
+    "disposition",
+    "scope",
+    "summary",
+    "evidence",
 )
 
 MANDATORY_BLOCK_SCOPES = frozenset({
@@ -44,19 +77,94 @@ MANDATORY_BLOCK_SCOPES = frozenset({
     "review_tip",
 })
 
-FAMILY_PREFIXES = ("deepseek", "claude", "gpt")
+FAMILY_KEYWORDS = {
+    "deepseek": frozenset({"deepseek"}),
+    "openai": frozenset({"openai", "gpt", "chatgpt", "o1", "o3", "o4"}),
+    "anthropic": frozenset({"anthropic", "claude"}),
+    "google": frozenset({"google", "googleai", "gemini", "bard"}),
+    "xai": frozenset({"xai", "x", "grok"}),
+    "zhipu": frozenset({"zhipu", "glm"}),
+    "alibaba": frozenset({"alibaba", "aliyun", "tongyi", "qwen"}),
+    "moonshot": frozenset({"moonshot", "kimi"}),
+    "minimax": frozenset({"minimax", "abab"}),
+    "xiaomi": frozenset({"xiaomi", "mimo"}),
+}
+
+FAMILY_DESIGNATORS = frozenset({
+    "mini", "pro", "max", "plus", "ultra", "nano", "alpha", "beta",
+    "preview", "flash", "turbo", "lite", "vision", "chat", "instruct",
+    "coder", "codex", "reasoning", "thinking", "high", "medium", "low",
+    "large", "small", "opus", "sonnet", "haiku", "next", "exp",
+})
+
+_VERSION_RE = re.compile(r"^\.?\d[\d.]*$")
+_V_PREFIX_RE = re.compile(r"^v?\d+(\.\d+)?$")
+_RELEASE_RE = re.compile(r"^r\d+$")
+_SIZE_RE = re.compile(r"^\d+(\.\d+)?[bm]$")
+_ALNUM_VERSION_RE = re.compile(r"^[a-z]?\d+[a-z]?$")
 
 
 class ReviewValidationError(ValueError):
     pass
 
 
+def _family_tokens(value: str) -> List[str]:
+    normalized = value.strip().casefold()
+    if not normalized:
+        raise ReviewValidationError("model family must be a non-empty string")
+    return re.findall(r"[a-z0-9]+(?:\.[a-z0-9]+)*", normalized)
+
+
+def _is_generic_token(token: str) -> bool:
+    return (
+        token in FAMILY_DESIGNATORS
+        or _VERSION_RE.fullmatch(token) is not None
+        or _V_PREFIX_RE.fullmatch(token) is not None
+        or _RELEASE_RE.fullmatch(token) is not None
+        or _SIZE_RE.fullmatch(token) is not None
+        or _ALNUM_VERSION_RE.fullmatch(token) is not None
+    )
+
+
+def _is_generic_suffix(suffix: str) -> bool:
+    return (
+        suffix in FAMILY_DESIGNATORS
+        or _VERSION_RE.fullmatch(suffix) is not None
+        or _V_PREFIX_RE.fullmatch(suffix) is not None
+        or _RELEASE_RE.fullmatch(suffix) is not None
+        or _SIZE_RE.fullmatch(suffix) is not None
+    )
+
+
+def _family_of_token(token: str) -> Optional[str]:
+    for family, keywords in FAMILY_KEYWORDS.items():
+        for keyword in keywords:
+            if token == keyword:
+                return family
+            if token.startswith(keyword) and _is_generic_suffix(token[len(keyword):]):
+                return family
+    return None
+
+
+def _resolve_family(value: str) -> str:
+    tokens = _family_tokens(value)
+    families = {fam for token in tokens if (fam := _family_of_token(token)) is not None}
+    if not families:
+        raise ReviewValidationError(f"unknown model family: {value!r}")
+    if len(families) > 1:
+        raise ReviewValidationError(f"ambiguous model family: {value!r}")
+    family = next(iter(families))
+    for token in tokens:
+        token_family = _family_of_token(token)
+        if token_family is not None and token_family != family:
+            raise ReviewValidationError(f"ambiguous model family: {value!r}")
+        if token_family is None and not _is_generic_token(token):
+            raise ReviewValidationError(f"unknown model family: {value!r}")
+    return family
+
+
 def normalize_family(value: str) -> str:
-    lowered = value.strip().lower()
-    for prefix in FAMILY_PREFIXES:
-        if lowered == prefix or lowered.startswith(prefix):
-            return prefix
-    return lowered
+    return _resolve_family(value)
 
 
 def _require_mapping(value, context: str) -> Mapping:
@@ -71,28 +179,60 @@ def _require_list(value, context: str) -> list:
     return value
 
 
-def _parse_finding(raw_finding):
+def _require_non_empty_string(value, context: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ReviewValidationError(f"{context} must be a non-empty string")
+    return value
+
+
+def _require_string_list(value, context: str) -> Tuple[str, ...]:
+    items = _require_list(value, context)
+    if not all(isinstance(item, str) and item.strip() for item in items):
+        raise ReviewValidationError(f"{context} must be a list of non-empty strings")
+    return tuple(items)
+
+
+def _optional_string_list(value, context: str) -> Optional[Tuple[str, ...]]:
+    if value is None:
+        return None
+    return _require_string_list(value, context)
+
+
+def _reject_unknown_keys(mapping, allowed, context: str):
+    unknown = [key for key in mapping if key not in allowed]
+    if unknown:
+        raise ReviewValidationError(
+            f"unknown {context} key(s): {', '.join(sorted(unknown))}"
+        )
+
+
+def _enum_member(mapping, key, enum, context: str):
+    raw = mapping[key]
+    if not isinstance(raw, str) or raw not in enum._value2member_map_:
+        raise ReviewValidationError(f"unsupported {context}: {raw!r}")
+    return enum(raw)
+
+
+def _parse_finding(raw_finding) -> Finding:
     finding = _require_mapping(raw_finding, "finding")
-    required = (f for f in FINDING_FIELDS if f != "follow_up_issue")
-    missing = [k for k in required if k not in finding]
+    _reject_unknown_keys(finding, FINDING_FIELDS, "finding")
+    missing = [field for field in REQUIRED_FINDING_FIELDS if field not in finding]
     if missing:
         raise ReviewValidationError(f"missing finding field(s): {', '.join(missing)}")
 
-    severity_raw = finding["severity"]
-    if severity_raw not in Severity._value2member_map_:
-        raise ReviewValidationError(f"unsupported severity: {severity_raw}")
-    disposition_raw = finding["disposition"]
-    if disposition_raw not in Disposition._value2member_map_:
-        raise ReviewValidationError(f"unsupported disposition: {disposition_raw}")
+    finding_id = _require_non_empty_string(finding["id"], "finding id")
+    root_cause = _require_non_empty_string(finding["root_cause"], "finding.root_cause")
+    summary = _require_non_empty_string(finding["summary"], "finding.summary")
 
-    evidence = _require_list(finding["evidence"], "finding.evidence")
-    if not all(isinstance(item, str) for item in evidence):
-        raise ReviewValidationError("finding.evidence must be a list of strings")
+    severity = _enum_member(finding, "severity", Severity, "severity")
+    disposition = _enum_member(finding, "disposition", Disposition, "disposition")
 
-    severity = Severity(severity_raw)
-    disposition = Disposition(disposition_raw)
+    scope_raw = finding["scope"]
+    if not isinstance(scope_raw, str) or not scope_raw.strip():
+        raise ReviewValidationError("finding.scope must be a non-empty string")
+    scope = scope_raw.strip().casefold()
+
     follow_up = finding.get("follow_up_issue")
-
     if disposition is Disposition.FOLLOW_UP_ISSUE:
         if follow_up is None:
             raise ReviewValidationError("FOLLOW_UP_ISSUE finding requires a follow_up_issue number")
@@ -101,31 +241,43 @@ def _parse_finding(raw_finding):
     elif follow_up is not None:
         raise ReviewValidationError("follow_up_issue only applies to FOLLOW_UP_ISSUE findings")
 
-    finding_id = finding["id"]
-    if not isinstance(finding_id, str) or not finding_id.strip():
-        raise ReviewValidationError("finding id must be a non-empty string")
+    evidence = _require_string_list(finding["evidence"], "finding.evidence")
+
+    bad_case = _optional_string_list(
+        finding.get("bad_case_evidence"), "finding.bad_case_evidence"
+    )
+    good_case = _optional_string_list(
+        finding.get("good_case_evidence"), "finding.good_case_evidence"
+    )
+    if (bad_case is None) != (good_case is None):
+        raise ReviewValidationError(
+            "bad_case_evidence and good_case_evidence must be supplied together"
+        )
 
     return Finding(
         id=finding_id,
-        root_cause=finding["root_cause"],
+        root_cause=root_cause,
         severity=severity,
         disposition=disposition,
-        scope=finding["scope"],
-        summary=finding["summary"],
-        evidence=list(evidence),
+        scope=scope,
+        summary=summary,
+        evidence=evidence,
         follow_up_issue=follow_up,
+        bad_case_evidence=bad_case or (),
+        good_case_evidence=good_case or (),
     )
 
 
 def _parse_family(raw: object, field: str) -> str:
     if not isinstance(raw, str) or not raw.strip():
         raise ReviewValidationError(f"{field} must be a non-empty string")
-    return raw
+    return _resolve_family(raw)
 
 
 def validate_review(record: Mapping) -> ReviewRecord:
     record = _require_mapping(record, "review record")
-    missing = [k for k in TOP_LEVEL_FIELDS if k not in record]
+    _reject_unknown_keys(record, TOP_LEVEL_FIELDS, "review record")
+    missing = [field for field in REQUIRED_TOP_LEVEL_FIELDS if field not in record]
     if missing:
         raise ReviewValidationError(f"missing field(s): {', '.join(missing)}")
 
@@ -134,28 +286,55 @@ def validate_review(record: Mapping) -> ReviewRecord:
         raise ReviewValidationError(f"unsupported schema_version: {schema_version!r}")
 
     repository = record["repository"]
-    if not isinstance(repository, str) or "/" not in repository:
+    if not isinstance(repository, str) or REPOSITORY_RE.fullmatch(repository) is None:
         raise ReviewValidationError("repository must be a 'owner/name' string")
 
     pr_number = record["pr_number"]
     if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
         raise ReviewValidationError("pr_number must be a positive integer")
 
+    reviewed_branch = _require_non_empty_string(
+        record["reviewed_branch"], "reviewed_branch"
+    )
+
     reviewed_commit = record["reviewed_commit"]
-    if not isinstance(reviewed_commit, str) or not COMMIT_ID_RE.match(reviewed_commit):
-        raise ReviewValidationError("reviewed_commit must be a 40-character lowercase hex commit ID")
+    if not isinstance(reviewed_commit, str) or COMMIT_ID_RE.fullmatch(reviewed_commit) is None:
+        raise ReviewValidationError(
+            "reviewed_commit must be a 40-character lowercase hex commit ID"
+        )
+
+    has_base = "base_commit" in record
+    has_range = "comparison_range" in record
+    if has_base == has_range:
+        raise ReviewValidationError("exactly one of base_commit or comparison_range is required")
+    base_commit = None
+    comparison_range = None
+    if has_base:
+        base_commit = record["base_commit"]
+        if not isinstance(base_commit, str) or COMMIT_ID_RE.fullmatch(base_commit) is None:
+            raise ReviewValidationError(
+                "base_commit must be a 40-character lowercase hex commit ID"
+            )
+    else:
+        comparison_range = _require_non_empty_string(
+            record["comparison_range"], "comparison_range"
+        )
 
     implementer_family = _parse_family(record["implementer_family"], "implementer_family")
     reviewer_family = _parse_family(record["reviewer_family"], "reviewer_family")
-    if normalize_family(implementer_family) == normalize_family(reviewer_family):
+    if implementer_family == reviewer_family:
         raise ReviewValidationError(
             "implementer and reviewer must come from a different model family"
         )
 
-    verdict_raw = record["verdict"]
-    verdict = Verdict._value2member_map_.get(verdict_raw)
-    if verdict is None:
-        raise ReviewValidationError(f"unsupported verdict: {verdict_raw}")
+    verdict = _enum_member(record, "verdict", Verdict, "verdict")
+
+    local_evidence = _require_string_list(record["local_evidence"], "local_evidence")
+    if not local_evidence:
+        raise ReviewValidationError("local_evidence must be a non-empty list")
+    ci_evidence = _require_string_list(record["ci_evidence"], "ci_evidence")
+    if not ci_evidence:
+        raise ReviewValidationError("ci_evidence must be a non-empty list")
 
     raw_findings = _require_list(record["findings"], "findings")
     findings = [_parse_finding(item) for item in raw_findings]
@@ -166,23 +345,26 @@ def validate_review(record: Mapping) -> ReviewRecord:
             raise ReviewValidationError(f"duplicate finding id: {finding.id}")
         seen_ids.add(finding.id)
 
-    intentionally_not_findings = _require_list(
+    intentionally_not_findings = _require_string_list(
         record["intentionally_not_findings"], "intentionally_not_findings"
     )
-    if not all(isinstance(item, str) for item in intentionally_not_findings):
-        raise ReviewValidationError("intentionally_not_findings must be a list of strings")
 
     findings, verdict = _apply_mandatory_blocks_and_verdict(findings, verdict)
     return ReviewRecord(
         schema_version=schema_version,
         repository=repository,
         pr_number=pr_number,
+        reviewed_branch=reviewed_branch,
         reviewed_commit=reviewed_commit,
         implementer_family=implementer_family,
         reviewer_family=reviewer_family,
+        local_evidence=local_evidence,
+        ci_evidence=ci_evidence,
         verdict=verdict,
         findings=findings,
-        intentionally_not_findings=list(intentionally_not_findings),
+        intentionally_not_findings=intentionally_not_findings,
+        base_commit=base_commit,
+        comparison_range=comparison_range,
     )
 
 
@@ -200,8 +382,9 @@ def _apply_mandatory_blocks_and_verdict(
                     disposition=Disposition.BLOCKS_PR,
                     scope=finding.scope,
                     summary=finding.summary,
-                    evidence=finding.evidence,
-                    follow_up_issue=None,
+                    evidence=tuple(finding.evidence),
+                    bad_case_evidence=tuple(finding.bad_case_evidence),
+                    good_case_evidence=tuple(finding.good_case_evidence),
                 )
             )
         else:

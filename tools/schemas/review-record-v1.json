@@ -3,14 +3,18 @@
   "$id": "https://ai-orchestration-playbook/schemas/review-record-v1.json",
   "title": "Structured Adversarial Review Record",
   "description": "Machine authority for an independent cross-family PR review. The gate promotes mandatory scopes to BLOCKS_PR independently of reviewer labels.",
+  "$comment": "Standard JSON Schema cannot express uniqueness of a single object property, so duplicate finding IDs cannot be forbidden here. The Python validator enforces that semantic rule and rejects duplicate IDs; this schema intentionally declares no uniqueness keyword.",
   "type": "object",
   "required": [
     "schema_version",
     "repository",
     "pr_number",
+    "reviewed_branch",
     "reviewed_commit",
     "implementer_family",
     "reviewer_family",
+    "local_evidence",
+    "ci_evidence",
     "verdict",
     "findings",
     "intentionally_not_findings"
@@ -28,9 +32,21 @@
       "type": "integer",
       "minimum": 1
     },
+    "reviewed_branch": {
+      "type": "string",
+      "minLength": 1
+    },
     "reviewed_commit": {
       "type": "string",
       "pattern": "^[0-9a-f]{40}$"
+    },
+    "base_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "comparison_range": {
+      "type": "string",
+      "minLength": 1
     },
     "implementer_family": {
       "type": "string",
@@ -39,6 +55,22 @@
     "reviewer_family": {
       "type": "string",
       "minLength": 1
+    },
+    "local_evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "ci_evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
     },
     "verdict": {
       "type": "string",
@@ -58,10 +90,19 @@
     "intentionally_not_findings": {
       "type": "array",
       "items": {
-        "type": "string"
+        "type": "string",
+        "minLength": 1
       }
     }
   },
+  "oneOf": [
+    {
+      "required": ["base_commit"]
+    },
+    {
+      "required": ["comparison_range"]
+    }
+  ],
   "$defs": {
     "finding": {
       "type": "object",
@@ -75,6 +116,10 @@
         "evidence"
       ],
       "additionalProperties": false,
+      "dependentRequired": {
+        "bad_case_evidence": ["good_case_evidence"],
+        "good_case_evidence": ["bad_case_evidence"]
+      },
       "properties": {
         "id": {
           "type": "string",
@@ -113,7 +158,24 @@
         "evidence": {
           "type": "array",
           "items": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "bad_case_evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "good_case_evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
           }
         },
         "follow_up_issue": {
@@ -131,6 +193,11 @@
       },
       "then": {
         "required": ["follow_up_issue"]
+      },
+      "else": {
+        "not": {
+          "required": ["follow_up_issue"]
+        }
       }
     }
   }
