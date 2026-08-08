@@ -1,0 +1,808 @@
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+from datetime import datetime
+
+from pr_closure.model import (
+    CiState,
+    ClosureSnapshot,
+    ClosureState,
+    Evidence,
+)
+from pr_closure.state import derive_state
+from pr_closure.sources import (
+    CheckOutcome,
+    CheckResult,
+    GitHubSource,
+    GitSource,
+    PullRequestFacts,
+    SourceMalformed,
+    SourceUnavailable,
+    classify_ci,
+    parse_check,
+    require_infra_event,
+)
+
+COMMIT_A = "a" * 40
+COMMIT_B = "b" * 40
+COMMIT_C = "c" * 40
+NOW = datetime(2026, 8, 8, 12, 0, 0)
+
+PR_JSON_FIELDS = "number,headRefName,headRefOid,isDraft,state,statusCheckRollup,url"
+GH_BASE = {
+    "number": 42,
+    "headRefName": "feature/close",
+    "headRefOid": COMMIT_A,
+    "isDraft": False,
+    "state": "OPEN",
+    "url": "https://github.com/owner/repo/pull/42",
+    "statusCheckRollup": [],
+}
+VALID_INFRA_EVENT = {
+    "schema_version": 1,
+    "event_type": "INFRA_FAILURE",
+    "commit": COMMIT_A,
+    "failed_job": "build",
+    "test_steps_not_started": ["Run tests"],
+    "evidence_path": "/durable/runs/events.jsonl",
+}
+
+
+def gh_response(**overrides):
+    data = dict(GH_BASE)
+    data.update(overrides)
+    return (0, json.dumps(data), "")
+
+
+def check_run(name, status, conclusion=None, details_url=None):
+    node = {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion}
+    if details_url is not None:
+        node["detailsUrl"] = details_url
+    return node
+
+
+def status_context(context, state):
+    return {"__typename": "StatusContext", "context": context, "state": state}
+
+
+def check_suite(app_name, status, conclusion=None):
+    return {
+        "__typename": "CheckSuite",
+        "app": {"name": app_name, "slug": app_name.lower()},
+        "status": status,
+        "conclusion": conclusion,
+    }
+
+
+def porcelain_block(lines):
+    return "\n".join(lines)
+
+
+def porcelain_output(blocks):
+    return "\n\n".join(blocks) + "\n"
+
+
+def worktree_lines(path, head, branch=None, detached=False, extra=()):
+    lines = ["worktree {0}".format(path), "HEAD {0}".format(head)]
+    if branch is not None:
+        lines.append("branch refs/heads/{0}".format(branch))
+    elif detached:
+        lines.append("detached")
+    lines.extend(extra)
+    return lines
+
+
+class RecordingRunner:
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = []
+
+    def __call__(self, argv, timeout=None):
+        self.calls.append(tuple(argv))
+        key = " ".join(argv)
+        entry = self.responses.get(key, (127, "", "no scripted response for: {0}".format(key)))
+        if callable(entry):
+            return entry(argv, timeout)
+        if isinstance(entry, BaseException):
+            raise entry
+        return entry
+
+
+class TempDirTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.wt = os.path.join(self.tmp, "worktree")
+        self.real_wt = os.path.realpath(self.wt)
+        self.branch = "feature/close"
+
+    def git_c(self, *sub):
+        return " ".join(("git", "-C", self.real_wt) + sub)
+
+    def base_responses(self, head=COMMIT_A, branch=None, remote=COMMIT_A, status=""):
+        branch = self.branch if branch is None else branch
+        block = porcelain_block(worktree_lines(self.real_wt, head, branch=branch))
+        responses = {
+            "git worktree list --porcelain": (0, porcelain_output([block]), ""),
+            self.git_c("rev-parse", "HEAD"): (0, head + "\n", ""),
+            self.git_c("rev-parse", "origin/" + branch): (0, remote + "\n", ""),
+            self.git_c("status", "--porcelain=v1", "--untracked-files=all"): (0, status, ""),
+        }
+        return responses
+
+
+class SourceFailureTests(TempDirTestCase):
+    def test_gh_failure_raises_source_unavailable(self):
+        runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: (1, "", "HTTP 422")})
+        source = GitHubSource("owner/repo", 42, runner=runner)
+        with self.assertRaises(SourceUnavailable):
+            source.read_pr()
+
+    def test_git_failure_raises_source_unavailable(self):
+        responses = self.base_responses()
+        responses["git worktree list --porcelain"] = (128, "", "fatal: not a git repository")
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaises(SourceUnavailable):
+            source.discover_worktree()
+
+    def test_timeout_raises_source_unavailable(self):
+        def timed_out(argv, timeout=None):
+            raise subprocess.TimeoutExpired(" ".join(argv), timeout=timeout)
+
+        responses = self.base_responses()
+        responses["git worktree list --porcelain"] = timed_out
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses), timeout=3)
+        with self.assertRaisesRegex(SourceUnavailable, "timed out"):
+            source.discover_worktree()
+
+    def test_negative_returncode_is_timeout_or_signal(self):
+        responses = self.base_responses()
+        responses["git worktree list --porcelain"] = (-9, "", "Killed")
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaisesRegex(SourceUnavailable, "signal"):
+            source.discover_worktree()
+
+    def test_runner_result_shape_is_validated(self):
+        responses = self.base_responses()
+        responses["git worktree list --porcelain"] = (0, "worktree only")
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaises(SourceMalformed):
+            source.discover_worktree()
+
+    def test_stdout_and_stderr_must_be_text(self):
+        responses = self.base_responses()
+        responses["git worktree list --porcelain"] = (0, b"worktree bytes", None)
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaises(SourceMalformed):
+            source.discover_worktree()
+
+
+class MalformedOutputTests(TempDirTestCase):
+    def test_empty_gh_output_is_malformed(self):
+        runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: (0, "", "")})
+        source = GitHubSource("owner/repo", 42, runner=runner)
+        with self.assertRaises(SourceMalformed):
+            source.read_pr()
+
+    def test_whitespace_gh_output_is_malformed(self):
+        runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: (0, "  \n", "")})
+        source = GitHubSource("owner/repo", 42, runner=runner)
+        with self.assertRaises(SourceMalformed):
+            source.read_pr()
+
+    def test_malformed_json_is_malformed(self):
+        runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: (0, "not json{", "")})
+        source = GitHubSource("owner/repo", 42, runner=runner)
+        with self.assertRaises(SourceMalformed):
+            source.read_pr()
+
+    def test_json_array_is_not_a_pr_object(self):
+        runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: (0, "[]", "")})
+        source = GitHubSource("owner/repo", 42, runner=runner)
+        with self.assertRaises(SourceMalformed):
+            source.read_pr()
+
+    def test_missing_pr_key_raises(self):
+        for key in ("number", "headRefName", "headRefOid", "isDraft", "state", "statusCheckRollup", "url"):
+            with self.subTest(key=key):
+                data = dict(GH_BASE)
+                del data[key]
+                runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: (0, json.dumps(data), "")})
+                source = GitHubSource("owner/repo", 42, runner=runner)
+                with self.assertRaisesRegex(SourceMalformed, key):
+                    source.read_pr()
+
+    def test_pr_number_mismatch_is_malformed(self):
+        runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response(number=7)})
+        source = GitHubSource("owner/repo", 42, runner=runner)
+        with self.assertRaises(SourceMalformed):
+            source.read_pr()
+
+    def test_empty_rev_parse_output_is_malformed(self):
+        responses = self.base_responses()
+        responses[self.git_c("rev-parse", "HEAD")] = (0, "", "")
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaises(SourceMalformed):
+            source.local_head()
+
+    def test_whitespace_rev_parse_output_is_malformed(self):
+        responses = self.base_responses()
+        responses[self.git_c("rev-parse", "HEAD")] = (0, "   \n", "")
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaises(SourceMalformed):
+            source.local_head()
+
+    def test_whitespace_only_status_is_malformed(self):
+        responses = self.base_responses()
+        responses[self.git_c("status", "--porcelain=v1", "--untracked-files=all")] = (0, "  \n", "")
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaises(SourceMalformed):
+            source.worktree_clean()
+
+    def test_empty_worktree_list_is_malformed(self):
+        responses = self.base_responses()
+        responses["git worktree list --porcelain"] = (0, "", "")
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaises(SourceMalformed):
+            source.discover_worktree()
+
+
+class WorktreeBindingTests(TempDirTestCase):
+    def test_binds_requested_resolved_path_to_exactly_one_worktree(self):
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(self.base_responses()))
+        record = source.discover_worktree()
+        self.assertEqual(self.real_wt, record.path)
+        self.assertEqual(COMMIT_A, record.head)
+        self.assertEqual(self.branch, record.branch)
+        self.assertFalse(record.bare)
+        self.assertFalse(record.detached)
+
+    def test_symlink_path_resolves_to_same_worktree(self):
+        real_dir = os.path.join(self.tmp, "real")
+        os.makedirs(real_dir)
+        link = os.path.join(self.tmp, "link")
+        os.symlink(real_dir, link)
+        block = porcelain_block(worktree_lines(os.path.realpath(real_dir), COMMIT_A, branch=self.branch))
+        responses = {
+            "git worktree list --porcelain": (0, porcelain_output([block]), ""),
+        }
+        source = GitSource(link, self.branch, runner=RecordingRunner(responses))
+        record = source.discover_worktree()
+        self.assertEqual(os.path.realpath(real_dir), record.path)
+
+    def test_requested_path_not_a_worktree_is_malformed(self):
+        block = porcelain_block(worktree_lines(os.path.join(self.tmp, "elsewhere"), COMMIT_A, branch=self.branch))
+        responses = {"git worktree list --porcelain": (0, porcelain_output([block]), "")}
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaises(SourceMalformed):
+            source.discover_worktree()
+
+    def test_duplicate_records_for_same_path_are_contradictory(self):
+        block = porcelain_block(worktree_lines(self.real_wt, COMMIT_A, branch=self.branch))
+        duplicate = porcelain_block(worktree_lines(self.real_wt, COMMIT_B, branch=self.branch))
+        responses = {
+            "git worktree list --porcelain": (0, porcelain_output([block, duplicate]), "")
+        }
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaisesRegex(SourceMalformed, "duplicate"):
+            source.discover_worktree()
+
+    def test_detached_and_branch_together_are_contradictory(self):
+        lines = worktree_lines(self.real_wt, COMMIT_A, branch=self.branch)
+        lines.append("detached")
+        responses = {"git worktree list --porcelain": (0, porcelain_output([porcelain_block(lines)]), "")}
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaises(SourceMalformed):
+            source.discover_worktree()
+
+    def test_unknown_worktree_field_is_malformed(self):
+        lines = worktree_lines(self.real_wt, COMMIT_A, branch=self.branch) + ["bogusfield xyz"]
+        responses = {"git worktree list --porcelain": (0, porcelain_output([porcelain_block(lines)]), "")}
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaises(SourceMalformed):
+            source.discover_worktree()
+
+    def test_non_absolute_worktree_path_rejected(self):
+        with self.assertRaises(SourceMalformed):
+            GitSource("relative/worktree", self.branch)
+
+
+class GitHeadTests(TempDirTestCase):
+    def test_local_head_validated_40_lowercase_hex(self):
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(self.base_responses()))
+        self.assertEqual(COMMIT_A, source.local_head())
+
+    def test_remote_head_uses_origin_ref_and_validates(self):
+        responses = self.base_responses(remote=COMMIT_B)
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        self.assertEqual(COMMIT_B, source.remote_head())
+
+    def test_uppercase_and_wrong_length_heads_are_malformed(self):
+        for bad in ("A" * 40, "a" * 39, "a" * 41, "g" * 40, "", "z" * 40):
+            with self.subTest(value=bad):
+                responses = self.base_responses()
+                responses[self.git_c("rev-parse", "HEAD")] = (0, bad + "\n", "")
+                source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+                with self.assertRaises(SourceMalformed):
+                    source.local_head()
+
+    def test_mismatched_commits_preserved_in_snapshot(self):
+        responses = self.base_responses(head=COMMIT_A, remote=COMMIT_B)
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        facts = source.facts()
+        pr = PullRequestFacts(
+            repository="owner/repo",
+            number=42,
+            head_branch=self.branch,
+            head_oid=COMMIT_C,
+            is_draft=False,
+            state="OPEN",
+            url="https://github.com/owner/repo/pull/42",
+            checks=(CheckResult("check_run", "ci", "COMPLETED", "SUCCESS", CheckOutcome.PASSING, None),),
+        )
+        ci = classify_ci(pr.checks, pr.head_oid)
+        snapshot = ClosureSnapshot(
+            evidence_available=frozenset({
+                Evidence.WORKTREE,
+                Evidence.LOCAL_COMMIT,
+                Evidence.REMOTE_COMMIT,
+                Evidence.CI,
+                Evidence.CI_COMMIT,
+            }),
+            local_commit=facts.local_commit,
+            remote_commit=facts.remote_commit,
+            ci_commit=ci.ci_commit,
+            ci_state=ci.ci_state,
+            worktree_clean=facts.worktree_clean,
+        )
+        self.assertEqual(COMMIT_A, facts.local_commit)
+        self.assertEqual(COMMIT_B, facts.remote_commit)
+        self.assertEqual(COMMIT_C, ci.ci_commit)
+        self.assertNotEqual(facts.local_commit, facts.remote_commit)
+        decision = derive_state(snapshot, NOW)
+        self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+        self.assertIn("unpushed commit", decision.reasons)
+        self.assertIn("CI commit mismatch", decision.reasons)
+
+
+class DirtyStateTests(TempDirTestCase):
+    def test_empty_status_is_clean(self):
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(self.base_responses(status="")))
+        clean, entries = source.worktree_clean()
+        self.assertTrue(clean)
+        self.assertEqual((), entries)
+
+    def test_untracked_files_make_worktree_dirty(self):
+        status = " M src/modified.py\n?? untracked/new.py\n?? untracked/another.md\n"
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(self.base_responses(status=status)))
+        clean, entries = source.worktree_clean()
+        self.assertFalse(clean)
+        self.assertEqual((" M src/modified.py", "?? untracked/new.py", "?? untracked/another.md"), entries)
+
+    def test_dirty_entries_are_preserved(self):
+        status = "?? new-file.py\n"
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(self.base_responses(status=status)))
+        facts = source.facts()
+        self.assertFalse(facts.worktree_clean)
+        self.assertIn("?? new-file.py", facts.dirty_entries)
+
+    def test_blank_line_in_status_is_malformed(self):
+        responses = self.base_responses()
+        responses[self.git_c("status", "--porcelain=v1", "--untracked-files=all")] = (0, " M a.py\n\n?? b.py\n", "")
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaises(SourceMalformed):
+            source.worktree_clean()
+
+
+class GitHubPrTests(TempDirTestCase):
+    def test_repository_and_number_are_bound(self):
+        runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response()})
+        source = GitHubSource("owner/repo", 42, runner=runner)
+        pr = source.read_pr()
+        self.assertEqual("owner/repo", pr.repository)
+        self.assertEqual(42, pr.number)
+        self.assertEqual("feature/close", pr.head_branch)
+        self.assertEqual(COMMIT_A, pr.head_oid)
+        self.assertFalse(pr.is_draft)
+        self.assertEqual("OPEN", pr.state)
+        self.assertEqual("https://github.com/owner/repo/pull/42", pr.url)
+
+    def test_invalid_repository_shape_rejected(self):
+        for bad in ("norepo", "/repo", "owner/", "owner repo/x", ""):
+            with self.subTest(value=bad):
+                with self.assertRaises(SourceMalformed):
+                    GitHubSource(bad, 42)
+
+    def test_invalid_pr_number_rejected(self):
+        for bad in (0, -1, 1.5, "42", None, True):
+            with self.subTest(value=bad):
+                with self.assertRaises(SourceMalformed):
+                    GitHubSource("owner/repo", bad)
+
+    def test_head_oid_validated(self):
+        for bad in ("A" * 40, "a" * 39, "g" * 40, ""):
+            with self.subTest(value=bad):
+                runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response(headRefOid=bad)})
+                source = GitHubSource("owner/repo", 42, runner=runner)
+                with self.assertRaises(SourceMalformed):
+                    source.read_pr()
+
+    def test_is_draft_must_be_boolean(self):
+        runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response(isDraft="yes")})
+        source = GitHubSource("owner/repo", 42, runner=runner)
+        with self.assertRaises(SourceMalformed):
+            source.read_pr()
+
+    def test_unknown_pr_state_rejected(self):
+        for bad in ("OPENED", "DRAFT", "MERGING", "closed", "PENDING"):
+            with self.subTest(value=bad):
+                runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response(state=bad)})
+                source = GitHubSource("owner/repo", 42, runner=runner)
+                with self.assertRaises(SourceMalformed):
+                    source.read_pr()
+
+    def test_url_must_bind_repository_and_number(self):
+        for bad in (
+            "https://github.com/other/repo/pull/42",
+            "https://github.com/owner/repo/pull/43",
+            "https://github.com/owner/repo/issues/42",
+            "not-a-url",
+            "",
+        ):
+            with self.subTest(value=bad):
+                runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response(url=bad)})
+                source = GitHubSource("owner/repo", 42, runner=runner)
+                with self.assertRaises(SourceMalformed):
+                    source.read_pr()
+
+    def test_url_rejects_non_github_host(self):
+        for bad in (
+            "https://github.example/owner/repo/pull/42",
+            "https://evil.com/owner/repo/pull/42",
+            "https://github.com.evil.com/owner/repo/pull/42",
+            "https://github%2ecom/owner/repo/pull/42",
+        ):
+            with self.subTest(value=bad):
+                runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response(url=bad)})
+                source = GitHubSource("owner/repo", 42, runner=runner)
+                with self.assertRaises(SourceMalformed):
+                    source.read_pr()
+
+    def test_url_rejects_insecure_scheme_and_credentials(self):
+        for bad in (
+            "http://github.com/owner/repo/pull/42",
+            "ftp://github.com/owner/repo/pull/42",
+            "https://user@github.com/owner/repo/pull/42",
+            "https://user:pass@github.com/owner/repo/pull/42",
+        ):
+            with self.subTest(value=bad):
+                runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response(url=bad)})
+                source = GitHubSource("owner/repo", 42, runner=runner)
+                with self.assertRaises(SourceMalformed):
+                    source.read_pr()
+
+    def test_url_rejects_non_default_port(self):
+        for bad in (
+            "https://github.com:8080/owner/repo/pull/42",
+            "https://github.com:80/owner/repo/pull/42",
+        ):
+            with self.subTest(value=bad):
+                runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response(url=bad)})
+                source = GitHubSource("owner/repo", 42, runner=runner)
+                with self.assertRaises(SourceMalformed):
+                    source.read_pr()
+
+    def test_url_rejects_lookalike_and_encoded_paths(self):
+        for bad in (
+            "https://github.com//owner/repo/pull/42",
+            "https://github.com/ownerx/repo/pull/42",
+            "https://github.com/owner/repo/pull/420",
+            "https://github.com/owner/repo/pulls/42",
+            "https://github.com/owner/repo/pull/42/extra",
+            "https://github.com/owner/repo/pull/42/x",
+            "https://github.com/owner/repo/pull/42/.",
+            "https://github.com/owner/repo/pull/42/..",
+            "https://github.com/owner/repo/pull/%34%32",
+            "https://github.com/%6Fwner/repo/pull/42",
+        ):
+            with self.subTest(value=bad):
+                runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response(url=bad)})
+                source = GitHubSource("owner/repo", 42, runner=runner)
+                with self.assertRaises(SourceMalformed):
+                    source.read_pr()
+
+    def test_url_rejects_query_and_fragment(self):
+        for bad in (
+            "https://github.com/owner/repo/pull/42?x=1",
+            "https://github.com/owner/repo/pull/42#frag",
+        ):
+            with self.subTest(value=bad):
+                runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response(url=bad)})
+                source = GitHubSource("owner/repo", 42, runner=runner)
+                with self.assertRaises(SourceMalformed):
+                    source.read_pr()
+
+    def test_url_accepts_canonical_github_origin(self):
+        for ok in (
+            "https://github.com/owner/repo/pull/42",
+            "https://github.com/owner/repo/pull/42/",
+            "https://GitHub.com/owner/repo/pull/42",
+            "https://GITHUB.COM/owner/repo/pull/42",
+            "https://github.com:443/owner/repo/pull/42",
+        ):
+            with self.subTest(value=ok):
+                runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response(url=ok)})
+                source = GitHubSource("owner/repo", 42, runner=runner)
+                pr = source.read_pr()
+                self.assertEqual(ok, pr.url)
+
+    def test_argv_is_exact_gh_invocation_without_shell(self):
+        runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response()})
+        source = GitHubSource("owner/repo", 42, runner=runner)
+        source.read_pr()
+        self.assertEqual(
+            [("gh", "pr", "view", "42", "--repo", "owner/repo", "--json", PR_JSON_FIELDS)],
+            runner.calls,
+        )
+
+
+class CheckRollupTests(TempDirTestCase):
+    def test_check_run_passing(self):
+        pr = PullRequestFacts(
+            repository="owner/repo", number=42, head_branch="f", head_oid=COMMIT_A,
+            is_draft=False, state="OPEN", url="u",
+            checks=(parse_check(check_run("lint", "COMPLETED", "SUCCESS")),),
+        )
+        self.assertEqual(CheckOutcome.PASSING, pr.checks[0].outcome)
+
+    def test_check_run_failure(self):
+        result = parse_check(check_run("lint", "COMPLETED", "FAILURE"))
+        self.assertEqual(CheckOutcome.FAILURE, result.outcome)
+
+    def test_check_run_pending(self):
+        for status in ("QUEUED", "IN_PROGRESS", "PENDING"):
+            with self.subTest(status=status):
+                result = parse_check(check_run("lint", status))
+                self.assertEqual(CheckOutcome.PENDING, result.outcome)
+
+    def test_check_run_skipped(self):
+        result = parse_check(check_run("lint", "COMPLETED", "SKIPPED"))
+        self.assertEqual(CheckOutcome.SKIPPED, result.outcome)
+
+    def test_status_context_success_and_failure(self):
+        ok = parse_check(status_context("ci/circleci", "SUCCESS"))
+        bad = parse_check(status_context("ci/circleci", "FAILURE"))
+        self.assertEqual(CheckOutcome.PASSING, ok.outcome)
+        self.assertEqual(CheckOutcome.FAILURE, bad.outcome)
+        self.assertEqual("ci/circleci", ok.name)
+        self.assertEqual("status_context", ok.node_type)
+
+    def test_status_context_target_url_used_as_fallback(self):
+        node = {
+            "__typename": "StatusContext",
+            "context": "ci/circleci",
+            "state": "FAILURE",
+            "targetUrl": "https://example.com/logs",
+        }
+        result = parse_check(node)
+        self.assertEqual("https://example.com/logs", result.details_url)
+
+    def test_status_context_target_url_must_be_string(self):
+        for bad in (42, True, 1.5, [], {}):
+            with self.subTest(value=bad):
+                node = {
+                    "__typename": "StatusContext",
+                    "context": "ci/circleci",
+                    "state": "FAILURE",
+                    "targetUrl": bad,
+                }
+                with self.assertRaises(SourceMalformed):
+                    parse_check(node)
+
+    def test_check_suite_uses_app_name(self):
+        result = parse_check(check_suite("build", "COMPLETED", "SUCCESS"))
+        self.assertEqual("build", result.name)
+        self.assertEqual(CheckOutcome.PASSING, result.outcome)
+        self.assertEqual("check_suite", result.node_type)
+
+    def test_unknown_check_conclusion_is_malformed(self):
+        with self.assertRaises(SourceMalformed):
+            parse_check(check_run("lint", "COMPLETED", "DONE_SOON"))
+
+    def test_unknown_check_status_is_malformed(self):
+        with self.assertRaises(SourceMalformed):
+            parse_check(check_run("lint", "FINISHED"))
+
+    def test_unknown_node_type_is_malformed(self):
+        with self.assertRaises(SourceMalformed):
+            parse_check({"__typename": "Magic", "name": "x", "status": "COMPLETED"})
+
+    def test_completed_run_without_conclusion_is_malformed(self):
+        with self.assertRaises(SourceMalformed):
+            parse_check(check_run("lint", "COMPLETED"))
+
+    def test_node_must_be_an_object(self):
+        with self.assertRaises(SourceMalformed):
+            parse_check(["not", "an", "object"])
+
+    def test_missing_node_type_is_malformed(self):
+        with self.assertRaises(SourceMalformed):
+            parse_check({"name": "x", "status": "COMPLETED", "conclusion": "SUCCESS"})
+
+
+class CiClassificationTests(TempDirTestCase):
+    def all_green_checks(self):
+        return (
+            parse_check(check_run("lint", "COMPLETED", "SUCCESS")),
+            parse_check(check_run("test", "COMPLETED", "SUCCESS")),
+        )
+
+    def test_single_failure_not_hidden_by_green_aggregate(self):
+        checks = (
+            parse_check(check_run("lint", "COMPLETED", "SUCCESS")),
+            parse_check(check_run("test", "COMPLETED", "FAILURE")),
+        )
+        ci = classify_ci(checks, COMMIT_A)
+        self.assertEqual(CiState.BRANCH_FAILURE, ci.ci_state)
+        self.assertEqual(COMMIT_A, ci.ci_commit)
+        self.assertIsNone(ci.infra_job)
+
+    def test_all_green_is_passing(self):
+        ci = classify_ci(self.all_green_checks(), COMMIT_A)
+        self.assertEqual(CiState.PASSING, ci.ci_state)
+
+    def test_pending_checks_stay_pending(self):
+        checks = (
+            parse_check(check_run("lint", "COMPLETED", "SUCCESS")),
+            parse_check(check_run("test", "IN_PROGRESS")),
+        )
+        ci = classify_ci(checks, COMMIT_A)
+        self.assertEqual(CiState.PENDING, ci.ci_state)
+
+    def test_skipped_checks_do_not_become_passing_evidence(self):
+        checks = (
+            parse_check(check_run("lint", "COMPLETED", "SUCCESS")),
+            parse_check(check_run("test", "COMPLETED", "SKIPPED")),
+        )
+        ci = classify_ci(checks, COMMIT_A)
+        self.assertNotEqual(CiState.PASSING, ci.ci_state)
+        self.assertEqual(CiState.UNKNOWN, ci.ci_state)
+
+    def test_empty_rollup_is_unknown(self):
+        ci = classify_ci((), COMMIT_A)
+        self.assertEqual(CiState.UNKNOWN, ci.ci_state)
+
+    def test_infra_event_authorizes_infrastructure_classification(self):
+        checks = (parse_check(check_run("build", "COMPLETED", "FAILURE")),)
+        ci = classify_ci(checks, COMMIT_A, infra_event=VALID_INFRA_EVENT)
+        self.assertEqual(CiState.INFRA_FAILURE, ci.ci_state)
+        self.assertEqual("build", ci.infra_job)
+
+    def test_infra_event_for_wrong_job_stays_branch_failure(self):
+        checks = (parse_check(check_run("test", "COMPLETED", "FAILURE")),)
+        event = dict(VALID_INFRA_EVENT, failed_job="build")
+        ci = classify_ci(checks, COMMIT_A, infra_event=event)
+        self.assertEqual(CiState.BRANCH_FAILURE, ci.ci_state)
+        self.assertIsNone(ci.infra_job)
+
+    def test_infra_event_without_test_proof_stays_branch_failure(self):
+        checks = (parse_check(check_run("build", "COMPLETED", "FAILURE")),)
+        event = dict(VALID_INFRA_EVENT, test_steps_not_started=[])
+        ci = classify_ci(checks, COMMIT_A, infra_event=event)
+        self.assertEqual(CiState.BRANCH_FAILURE, ci.ci_state)
+        self.assertIsNone(ci.infra_job)
+
+    def test_malformed_infra_event_raises(self):
+        checks = (parse_check(check_run("build", "COMPLETED", "FAILURE")),)
+        for event in (
+            [],
+            dict(VALID_INFRA_EVENT, event_type="COMMIT"),
+            dict(VALID_INFRA_EVENT, failed_job=""),
+            dict(VALID_INFRA_EVENT, test_steps_not_started="Run tests"),
+            dict(VALID_INFRA_EVENT, test_steps_not_started=[None]),
+            dict(VALID_INFRA_EVENT, test_steps_not_started=[1]),
+            dict(VALID_INFRA_EVENT, commit="abc"),
+            dict(VALID_INFRA_EVENT, evidence_path=""),
+        ):
+            with self.subTest(event=event):
+                with self.assertRaises(SourceMalformed):
+                    classify_ci(checks, COMMIT_A, infra_event=event)
+
+    def test_absent_infra_event_stays_branch_failure(self):
+        checks = (parse_check(check_run("build", "COMPLETED", "FAILURE")),)
+        ci = classify_ci(checks, COMMIT_A, infra_event=None)
+        self.assertEqual(CiState.BRANCH_FAILURE, ci.ci_state)
+        self.assertIsNone(ci.infra_job)
+
+    def test_infra_event_ignored_when_rollup_is_green(self):
+        ci = classify_ci(self.all_green_checks(), COMMIT_A, infra_event=VALID_INFRA_EVENT)
+        self.assertEqual(CiState.PASSING, ci.ci_state)
+        self.assertIsNone(ci.infra_job)
+
+    def test_infra_event_for_stale_commit_stays_branch_failure(self):
+        checks = (parse_check(check_run("build", "COMPLETED", "FAILURE")),)
+        event = dict(VALID_INFRA_EVENT, commit=COMMIT_B)
+        ci = classify_ci(checks, COMMIT_A, infra_event=event)
+        self.assertEqual(CiState.BRANCH_FAILURE, ci.ci_state)
+        self.assertIsNone(ci.infra_job)
+        self.assertTrue(any("commit" in reason for reason in ci.reasons))
+
+    def test_infra_event_for_cross_pr_commit_stays_branch_failure(self):
+        checks = (parse_check(check_run("build", "COMPLETED", "FAILURE")),)
+        event = dict(VALID_INFRA_EVENT, commit=COMMIT_C)
+        ci = classify_ci(checks, COMMIT_A, infra_event=event)
+        self.assertEqual(CiState.BRANCH_FAILURE, ci.ci_state)
+        self.assertIsNone(ci.infra_job)
+
+    def test_infra_event_does_not_hide_unexplained_second_failure(self):
+        checks = (
+            parse_check(check_run("build", "COMPLETED", "FAILURE")),
+            parse_check(check_run("test", "COMPLETED", "FAILURE")),
+        )
+        ci = classify_ci(checks, COMMIT_A, infra_event=VALID_INFRA_EVENT)
+        self.assertEqual(CiState.BRANCH_FAILURE, ci.ci_state)
+        self.assertIsNone(ci.infra_job)
+        self.assertTrue(any("checks failed" in reason for reason in ci.reasons))
+
+    def test_infra_event_does_not_hide_duplicate_same_name_failures(self):
+        checks = (
+            parse_check(check_run("build", "COMPLETED", "FAILURE")),
+            parse_check(check_run("build", "COMPLETED", "FAILURE")),
+        )
+        ci = classify_ci(checks, COMMIT_A, infra_event=VALID_INFRA_EVENT)
+        self.assertEqual(CiState.BRANCH_FAILURE, ci.ci_state)
+        self.assertIsNone(ci.infra_job)
+
+
+class InfraEvidenceTests(TempDirTestCase):
+    def test_require_infra_event_accepts_valid_event(self):
+        evidence = require_infra_event(VALID_INFRA_EVENT)
+        self.assertEqual("build", evidence.failed_job)
+        self.assertEqual(("Run tests",), evidence.test_steps_not_started)
+        self.assertEqual(COMMIT_A, evidence.commit)
+
+    def test_require_infra_event_rejects_malformed(self):
+        for event in ([], "INFRA", {"event_type": "INFRA_FAILURE"}):
+            with self.subTest(event=event):
+                with self.assertRaises(SourceMalformed):
+                    require_infra_event(event)
+
+
+class DiagnosticTests(TempDirTestCase):
+    def test_stderr_appears_in_error_message(self):
+        responses = self.base_responses()
+        responses["git worktree list --porcelain"] = (128, "", "fatal: worktree removed")
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaisesRegex(SourceUnavailable, "fatal: worktree removed"):
+            source.discover_worktree()
+
+    def test_command_context_appears_in_error_message(self):
+        responses = self.base_responses()
+        responses[self.git_c("rev-parse", "HEAD")] = (128, "", "fatal: bad object")
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaisesRegex(SourceUnavailable, "rev-parse"):
+            source.local_head()
+
+    def test_secrets_redacted_from_error_message(self):
+        responses = self.base_responses()
+        responses[self.git_c("rev-parse", "HEAD")] = (
+            1,
+            "",
+            "error: https://user:supersecret@example.com failed (token=supersecret)",
+        )
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaises(SourceUnavailable) as context:
+            source.local_head()
+        self.assertNotIn("supersecret", str(context.exception))
+
+    def test_infra_event_type_must_match(self):
+        event = dict(VALID_INFRA_EVENT, event_type="INFRA_RETRY")
+        with self.assertRaises(SourceMalformed):
+            require_infra_event(event)
+
+
+if __name__ == "__main__":
+    unittest.main()
