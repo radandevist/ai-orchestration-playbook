@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,7 @@ from pr_closure.store import (
     RunStore,
     StoreError,
     StorePathEscape,
+    _serialize,
 )
 
 COMMIT_A = "a" * 40
@@ -650,6 +652,244 @@ class TipObservedBeforeApprovalTests(StoreTestCase):
         self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
         store.write_review(COMMIT_A, "review-1", _review_record())
         self.assertEqual(ApprovalState.STALE, store.approval_status(COMMIT_A))
+
+
+class OrphanEvidenceFailsClosedTests(StoreTestCase):
+    """T3R-F1: a failed event append must not leave approval evidence."""
+
+    def _write_artifact(self, path, record):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(_serialize(record))
+
+    def test_failed_event_append_raises_and_rolls_back_the_artifact(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip-a"))
+        os.chmod(store.events_path, 0o400)
+        try:
+            with self.assertRaises(OSError):
+                store.write_verification(COMMIT_A, _verification_record())
+            self.assertFalse(store.verification_path(COMMIT_A).exists())
+            self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        finally:
+            os.chmod(store.events_path, 0o600)
+
+    def test_failed_append_then_restored_retry_reaches_approved(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip-a"))
+        os.chmod(store.events_path, 0o400)
+        try:
+            with self.assertRaises(OSError):
+                store.write_verification(COMMIT_A, _verification_record())
+        finally:
+            os.chmod(store.events_path, 0o600)
+        store.write_verification(COMMIT_A, _verification_record())
+        store.write_review(COMMIT_A, "review-1", _review_record())
+        self.assertEqual(
+            [COMMIT_EVENT, VERIFICATION_EVENT, REVIEW_EVENT],
+            [e["event_type"] for e in store.read_events()],
+        )
+        self.assertEqual(ApprovalState.APPROVED, store.approval_status(COMMIT_A))
+
+    def test_orphan_artifacts_without_matching_events_never_approve(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip-a"))
+        self._write_artifact(store.verification_path(COMMIT_A), _verification_record())
+        self._write_artifact(store.review_path(COMMIT_A, "review-1"), _review_record())
+        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+
+    def test_failed_repair_append_leaves_an_orphan_that_cannot_approve(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip-a"))
+        self._write_artifact(store.verification_path(COMMIT_A), _verification_record())
+        os.chmod(store.events_path, 0o400)
+        try:
+            with self.assertRaises(OSError):
+                store.write_verification(COMMIT_A, _verification_record())
+            self.assertTrue(store.verification_path(COMMIT_A).is_file())
+            self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        finally:
+            os.chmod(store.events_path, 0o600)
+
+    def test_identical_retry_repairs_a_missing_event(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip-a"))
+        self._write_artifact(store.verification_path(COMMIT_A), _verification_record())
+        store.write_verification(COMMIT_A, _verification_record())
+        self.assertEqual(
+            [COMMIT_EVENT, VERIFICATION_EVENT], [e["event_type"] for e in store.read_events()]
+        )
+        store.write_verification(COMMIT_A, _verification_record())
+        self.assertEqual(2, len(store.read_events()))
+
+    def test_already_complete_identical_write_adds_no_duplicate_event(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip-a"))
+        store.write_verification(COMMIT_A, _verification_record())
+        store.write_verification(COMMIT_A, _verification_record())
+        self.assertEqual(
+            [COMMIT_EVENT, VERIFICATION_EVENT], [e["event_type"] for e in store.read_events()]
+        )
+
+    def test_write_rejects_verification_dir_symlinked_into_tmp_before_any_write(self):
+        session = Path(tempfile.mkdtemp(dir="/tmp"))
+        self.addCleanup(shutil.rmtree, session, ignore_errors=True)
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip-a"))
+        os.symlink(session, store.verification_path(COMMIT_A).parent)
+        with self.assertRaises(ForbiddenEvidencePath):
+            store.write_verification(COMMIT_A, _verification_record())
+        self.assertEqual([], list(session.iterdir()))
+
+    def test_write_rejects_reviews_dir_symlinked_into_tmp_before_any_write(self):
+        session = Path(tempfile.mkdtemp(dir="/tmp"))
+        self.addCleanup(shutil.rmtree, session, ignore_errors=True)
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip-a"))
+        os.symlink(session, store.review_dir(COMMIT_A).parent)
+        with self.assertRaises(ForbiddenEvidencePath):
+            store.write_review(COMMIT_A, "review-1", _review_record())
+        self.assertEqual([], list(session.iterdir()))
+
+    def test_approval_requires_a_matching_verification_event_for_the_resolved_path(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip-a"))
+        self._write_artifact(store.verification_path(COMMIT_A), _verification_record())
+        self._write_artifact(store.review_path(COMMIT_A, "review-1"), _review_record())
+        store.append_event(VERIFICATION_EVENT, COMMIT_A, self.durable_file("elsewhere"))
+        store.append_event(REVIEW_EVENT, COMMIT_A, str(store.review_path(COMMIT_A, "review-1")))
+        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+
+    def test_approval_requires_a_matching_review_event(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip-a"))
+        store.write_verification(COMMIT_A, _verification_record())
+        self._write_artifact(store.review_path(COMMIT_A, "review-1"), _review_record())
+        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        store.write_review(COMMIT_A, "review-1", _review_record())
+        self.assertEqual(ApprovalState.APPROVED, store.approval_status(COMMIT_A))
+
+
+class ConcurrentRecordWriteTests(StoreTestCase):
+    """T3R-F2: atomic no-replace record create under concurrent different-byte writers."""
+
+    def test_concurrent_different_review_bytes_cannot_both_succeed(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip-a"))
+        original = _review_record()
+        changed = dict(original, verdict="CHANGES_REQUIRED")
+        for round_id in range(5):
+            review_id = "rev-%d" % round_id
+            barrier = threading.Barrier(2)
+            outcomes = []
+
+            def worker(record):
+                barrier.wait()
+                try:
+                    store.write_review(COMMIT_A, review_id, record)
+                    outcomes.append("ok")
+                except EvidenceConflict:
+                    outcomes.append("conflict")
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(worker, (original, changed)))
+            self.assertEqual(1, outcomes.count("ok"), outcomes)
+            self.assertEqual(1, outcomes.count("conflict"), outcomes)
+            stored = json.loads(store.review_path(COMMIT_A, review_id).read_text())
+            self.assertIn(stored, (original, changed))
+            review_events = [
+                e
+                for e in store.read_events()
+                if e["event_type"] == REVIEW_EVENT
+                and e["commit"] == COMMIT_A
+                and e["evidence_path"] == str(store.review_path(COMMIT_A, review_id))
+            ]
+            self.assertEqual(1, len(review_events))
+
+    def test_concurrent_identical_review_bytes_may_both_succeed_idempotently(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip-a"))
+        store.write_verification(COMMIT_A, _verification_record())
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def worker():
+            barrier.wait()
+            try:
+                store.write_review(COMMIT_A, "rev-same", _review_record())
+                outcomes.append("ok")
+            except EvidenceConflict:
+                outcomes.append("conflict")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(lambda _: worker(), range(2)))
+        self.assertEqual(2, outcomes.count("ok"))
+        self.assertEqual(_review_record(), json.loads(store.review_path(COMMIT_A, "rev-same").read_text()))
+        events = store.read_events()
+        self.assertEqual({COMMIT_EVENT, VERIFICATION_EVENT, REVIEW_EVENT}, {e["event_type"] for e in events})
+        for event in events:
+            self.assertIn(event["event_type"], (COMMIT_EVENT, VERIFICATION_EVENT, REVIEW_EVENT))
+        self.assertEqual(ApprovalState.APPROVED, store.approval_status(COMMIT_A))
+
+    def test_concurrent_different_verification_bytes_cannot_both_succeed(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip-a"))
+        original = _verification_record()
+        changed = dict(original, commands=[{"command": "pytest", "exit_code": 1}])
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def worker(record):
+            barrier.wait()
+            try:
+                store.write_verification(COMMIT_A, record)
+                outcomes.append("ok")
+            except EvidenceConflict:
+                outcomes.append("conflict")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(worker, (original, changed)))
+        self.assertEqual(1, outcomes.count("ok"))
+        self.assertEqual(1, outcomes.count("conflict"))
+        stored = json.loads(store.verification_path(COMMIT_A).read_text())
+        self.assertIn(stored, (original, changed))
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires os.fork")
+    def test_cross_process_different_review_bytes_cannot_both_succeed(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip-a"))
+        original = _review_record()
+        changed = dict(original, verdict="CHANGES_REQUIRED")
+        for round_id in range(2):
+            review_id = "proc-%d" % round_id
+            r, w = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(r)
+                try:
+                    child_store = RunStore(self.root, "proj", 42)
+                    child_store.write_review(COMMIT_A, review_id, changed)
+                    result = b"ok"
+                except EvidenceConflict:
+                    result = b"conflict"
+                except Exception as error:
+                    result = ("error:" + type(error).__name__).encode("ascii")
+                try:
+                    os.write(w, result)
+                finally:
+                    os.close(w)
+                os._exit(0)
+            os.close(w)
+            try:
+                store.write_review(COMMIT_A, review_id, original)
+                parent_outcome = "ok"
+            except EvidenceConflict:
+                parent_outcome = "conflict"
+            child_outcome = os.read(r, 256).decode("ascii")
+            os.close(r)
+            os.waitpid(pid, 0)
+            self.assertEqual(["conflict", "ok"], sorted((child_outcome, parent_outcome)))
+            stored = json.loads(store.review_path(COMMIT_A, review_id).read_text())
+            self.assertIn(stored, (original, changed))
 
 
 if __name__ == "__main__":

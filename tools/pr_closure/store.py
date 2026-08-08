@@ -323,7 +323,12 @@ class RunStore:
     # -- verification records ---------------------------------------------
 
     def write_verification(self, commit, record: Mapping) -> Path:
-        """Atomically write ``verification/<commit>.json``; never overwrite different bytes."""
+        """Atomically no-replace ``verification/<commit>.json`` plus its event.
+
+        Different bytes never replace an existing record: the losing writer
+        raises ``EvidenceConflict`` and the original bytes survive. An
+        identical-byte retry repairs a missing event rather than early-returning.
+        """
         commit = _require_commit(commit)
         target = self.verification_path(commit)
         record = _require_json_object(record, "verification record")
@@ -332,15 +337,7 @@ class RunStore:
                 "verification record commit contradicts its store path"
             )
         line = _serialize(record)
-        if target.exists():
-            if target.read_bytes() != line:
-                raise EvidenceConflict(
-                    f"verification record already exists with different bytes: {target}"
-                )
-            return target
-        self._write_atomic(target, line)
-        self.append_event(VERIFICATION_EVENT, commit, os.fspath(target))
-        return target
+        return self._commit_record(target, line, VERIFICATION_EVENT, commit)
 
     def verification_exists(self, commit) -> bool:
         return self.verification_path(commit).is_file()
@@ -351,10 +348,12 @@ class RunStore:
     # -- review records ----------------------------------------------------
 
     def write_review(self, commit, review_id, record: Mapping) -> Path:
-        """Atomically write ``reviews/<commit>/<review-id>.json``.
+        """Atomically no-replace ``reviews/<commit>/<review-id>.json`` plus its event.
 
         An existing review id may be written again only with identical bytes;
         different bytes raise ``EvidenceConflict`` and preserve the original.
+        Concurrent different-byte writers of the same id race on an atomic
+        no-replace create, so exactly one succeeds and the losers conflict.
         """
         commit = _require_commit(commit)
         review_id = _require_review_id(review_id)
@@ -363,15 +362,7 @@ class RunStore:
         if "reviewed_commit" in record and record["reviewed_commit"] != commit:
             raise MalformedEvidence("review record reviewed_commit contradicts its store path")
         line = _serialize(record)
-        if target.exists():
-            if target.read_bytes() != line:
-                raise EvidenceConflict(
-                    f"review record already exists with different bytes: {target}"
-                )
-            return target
-        self._write_atomic(target, line)
-        self.append_event(REVIEW_EVENT, commit, os.fspath(target))
-        return target
+        return self._commit_record(target, line, REVIEW_EVENT, commit)
 
     def review_exists(self, commit, review_id) -> bool:
         return self.review_path(commit, review_id).is_file()
@@ -393,19 +384,40 @@ class RunStore:
     def approval_status(self, commit) -> ApprovalState:
         """Derive durable-approval status for one commit, failing closed.
 
-        APPROVED only when an observed current COMMIT_EVENT equals ``commit`` and
-        both a verification record and at least one review record exist and parse.
-        A newer commit event downgrades any older approval to STALE. A missing
-        current-tip event, a missing artifact, or malformed data derives UNVERIFIED
-        or raises rather than passing.
+        APPROVED only when an observed current COMMIT_EVENT equals ``commit``,
+        a valid VERIFICATION_EVENT binds the queried commit to the resolved
+        verification artifact path, and at least one valid REVIEW_EVENT binds it
+        to a resolved review artifact path, with both artifacts present and
+        parseable. A file with no matching event is orphaned evidence and never
+        approves. A newer commit event downgrades any older approval to STALE.
+        A missing current-tip event, a missing artifact, or malformed data
+        derives UNVERIFIED or raises rather than passing.
         """
         commit = _require_commit(commit)
-        tip = self.current_commit()
-        has_verification = self.verification_exists(commit)
-        if has_verification:
+        events = self.read_events()
+
+        tip = None
+        for event in events:
+            if event["event_type"] == COMMIT_EVENT:
+                tip = event["commit"]
+
+        verification = self.verification_path(commit)
+        verification_ok = False
+        if verification.is_file():
+            if not self._has_matching_event(events, VERIFICATION_EVENT, commit, verification):
+                return ApprovalState.UNVERIFIED
             self.read_verification(commit)
-        reviews = self.read_reviews(commit)
-        if not has_verification or not reviews:
+            verification_ok = True
+
+        review_ok = False
+        for path in self.review_paths(commit):
+            if not self._has_matching_event(events, REVIEW_EVENT, commit, path):
+                continue
+            self.read_review(commit, path.stem)
+            review_ok = True
+            break
+
+        if not verification_ok or not review_ok:
             return ApprovalState.UNVERIFIED
         if tip is None:
             return ApprovalState.UNVERIFIED
@@ -413,9 +425,68 @@ class RunStore:
             return ApprovalState.STALE
         return ApprovalState.APPROVED
 
-    # -- atomic record write ----------------------------------------------
+    def _has_matching_event(self, events, event_type, commit, target: Path) -> bool:
+        """Whether an event of ``event_type`` binds ``commit`` to the resolved
+        artifact path ``target`` currently resolves to."""
+        resolved = _resolve(os.fspath(target))
+        return any(
+            event["event_type"] == event_type
+            and event["commit"] == commit
+            and event["evidence_path"] == resolved
+            for event in events
+        )
 
-    def _write_atomic(self, target: Path, line: bytes) -> None:
+    # -- atomic record commit ---------------------------------------------
+
+    def _commit_record(self, target: Path, line: bytes, event_type, commit) -> Path:
+        """Commit a record artifact and its evidence event as one transaction.
+
+        The target is re-resolved against the durable-path rules before any
+        mutation, so a swapped or symlinked verification/reviews directory
+        cannot create the artifact under a forbidden area and fail only after
+        the fact. The artifact is created with an atomic no-replace primitive;
+        exactly one different-byte writer wins, and losers compare the committed
+        bytes and raise ``EvidenceConflict``. The event is appended only after
+        the artifact exists; if the append fails, the artifact created by this
+        call is rolled back. An identical-byte retry repairs a missing event
+        instead of taking an early return, while an already-complete write stays
+        idempotent without a duplicate event.
+        """
+        _require_durable(os.fspath(target), "record path")
+        created = self._atomic_create(target, line)
+        if not created:
+            try:
+                existing = target.read_bytes()
+            except OSError as error:
+                raise MalformedEvidence(
+                    f"cannot read existing record: {target}: {error}"
+                ) from error
+            if existing != line:
+                raise EvidenceConflict(
+                    f"record already exists with different bytes: {target}"
+                )
+        if self._has_matching_event(self.read_events(), event_type, commit, target):
+            return target
+        try:
+            self.append_event(event_type, commit, os.fspath(target))
+        except BaseException:
+            if created:
+                try:
+                    os.unlink(os.fspath(target))
+                except OSError:
+                    pass
+            raise
+        return target
+
+    def _atomic_create(self, target: Path, line: bytes) -> bool:
+        """Create ``target`` with ``line`` using an atomic no-replace primitive.
+
+        Returns True when this call created the target; False when it already
+        existed (or a concurrent writer created it first). The temporary file is
+        always removed, and the parent directory is fsynced when a new entry is
+        made. ``os.link`` fails with ``EEXIST`` if the target already exists, so
+        two writers cannot both create the same path.
+        """
         target.parent.mkdir(parents=True, exist_ok=True)
         temp_name = None
         try:
@@ -426,7 +497,12 @@ class RunStore:
                 handle.write(line)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_name, os.fspath(target))
+            try:
+                os.link(temp_name, os.fspath(target))
+            except OSError:
+                if target.exists():
+                    return False
+                raise
             try:
                 dir_fd = os.open(os.fspath(target.parent), os.O_RDONLY)
                 try:
@@ -435,10 +511,10 @@ class RunStore:
                     os.close(dir_fd)
             except OSError:
                 pass
-        except BaseException:
+            return True
+        finally:
             if temp_name is not None:
                 try:
                     os.unlink(temp_name)
                 except OSError:
                     pass
-            raise
