@@ -1,6 +1,8 @@
 .DS_Store
 Thumbs.db
 *.swp
+__pycache__/
+*.py[cod]
 
 # Runtime dispatch ledgers (run data, not playbook content)
 orchestration/
