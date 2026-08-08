@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 
 class Severity(StrEnum):
@@ -24,6 +25,48 @@ class Verdict(StrEnum):
     APPROVED_WITH_FOLLOW_UPS = "APPROVED_WITH_FOLLOW_UPS"
     APPROVED = "APPROVED"
     INCONCLUSIVE = "INCONCLUSIVE"
+
+
+class ClosureState(StrEnum):
+    CI_RED = "CI_RED"
+    CI_INFRA_RETRY = "CI_INFRA_RETRY"
+    FIXING = "FIXING"
+    LOCAL_VERIFY = "LOCAL_VERIFY"
+    REVIEW_READY = "REVIEW_READY"
+    REVIEWING = "REVIEWING"
+    CHANGES_REQUIRED = "CHANGES_REQUIRED"
+    DESIGN_RESET = "DESIGN_RESET"
+    FOLLOW_UP_FILING = "FOLLOW_UP_FILING"
+    APPROVED_WITH_FOLLOW_UPS = "APPROVED_WITH_FOLLOW_UPS"
+    APPROVED = "APPROVED"
+    NEEDS_OWNER = "NEEDS_OWNER"
+    STALLED = "STALLED"
+    UNVERIFIED = "UNVERIFIED"
+
+
+class CiState(StrEnum):
+    UNKNOWN = "UNKNOWN"
+    PENDING = "PENDING"
+    PASSING = "PASSING"
+    BRANCH_FAILURE = "BRANCH_FAILURE"
+    INFRA_FAILURE = "INFRA_FAILURE"
+
+
+class Evidence(StrEnum):
+    WORKTREE = "worktree"
+    LOCAL_COMMIT = "local_commit"
+    REMOTE_COMMIT = "remote_commit"
+    CI = "ci"
+    CI_COMMIT = "ci_commit"
+
+
+class Contradiction(StrEnum):
+    LOCAL_REMOTE_MISMATCH = "local_remote_mismatch"
+    CI_TIP_MISMATCH = "ci_tip_mismatch"
+    REVIEW_TIP_MISMATCH = "review_tip_mismatch"
+
+
+ALL_EVIDENCE = frozenset(Evidence)
 
 
 def _as_tuple(value):
@@ -71,3 +114,54 @@ class ReviewRecord:
         object.__setattr__(self, "intentionally_not_findings", _as_tuple(self.intentionally_not_findings))
         object.__setattr__(self, "local_evidence", _as_tuple(self.local_evidence))
         object.__setattr__(self, "ci_evidence", _as_tuple(self.ci_evidence))
+
+
+@dataclass(frozen=True)
+class ClosureSnapshot:
+    """Already-read facts about one pull request, tied to one pushed tip.
+
+    Defaults fail closed: missing evidence, unknown CI, absent commits, and
+    unverified gates never imply a favorable state.
+    """
+
+    evidence_available: frozenset = frozenset()
+    contradictions: frozenset = frozenset()
+    local_commit: Optional[str] = None
+    remote_commit: Optional[str] = None
+    ci_commit: Optional[str] = None
+    review_commit: Optional[str] = None
+    verification_commit: Optional[str] = None
+    worktree_clean: Optional[bool] = None
+    local_verification: Optional[bool] = None
+    ci_state: CiState = CiState.UNKNOWN
+    fixing_lane_active: bool = False
+    review_owned: bool = False
+    review_verdict: Optional[Verdict] = None
+    blocking_findings: Tuple[str, ...] = ()
+    follow_up_findings: Tuple[str, ...] = ()
+    follow_ups_complete: Optional[bool] = None
+    repeated_root_cause: Optional[str] = None
+    distinct_repair_strategies: int = 0
+    executor_deaths: int = 0
+    owner_decision_required: bool = False
+    infra_retry_budget: int = 0
+    infra_retries_used: int = 0
+    stagnation_budget_minutes: int = 0
+    last_progress_at: Optional[datetime] = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "evidence_available", frozenset(self.evidence_available))
+        object.__setattr__(self, "contradictions", frozenset(self.contradictions))
+        object.__setattr__(self, "blocking_findings", _as_tuple(self.blocking_findings))
+        object.__setattr__(self, "follow_up_findings", _as_tuple(self.follow_up_findings))
+
+
+@dataclass(frozen=True)
+class StateDecision:
+    state: ClosureState
+    reasons: Tuple[str, ...]
+    allowed_actions: Tuple[str, ...]
+
+    def __post_init__(self):
+        object.__setattr__(self, "reasons", _as_tuple(self.reasons))
+        object.__setattr__(self, "allowed_actions", _as_tuple(self.allowed_actions))
