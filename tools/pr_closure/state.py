@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 from typing import Mapping, Tuple
 
+from pr_closure.contract import COMMIT_ID_PATTERN, ReviewValidationError
 from pr_closure.model import (
     CiState,
     ClosureSnapshot,
@@ -35,6 +37,8 @@ _CORE_STATES_WITH_CI_COMMIT = (
     CiState.BRANCH_FAILURE,
     CiState.INFRA_FAILURE,
 )
+
+_COMMIT_ID_RE = re.compile(COMMIT_ID_PATTERN)
 
 
 def derive_state(snapshot, now) -> StateDecision:
@@ -155,11 +159,23 @@ def _missing_evidence(snapshot, ci_state, review_verdict) -> list:
 
 def _contradictions(snapshot) -> list:
     contradictions = sorted(snapshot.contradictions, key=str)
-    if snapshot.local_commit and snapshot.remote_commit and snapshot.local_commit != snapshot.remote_commit:
+    if (
+        snapshot.local_commit is not None
+        and snapshot.remote_commit is not None
+        and snapshot.local_commit != snapshot.remote_commit
+    ):
         contradictions.append("unpushed commit")
-    if snapshot.local_commit and snapshot.ci_commit and snapshot.ci_commit != snapshot.local_commit:
+    if (
+        snapshot.local_commit is not None
+        and snapshot.ci_commit is not None
+        and snapshot.ci_commit != snapshot.local_commit
+    ):
         contradictions.append("CI commit mismatch")
-    if snapshot.local_commit and snapshot.review_commit and snapshot.review_commit != snapshot.local_commit:
+    if (
+        snapshot.local_commit is not None
+        and snapshot.review_commit is not None
+        and snapshot.review_commit != snapshot.local_commit
+    ):
         contradictions.append("reviewed commit mismatch")
     return contradictions
 
@@ -211,6 +227,18 @@ def _validate(snapshot, now) -> None:
     ):
         if value is not None and not isinstance(value, str):
             raise TypeError(f"{name} must be a str or None")
+
+    for name, value in (
+        ("local_commit", snapshot.local_commit),
+        ("remote_commit", snapshot.remote_commit),
+        ("ci_commit", snapshot.ci_commit),
+        ("review_commit", snapshot.review_commit),
+        ("verification_commit", snapshot.verification_commit),
+    ):
+        if value is not None and _COMMIT_ID_RE.fullmatch(value) is None:
+            raise ReviewValidationError(
+                f"{name} must be a 40-character lowercase hex commit id"
+            )
 
     for name, value in (
         ("fixing_lane_active", snapshot.fixing_lane_active),
