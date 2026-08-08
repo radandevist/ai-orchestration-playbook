@@ -6,7 +6,8 @@
 
 **Architecture:** A small Python standard-library package owns typed records, validation, state derivation, durable append-only evidence, live Git/GitHub reads, and a CLI. Project-specific commands and limits come from a versioned JSON configuration referenced by each orchestration adapter. Markdown reports remain readable by people; versioned JSON records are the only machine authority.
 
-**Tech Stack:** Python 3 standard library, `unittest`, Git, GitHub CLI, JSON, Bash, Markdown.
+**Tech Stack:** Python 3 standard library in production, `unittest`, pinned test-only
+`jsonschema==4.19.2`, Git, GitHub CLI, JSON, Bash, Markdown.
 
 **Existing-work warning:** The playbook checkout already contains untracked, user-owned
 `tools/board.py`, `tools/run-lane.sh`, and `tools/run-review.sh`. They are reference material and paid
@@ -20,6 +21,8 @@ filenames.
 
 - Create `tools/pr_closure/__init__.py` — public package version.
 - Create `tools/pr_closure/model.py` — enums and immutable records.
+- Create `tools/pr_closure/contract.py` — single declarative source for Python validation and JSON Schema.
+- Create `tools/pr_closure/families.py` — fail-closed configured-model family resolution.
 - Create `tools/pr_closure/review.py` — structured review validation and mandatory-block promotion.
 - Create `tools/pr_closure/state.py` — pure state derivation.
 - Create `tools/pr_closure/store.py` — append-only durable evidence store.
@@ -31,6 +34,8 @@ filenames.
 - Create `tools/schemas/project-closure-v1.json` — published project-config contract.
 - Create `tools/tests/fixtures/` — paid-failure fixtures.
 - Create `tools/tests/test_review.py` — review parsing and disposition tests.
+- Create `tools/tests/test_schema_agreement.py` — generated-schema/Python differential tests.
+- Create `tools/tests/requirements-test.txt` — pinned dependencies used only by tests.
 - Create `tools/tests/test_state.py` — state-transition tests.
 - Create `tools/tests/test_store.py` — durable evidence and stale-approval tests.
 - Create `tools/tests/test_sources.py` — live-source failure semantics.
@@ -68,9 +73,13 @@ class ReviewValidationTests(unittest.TestCase):
             "schema_version": 1,
             "repository": "owner/repo",
             "pr_number": 42,
+            "reviewed_branch": "feat/pr-closure-framework",
             "reviewed_commit": "a" * 40,
+            "base_commit": "b" * 40,
             "implementer_family": "deepseek",
             "reviewer_family": "claude",
+            "local_evidence": ["tests:tools/tests/test_review.py"],
+            "ci_evidence": ["ci:pr-check/run-1"],
             "verdict": "APPROVED_WITH_FOLLOW_UPS",
             "findings": [{
                 "id": "F-1",
@@ -656,3 +665,23 @@ Any blockers return to Task 1-8 as appropriate; non-blockers require verified fo
 
 Run `tools/pr-closure check-transition ... --to APPROVED` against the framework's own fixture-backed
 review record. Report the artifact path. Do not push or merge without explicit owner authorization.
+
+---
+
+### Recorded deviation: `jsonschema` is a pinned, test-only dependency (Task 1 design reset)
+
+Approved during the Task 1 design reset (packet section 4): the production `pr_closure` package remains
+standard-library-only — `contract.py`, `families.py`, `review.py`, `model.py` import nothing beyond the
+standard library plus each other. The schema/python differential suite in
+`tools/tests/test_schema_agreement.py` uses `jsonschema` as a strict test-only peer of the Python
+validator. To keep this honest:
+
+- `tools/tests/requirements-test.txt` pins `jsonschema==4.19.2`.
+- The agreement module imports `from jsonschema import Draft202012Validator` unguarded — no
+  `try/except ImportError`, no `@unittest.skipUnless` — so a missing dependency fails the suite loudly
+  instead of silently skipping.
+- `test_production_package_does_not_import_jsonschema` scans `tools/pr_closure/*.py` and fails if the
+  dependency leaks into production.
+- `test_jsonschema_is_a_pinned_test_only_dependency` asserts the pinned version equals the installed one.
+- The published schema is regenerated only from `contract.py` (`PYTHONPATH=tools python3 -m
+  pr_closure.contract > tools/schemas/review-record-v1.json`); its `$comment` forbids hand-editing.

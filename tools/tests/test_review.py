@@ -3,14 +3,34 @@ import unittest
 from pathlib import Path
 
 from pr_closure.model import Disposition, Severity, Verdict
-from pr_closure.review import ReviewValidationError, validate_review
+from pr_closure.review import ReviewValidationError, normalize_family, validate_review
 
-try:
-    from jsonschema import Draft202012Validator
 
-    HAS_JSONSCHEMA = True
-except ImportError:  # pragma: no cover - environment without jsonschema
-    HAS_JSONSCHEMA = False
+def _valid_record():
+    return {
+        "schema_version": 1,
+        "repository": "owner/repo",
+        "pr_number": 42,
+        "reviewed_branch": "feat/pr-closure-framework",
+        "reviewed_commit": "a" * 40,
+        "base_commit": "b" * 40,
+        "implementer_family": "deepseek",
+        "reviewer_family": "claude",
+        "local_evidence": ["tests:tools/tests/test_review.py"],
+        "ci_evidence": ["ci:pr-check/run-1"],
+        "verdict": "APPROVED_WITH_FOLLOW_UPS",
+        "findings": [{
+            "id": "F-1",
+            "root_cause": "missing-output-test",
+            "severity": "MINOR",
+            "disposition": "FOLLOW_UP_ISSUE",
+            "scope": "pre_existing",
+            "summary": "Operator output lacks a mutation guard",
+            "evidence": ["476 tests survive the mutation"],
+            "follow_up_issue": 900,
+        }],
+        "intentionally_not_findings": [],
+    }
 
 
 class ReviewValidationTests(unittest.TestCase):
@@ -508,102 +528,121 @@ class ReviewValidationTests(unittest.TestCase):
             validate_review(record)
 
 
-@unittest.skipUnless(HAS_JSONSCHEMA, "jsonschema is not installed")
-class SchemaAgreementTests(unittest.TestCase):
-    def schema(self):
-        path = Path(__file__).resolve().parent.parent / "schemas" / "review-record-v1.json"
-        return json.loads(path.read_text())
+class ConfiguredFamilySpellingTests(unittest.TestCase):
+    CONFIGURED = {
+        "deepseek-v4-flash": "deepseek",
+        "cline-pass/cline-pass/deepseek-v4-flash": "deepseek",
+        "opencode/deepseek-v4-flash-free": "deepseek",
+        "gpt-5.3-codex": "openai",
+        "gpt-5.3-codex-spark": "openai",
+        "gpt-5.6-sol": "openai",
+        "gpt-5.6-luna": "openai",
+        "claude-opus-5": "anthropic",
+        "anthropic/claude-sonnet-5": "anthropic",
+        "openrouter/anthropic/claude-opus-5": "anthropic",
+        "kimi-k2": "moonshot",
+        "kimi-k2.6": "moonshot",
+        "mimo-v2.5-pro": "xiaomi",
+        "qwen3.7-max": "alibaba",
+        "glm-5.2": "zhipu",
+        "z-ai/glm-5.2": "zhipu",
+        "x-ai/grok-4": "xai",
+        "Claude Opus 5": "anthropic",
+    }
 
-    def valid_record(self):
-        return {
-            "schema_version": 1,
-            "repository": "owner/repo",
-            "pr_number": 42,
-            "reviewed_branch": "feat/pr-closure-framework",
-            "reviewed_commit": "a" * 40,
-            "base_commit": "b" * 40,
-            "implementer_family": "deepseek",
-            "reviewer_family": "claude",
-            "local_evidence": ["tests:tools/tests/test_review.py"],
-            "ci_evidence": ["ci:pr-check/run-1"],
-            "verdict": "APPROVED_WITH_FOLLOW_UPS",
-            "findings": [{
-                "id": "F-1",
-                "root_cause": "missing-output-test",
-                "severity": "MINOR",
-                "disposition": "FOLLOW_UP_ISSUE",
-                "scope": "pre_existing",
-                "summary": "Operator output lacks a mutation guard",
-                "evidence": ["476 tests survive the mutation"],
-                "follow_up_issue": 900,
-            }],
-            "intentionally_not_findings": [],
-        }
+    UNKNOWN = ("gptzero", "claude-killer", "wizard-9000", "mario", "x", "x5")
 
-    def schema_valid(self, record):
-        return Draft202012Validator(self.schema()).is_valid(record)
+    CROSS_LINEAGE_PAIRS = (
+        ("deepseek-v4-flash", "gpt-5.3-codex"),
+        ("opencode/deepseek-v4-flash-free", "claude-opus-5"),
+        ("gpt-5.6-sol", "kimi-k2.6"),
+        ("claude-opus-5", "mimo-v2.5-pro"),
+        ("kimi-k2.6", "qwen3.7-max"),
+        ("mimo-v2.5-pro", "glm-5.2"),
+        ("qwen3.7-max", "x-ai/grok-4"),
+        ("glm-5.2", "deepseek-v4-flash"),
+        ("x-ai/grok-4", "minimax"),
+    )
 
-    def _mutations(self):
-        return {
-            "unknown top-level key": dict(self.valid_record(), rogue="x"),
-            "unknown finding key": (
-                lambda r: dict(r, findings=[dict(r["findings"][0], rogue="x")])
-            )(self.valid_record()),
-            "null root_cause": (
-                lambda r: dict(r, findings=[dict(r["findings"][0], root_cause=None)])
-            )(self.valid_record()),
-            "empty scope": (
-                lambda r: dict(r, findings=[dict(r["findings"][0], scope="")])
-            )(self.valid_record()),
-            "int summary": (
-                lambda r: dict(r, findings=[dict(r["findings"][0], summary=123)])
-            )(self.valid_record()),
-            "repository a/b/c": dict(self.valid_record(), repository="a/b/c"),
-            "unknown verdict": dict(self.valid_record(), verdict="LOOKS_FINE"),
-            "bad commit": dict(self.valid_record(), reviewed_commit="NOPE"),
-            "follow_up_issue on NOTE_ONLY": (
-                lambda r: dict(r, findings=[dict(r["findings"][0], disposition="NOTE_ONLY")])
-            )(self.valid_record()),
-            "both base_commit and comparison_range": dict(
-                self.valid_record(), comparison_range="c236e90..5dcfc09"
-            ),
-            "neither base_commit nor comparison_range": dict(
-                self.valid_record(), base_commit=None
-            ),
-            "empty local_evidence": dict(self.valid_record(), local_evidence=[]),
-            "empty ci_evidence": dict(self.valid_record(), ci_evidence=[]),
-        }
+    SAME_LINEAGE_PAIRS = (
+        ("openrouter/anthropic/claude-opus-5", "claude-opus-5"),
+        ("gpt-5.6-sol", "gpt-5.3-codex-spark"),
+        ("cline-pass/cline-pass/deepseek-v4-flash", "opencode/deepseek-v4-flash-free"),
+        ("kimi-k2.6", "moonshot/kimi-k2"),
+        ("z-ai/glm-5.2", "glm-4"),
+        ("x-ai/grok-4", "grok-3-mini"),
+    )
 
-    def test_python_and_schema_agree_on_structural_acceptance(self):
-        valid = self.valid_record()
-        self.assertTrue(self.schema_valid(valid))
-        validate_review(valid)
-        for label, record in self._mutations().items():
-            with self.subTest(label=label):
-                schema_ok = self.schema_valid(record)
-                try:
+    def test_every_configured_spelling_resolves(self):
+        failures = []
+        for spelling, expected in self.CONFIGURED.items():
+            try:
+                got = normalize_family(spelling)
+            except ReviewValidationError as error:
+                failures.append(f"{spelling} -> {error}")
+                continue
+            if got != expected:
+                failures.append(f"{spelling!r} -> {got!r}")
+        self.assertEqual([], failures)
+
+    def test_unknown_and_lookalike_spellings_are_still_rejected(self):
+        failures = []
+        for spelling in self.UNKNOWN:
+            try:
+                got = normalize_family(spelling)
+                failures.append(f"{spelling!r} -> {got!r}")
+            except ReviewValidationError:
+                pass
+        self.assertEqual([], failures)
+
+    def test_configured_cross_lineage_pairs_are_recordable(self):
+        failures = []
+        for implementer, reviewer in self.CROSS_LINEAGE_PAIRS:
+            record = _valid_record()
+            record["implementer_family"] = implementer
+            record["reviewer_family"] = reviewer
+            try:
+                validate_review(record)
+            except ReviewValidationError as error:
+                failures.append(f"{implementer} vs {reviewer} unrecordable: {error}")
+        self.assertEqual([], failures)
+
+    def test_same_lineage_pairs_are_still_rejected(self):
+        for first, second in self.SAME_LINEAGE_PAIRS:
+            with self.subTest(first=first, second=second):
+                record = _valid_record()
+                record["implementer_family"] = first
+                record["reviewer_family"] = second
+                with self.assertRaisesRegex(
+                    ReviewValidationError, "different model family"
+                ):
                     validate_review(record)
-                    python_ok = True
-                except ReviewValidationError:
-                    python_ok = False
-                self.assertEqual(
-                    schema_ok,
-                    python_ok,
-                    f"agreement broken for {label}: schema={schema_ok} python={python_ok}",
-                )
-                self.assertFalse(schema_ok, f"expected both validators to reject {label}")
 
-    def test_duplicate_finding_ids_are_python_only_enforcement(self):
-        record = self.valid_record()
-        record["findings"].append(dict(record["findings"][0], severity="MAJOR"))
-        self.assertTrue(self.schema_valid(record))
-        with self.assertRaisesRegex(ReviewValidationError, "duplicate"):
-            validate_review(record)
 
-    def test_schema_documents_duplicate_id_limitation_in_comment(self):
-        comment = self.schema().get("$comment", "")
-        self.assertIn("duplicate", comment.casefold())
-        self.assertNotIn("uniqueIDs", self.schema())
+class GeneratedSchemaTests(unittest.TestCase):
+    def published_schema(self):
+        path = Path(__file__).resolve().parent.parent / "schemas" / "review-record-v1.json"
+        return path.read_text()
+
+    def test_published_schema_is_exactly_what_the_gate_generates(self):
+        from pr_closure.contract import render_schema
+
+        published = self.published_schema()
+        generated = render_schema()
+        self.assertEqual(
+            generated,
+            published,
+            "tools/schemas/review-record-v1.json drifted from contract.py - regenerate "
+            "with PYTHONPATH=tools python3 -m pr_closure.contract",
+        )
+
+    def test_schema_documents_every_deliberate_python_only_semantic(self):
+        from pr_closure.contract import SEMANTIC_ASYMMETRIES
+
+        comment = json.loads(self.published_schema()).get("$comment", "")
+        for asymmetry in SEMANTIC_ASYMMETRIES:
+            with self.subTest(asymmetry=asymmetry):
+                self.assertIn(asymmetry, comment)
 
 
 if __name__ == "__main__":

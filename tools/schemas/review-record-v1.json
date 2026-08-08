@@ -3,7 +3,7 @@
   "$id": "https://ai-orchestration-playbook/schemas/review-record-v1.json",
   "title": "Structured Adversarial Review Record",
   "description": "Machine authority for an independent cross-family PR review. The gate promotes mandatory scopes to BLOCKS_PR independently of reviewer labels.",
-  "$comment": "Standard JSON Schema cannot express uniqueness of a single object property, so duplicate finding IDs cannot be forbidden here. The Python validator enforces that semantic rule and rejects duplicate IDs; this schema intentionally declares no uniqueness keyword.",
+  "$comment": "Generated from tools/pr_closure/contract.py by PYTHONPATH=tools python3 -m pr_closure.contract - never hand-edit. Residual semantics JSON Schema cannot express are enforced in Python and are documented verbatim: duplicate finding IDs cannot be forbidden here: JSON Schema has no uniqueness keyword over object properties, so the Python gate rejects duplicate ids and this schema deliberately declares none.; unknown model family (e.g. wizard-9000) is rejected only by the Python resolver: model lineage is not representable as a JSON Schema pattern, so this schema accepts any non-blank spelling.; third-party lookalike (claude-killer) is rejected only by the Python resolver: a product name attached to a vendor prefix is not expressible in this schema, so the schema accepts it.; same family under different spellings is rejected only by the Python gate: JSON Schema cannot compare implementer_family with reviewer_family, so this schema accepts families that resolve to the same lineage.; schema_version 1.0 is rejected only by the Python gate: JSON Schema's const treats the numeric literal 1.0 as equal to 1, while the Python gate requires an exact integer type.",
   "type": "object",
   "required": [
     "schema_version",
@@ -22,11 +22,12 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
+      "type": "integer",
       "const": 1
     },
     "repository": {
       "type": "string",
-      "pattern": "^[^/]+/[^/]+$"
+      "pattern": "^[^/\\s]+/[^/\\s]+(?![\\s\\S])"
     },
     "pr_number": {
       "type": "integer",
@@ -34,43 +35,53 @@
     },
     "reviewed_branch": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "\\S"
     },
     "reviewed_commit": {
       "type": "string",
-      "pattern": "^[0-9a-f]{40}$"
+      "pattern": "^[0-9a-f]{40}(?![\\s\\S])",
+      "minLength": 40,
+      "maxLength": 40
     },
     "base_commit": {
       "type": "string",
-      "pattern": "^[0-9a-f]{40}$"
+      "pattern": "^[0-9a-f]{40}(?![\\s\\S])",
+      "minLength": 40,
+      "maxLength": 40
     },
     "comparison_range": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "\\S"
     },
     "implementer_family": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "\\S"
     },
     "reviewer_family": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "pattern": "\\S"
     },
     "local_evidence": {
       "type": "array",
-      "minItems": 1,
       "items": {
         "type": "string",
-        "minLength": 1
-      }
+        "minLength": 1,
+        "pattern": "\\S"
+      },
+      "minItems": 1
     },
     "ci_evidence": {
       "type": "array",
-      "minItems": 1,
       "items": {
         "type": "string",
-        "minLength": 1
-      }
+        "minLength": 1,
+        "pattern": "\\S"
+      },
+      "minItems": 1
     },
     "verdict": {
       "type": "string",
@@ -91,16 +102,21 @@
       "type": "array",
       "items": {
         "type": "string",
-        "minLength": 1
+        "minLength": 1,
+        "pattern": "\\S"
       }
     }
   },
   "oneOf": [
     {
-      "required": ["base_commit"]
+      "required": [
+        "base_commit"
+      ]
     },
     {
-      "required": ["comparison_range"]
+      "required": [
+        "comparison_range"
+      ]
     }
   ],
   "$defs": {
@@ -117,17 +133,23 @@
       ],
       "additionalProperties": false,
       "dependentRequired": {
-        "bad_case_evidence": ["good_case_evidence"],
-        "good_case_evidence": ["bad_case_evidence"]
+        "bad_case_evidence": [
+          "good_case_evidence"
+        ],
+        "good_case_evidence": [
+          "bad_case_evidence"
+        ]
       },
       "properties": {
         "id": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "\\S"
         },
         "root_cause": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "\\S"
         },
         "severity": {
           "type": "string",
@@ -149,38 +171,43 @@
         },
         "scope": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "\\S"
         },
         "summary": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "\\S"
         },
         "evidence": {
           "type": "array",
           "items": {
             "type": "string",
-            "minLength": 1
-          }
-        },
-        "bad_case_evidence": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "type": "string",
-            "minLength": 1
-          }
-        },
-        "good_case_evidence": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "pattern": "\\S"
           }
         },
         "follow_up_issue": {
           "type": "integer",
           "minimum": 1
+        },
+        "bad_case_evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "minItems": 1
+        },
+        "good_case_evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "minItems": 1
         }
       },
       "if": {
@@ -189,14 +216,20 @@
             "const": "FOLLOW_UP_ISSUE"
           }
         },
-        "required": ["disposition"]
+        "required": [
+          "disposition"
+        ]
       },
       "then": {
-        "required": ["follow_up_issue"]
+        "required": [
+          "follow_up_issue"
+        ]
       },
       "else": {
         "not": {
-          "required": ["follow_up_issue"]
+          "required": [
+            "follow_up_issue"
+          ]
         }
       }
     }
