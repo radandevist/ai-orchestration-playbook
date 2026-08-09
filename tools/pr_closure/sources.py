@@ -194,7 +194,12 @@ def _parse_worktree_block(lines, argv) -> WorktreeRecord:
     if marker == "bare":
         bare, path, rest = True, None, lines[1:]
     elif marker.startswith("worktree "):
-        bare, path, rest = False, marker[len("worktree "):], lines[1:]
+        path = marker[len("worktree "):]
+        if not path or not os.path.isabs(path):
+            raise SourceMalformed(
+                "worktree record path must be absolute for: {0}".format(_describe_command(argv))
+            )
+        bare, rest = False, lines[1:]
     else:
         raise SourceMalformed(
             "unexpected worktree marker {0!r} for: {1}".format(marker, _describe_command(argv))
@@ -236,20 +241,33 @@ def _parse_worktree_block(lines, argv) -> WorktreeRecord:
                     )
                 )
             detached = True
-        elif key in ("bare", "prunable", "reftable", "locked", "lock_reason"):
+        elif key == "bare":
+            if value is not None or bare:
+                raise SourceMalformed(
+                    "contradictory worktree bare field for: {0}".format(_describe_command(argv))
+                )
+            bare = True
+        elif key in ("prunable", "reftable", "locked", "lock_reason"):
             continue
         else:
             raise SourceMalformed(
                 "unknown worktree field {0!r} for: {1}".format(key, _describe_command(argv))
             )
-    if not bare and head is None:
+    if bare:
+        if head is not None or branch is not None or detached:
+            raise SourceMalformed(
+                "contradictory bare worktree record for: {0}".format(_describe_command(argv))
+            )
+        path = None
+    elif head is None:
         raise SourceMalformed(
             "worktree record missing HEAD for: {0}".format(_describe_command(argv))
         )
+    else:
+        head = _require_commit(head, "worktree HEAD", argv)
     resolved = None
     if path is not None:
         resolved = os.path.realpath(os.path.abspath(path))
-        head = _require_commit(head, "worktree HEAD", argv)
     return WorktreeRecord(path=resolved, head=head, branch=branch, detached=detached, bare=bare)
 
 
@@ -257,7 +275,7 @@ def _parse_worktree_block(lines, argv) -> WorktreeRecord:
 # GitSource
 # ---------------------------------------------------------------------------
 
-WORKTREE_LIST_COMMAND = ("git", "worktree", "list", "--porcelain")
+WORKTREE_LIST_COMMAND = ("worktree", "list", "--porcelain")
 STATUS_COMMAND = ("status", "--porcelain=v1", "--untracked-files=all")
 
 
@@ -307,7 +325,7 @@ class GitSource:
         return ("git", "-C", worktree_path) + tuple(sub_args)
 
     def discover_worktree(self) -> WorktreeRecord:
-        argv = WORKTREE_LIST_COMMAND
+        argv = self._git_c(self._resolved, WORKTREE_LIST_COMMAND)
         _, stdout, _ = _invoke(argv, self._timeout, self._runner)
         raw = _require_non_blank(stdout, argv, "git worktree list")
         records = [_parse_worktree_block(block, argv) for block in _split_blocks(raw)]

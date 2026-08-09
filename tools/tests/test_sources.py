@@ -21,7 +21,9 @@ from pr_closure.sources import (
     PullRequestFacts,
     SourceMalformed,
     SourceUnavailable,
+    _parse_worktree_block,
     classify_ci,
+    default_runner,
     parse_check,
     require_infra_event,
 )
@@ -126,7 +128,7 @@ class TempDirTestCase(unittest.TestCase):
         branch = self.branch if branch is None else branch
         block = porcelain_block(worktree_lines(self.real_wt, head, branch=branch))
         responses = {
-            "git worktree list --porcelain": (0, porcelain_output([block]), ""),
+            self.git_c("worktree", "list", "--porcelain"): (0, porcelain_output([block]), ""),
             self.git_c("rev-parse", "HEAD"): (0, head + "\n", ""),
             self.git_c("rev-parse", "origin/" + branch): (0, remote + "\n", ""),
             self.git_c("status", "--porcelain=v1", "--untracked-files=all"): (0, status, ""),
@@ -143,7 +145,7 @@ class SourceFailureTests(TempDirTestCase):
 
     def test_git_failure_raises_source_unavailable(self):
         responses = self.base_responses()
-        responses["git worktree list --porcelain"] = (128, "", "fatal: not a git repository")
+        responses[self.git_c("worktree", "list", "--porcelain")] = (128, "", "fatal: not a git repository")
         source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
         with self.assertRaises(SourceUnavailable):
             source.discover_worktree()
@@ -153,28 +155,28 @@ class SourceFailureTests(TempDirTestCase):
             raise subprocess.TimeoutExpired(" ".join(argv), timeout=timeout)
 
         responses = self.base_responses()
-        responses["git worktree list --porcelain"] = timed_out
+        responses[self.git_c("worktree", "list", "--porcelain")] = timed_out
         source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses), timeout=3)
         with self.assertRaisesRegex(SourceUnavailable, "timed out"):
             source.discover_worktree()
 
     def test_negative_returncode_is_timeout_or_signal(self):
         responses = self.base_responses()
-        responses["git worktree list --porcelain"] = (-9, "", "Killed")
+        responses[self.git_c("worktree", "list", "--porcelain")] = (-9, "", "Killed")
         source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
         with self.assertRaisesRegex(SourceUnavailable, "signal"):
             source.discover_worktree()
 
     def test_runner_result_shape_is_validated(self):
         responses = self.base_responses()
-        responses["git worktree list --porcelain"] = (0, "worktree only")
+        responses[self.git_c("worktree", "list", "--porcelain")] = (0, "worktree only")
         source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
         with self.assertRaises(SourceMalformed):
             source.discover_worktree()
 
     def test_stdout_and_stderr_must_be_text(self):
         responses = self.base_responses()
-        responses["git worktree list --porcelain"] = (0, b"worktree bytes", None)
+        responses[self.git_c("worktree", "list", "--porcelain")] = (0, b"worktree bytes", None)
         source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
         with self.assertRaises(SourceMalformed):
             source.discover_worktree()
@@ -244,7 +246,7 @@ class MalformedOutputTests(TempDirTestCase):
 
     def test_empty_worktree_list_is_malformed(self):
         responses = self.base_responses()
-        responses["git worktree list --porcelain"] = (0, "", "")
+        responses[self.git_c("worktree", "list", "--porcelain")] = (0, "", "")
         source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
         with self.assertRaises(SourceMalformed):
             source.discover_worktree()
@@ -265,17 +267,18 @@ class WorktreeBindingTests(TempDirTestCase):
         os.makedirs(real_dir)
         link = os.path.join(self.tmp, "link")
         os.symlink(real_dir, link)
-        block = porcelain_block(worktree_lines(os.path.realpath(real_dir), COMMIT_A, branch=self.branch))
+        resolved = os.path.realpath(real_dir)
+        block = porcelain_block(worktree_lines(resolved, COMMIT_A, branch=self.branch))
         responses = {
-            "git worktree list --porcelain": (0, porcelain_output([block]), ""),
+            "git -C {0} worktree list --porcelain".format(resolved): (0, porcelain_output([block]), ""),
         }
         source = GitSource(link, self.branch, runner=RecordingRunner(responses))
         record = source.discover_worktree()
-        self.assertEqual(os.path.realpath(real_dir), record.path)
+        self.assertEqual(resolved, record.path)
 
     def test_requested_path_not_a_worktree_is_malformed(self):
         block = porcelain_block(worktree_lines(os.path.join(self.tmp, "elsewhere"), COMMIT_A, branch=self.branch))
-        responses = {"git worktree list --porcelain": (0, porcelain_output([block]), "")}
+        responses = {self.git_c("worktree", "list", "--porcelain"): (0, porcelain_output([block]), "")}
         source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
         with self.assertRaises(SourceMalformed):
             source.discover_worktree()
@@ -284,7 +287,7 @@ class WorktreeBindingTests(TempDirTestCase):
         block = porcelain_block(worktree_lines(self.real_wt, COMMIT_A, branch=self.branch))
         duplicate = porcelain_block(worktree_lines(self.real_wt, COMMIT_B, branch=self.branch))
         responses = {
-            "git worktree list --porcelain": (0, porcelain_output([block, duplicate]), "")
+            self.git_c("worktree", "list", "--porcelain"): (0, porcelain_output([block, duplicate]), "")
         }
         source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
         with self.assertRaisesRegex(SourceMalformed, "duplicate"):
@@ -293,14 +296,14 @@ class WorktreeBindingTests(TempDirTestCase):
     def test_detached_and_branch_together_are_contradictory(self):
         lines = worktree_lines(self.real_wt, COMMIT_A, branch=self.branch)
         lines.append("detached")
-        responses = {"git worktree list --porcelain": (0, porcelain_output([porcelain_block(lines)]), "")}
+        responses = {self.git_c("worktree", "list", "--porcelain"): (0, porcelain_output([porcelain_block(lines)]), "")}
         source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
         with self.assertRaises(SourceMalformed):
             source.discover_worktree()
 
     def test_unknown_worktree_field_is_malformed(self):
         lines = worktree_lines(self.real_wt, COMMIT_A, branch=self.branch) + ["bogusfield xyz"]
-        responses = {"git worktree list --porcelain": (0, porcelain_output([porcelain_block(lines)]), "")}
+        responses = {self.git_c("worktree", "list", "--porcelain"): (0, porcelain_output([porcelain_block(lines)]), "")}
         source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
         with self.assertRaises(SourceMalformed):
             source.discover_worktree()
@@ -308,6 +311,101 @@ class WorktreeBindingTests(TempDirTestCase):
     def test_non_absolute_worktree_path_rejected(self):
         with self.assertRaises(SourceMalformed):
             GitSource("relative/worktree", self.branch)
+
+    def test_worktree_list_argv_is_bound_to_requested_worktree(self):
+        runner = RecordingRunner(self.base_responses())
+        source = GitSource(self.wt, self.branch, runner=runner)
+        source.discover_worktree()
+        self.assertEqual(
+            [("git", "-C", self.real_wt, "worktree", "list", "--porcelain")],
+            runner.calls,
+        )
+
+    def test_bare_main_record_does_not_block_linked_worktree(self):
+        bare_block = porcelain_block(
+            ["worktree {0}".format(os.path.join(self.tmp, "main.git")), "bare"]
+        )
+        linked_block = porcelain_block(worktree_lines(self.real_wt, COMMIT_A, branch=self.branch))
+        responses = {
+            self.git_c("worktree", "list", "--porcelain"): (
+                0,
+                porcelain_output([bare_block, linked_block]),
+                "",
+            )
+        }
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        record = source.discover_worktree()
+        self.assertEqual(self.real_wt, record.path)
+        self.assertEqual(COMMIT_A, record.head)
+        self.assertEqual(self.branch, record.branch)
+        self.assertFalse(record.bare)
+
+    def test_empty_porcelain_worktree_path_rejected(self):
+        block = porcelain_block(["worktree ", "HEAD " + COMMIT_A, "branch refs/heads/" + self.branch])
+        responses = {
+            self.git_c("worktree", "list", "--porcelain"): (0, porcelain_output([block]), "")
+        }
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaisesRegex(SourceMalformed, "absolute"):
+            source.discover_worktree()
+
+    def test_relative_porcelain_worktree_path_rejected(self):
+        block = porcelain_block(["worktree tools", "HEAD " + COMMIT_A, "branch refs/heads/" + self.branch])
+        responses = {
+            self.git_c("worktree", "list", "--porcelain"): (0, porcelain_output([block]), "")
+        }
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaisesRegex(SourceMalformed, "absolute"):
+            source.discover_worktree()
+
+
+class BareWorktreeRecordTests(TempDirTestCase):
+    def test_bare_field_line_marks_record_bare_without_head(self):
+        record = _parse_worktree_block(("worktree /tmp/main.git", "bare"), ())
+        self.assertTrue(record.bare)
+        self.assertIsNone(record.head)
+        self.assertIsNone(record.path)
+        self.assertIsNone(record.branch)
+        self.assertFalse(record.detached)
+
+    def test_leading_bare_marker_marks_record_bare(self):
+        record = _parse_worktree_block(("bare",), ())
+        self.assertTrue(record.bare)
+        self.assertIsNone(record.path)
+
+    def test_bare_with_head_is_contradictory(self):
+        for lines in (
+            ("worktree /tmp/main.git", "bare", "HEAD " + COMMIT_A),
+            ("worktree /tmp/main.git", "HEAD " + COMMIT_A, "bare"),
+        ):
+            with self.subTest(lines=lines):
+                with self.assertRaisesRegex(SourceMalformed, "bare"):
+                    _parse_worktree_block(lines, ())
+
+    def test_bare_with_branch_is_contradictory(self):
+        with self.assertRaisesRegex(SourceMalformed, "bare"):
+            _parse_worktree_block(("worktree /tmp/main.git", "branch refs/heads/main", "bare"), ())
+
+    def test_bare_with_detached_is_contradictory(self):
+        with self.assertRaisesRegex(SourceMalformed, "bare"):
+            _parse_worktree_block(("worktree /tmp/main.git", "bare", "detached"), ())
+
+    def test_repeated_bare_field_is_contradictory(self):
+        with self.assertRaisesRegex(SourceMalformed, "bare"):
+            _parse_worktree_block(("worktree /tmp/main.git", "bare", "bare"), ())
+
+    def test_bare_field_with_value_is_malformed(self):
+        with self.assertRaisesRegex(SourceMalformed, "bare"):
+            _parse_worktree_block(("worktree /tmp/main.git", "bare yes"), ())
+
+    def test_non_absolute_porcelain_path_is_malformed(self):
+        for block in (
+            ("worktree tools", "HEAD " + COMMIT_A),
+            ("worktree ", "HEAD " + COMMIT_A),
+        ):
+            with self.subTest(block=block):
+                with self.assertRaisesRegex(SourceMalformed, "absolute"):
+                    _parse_worktree_block(block, ())
 
 
 class GitHeadTests(TempDirTestCase):
@@ -774,7 +872,7 @@ class InfraEvidenceTests(TempDirTestCase):
 class DiagnosticTests(TempDirTestCase):
     def test_stderr_appears_in_error_message(self):
         responses = self.base_responses()
-        responses["git worktree list --porcelain"] = (128, "", "fatal: worktree removed")
+        responses[self.git_c("worktree", "list", "--porcelain")] = (128, "", "fatal: worktree removed")
         source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
         with self.assertRaisesRegex(SourceUnavailable, "fatal: worktree removed"):
             source.discover_worktree()
@@ -802,6 +900,95 @@ class DiagnosticTests(TempDirTestCase):
         event = dict(VALID_INFRA_EVENT, event_type="INFRA_RETRY")
         with self.assertRaises(SourceMalformed):
             require_infra_event(event)
+
+
+class RealGitIntegrationTests(unittest.TestCase):
+    """Real-git coverage for default_runner.
+
+    The process CWD is moved to an unrelated directory before every read so the
+    ambient CWD can never be what the discovery binds against, and all
+    temporary repositories are removed with the CWD restored even on failure.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._cwd = os.getcwd()
+
+        def cleanup():
+            os.chdir(self._cwd)
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+        self.addCleanup(cleanup)
+
+    def run_git(self, cwd, *args):
+        proc = subprocess.run(("git", "-C", cwd) + args, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise AssertionError(
+                "git {0} failed with {1}: {2}".format(" ".join(args), proc.returncode, proc.stderr)
+            )
+        return proc
+
+    def move_to_unrelated_cwd(self):
+        unrelated = os.path.join(self.tmp, "unrelated")
+        os.makedirs(unrelated)
+        os.chdir(unrelated)
+
+    def test_discover_and_facts_bind_with_default_runner_from_unrelated_cwd(self):
+        origin = os.path.join(self.tmp, "origin.git")
+        self.run_git(self.tmp, "init", "--bare", "--initial-branch", "main", "origin.git")
+        repo = os.path.join(self.tmp, "main")
+        self.run_git(self.tmp, "init", "--initial-branch", "main", "main")
+        self.run_git(repo, "config", "user.email", "test@example.com")
+        self.run_git(repo, "config", "user.name", "Test")
+        with open(os.path.join(repo, "init.txt"), "w") as handle:
+            handle.write("init\n")
+        self.run_git(repo, "add", "init.txt")
+        self.run_git(repo, "commit", "-m", "init")
+        commit = self.run_git(repo, "rev-parse", "HEAD").stdout.strip()
+        wt = os.path.join(self.tmp, "worktree")
+        self.run_git(repo, "worktree", "add", "-b", "feature/close", wt)
+        self.run_git(repo, "remote", "add", "origin", origin)
+        self.run_git(repo, "push", "-u", "origin", "feature/close")
+
+        self.move_to_unrelated_cwd()
+        source = GitSource(wt, "feature/close", runner=default_runner)
+        record = source.discover_worktree()
+        self.assertEqual(os.path.realpath(wt), record.path)
+        self.assertEqual("feature/close", record.branch)
+        self.assertFalse(record.bare)
+        facts = source.facts()
+        self.assertEqual(commit, facts.local_commit)
+        self.assertEqual(commit, facts.remote_commit)
+        self.assertTrue(facts.worktree_clean)
+
+    def test_bare_main_with_linked_worktree_reads_with_default_runner(self):
+        bare = os.path.join(self.tmp, "bare.git")
+        self.run_git(self.tmp, "init", "--bare", "--initial-branch", "main", "bare.git")
+        seed = os.path.join(self.tmp, "seed")
+        self.run_git(self.tmp, "clone", bare, "seed")
+        self.run_git(seed, "config", "user.email", "test@example.com")
+        self.run_git(seed, "config", "user.name", "Test")
+        with open(os.path.join(seed, "init.txt"), "w") as handle:
+            handle.write("init\n")
+        self.run_git(seed, "add", "init.txt")
+        self.run_git(seed, "commit", "-m", "init")
+        self.run_git(seed, "push", "origin", "main")
+        commit = self.run_git(seed, "rev-parse", "main").stdout.strip()
+        wt = os.path.join(self.tmp, "worktree")
+        self.run_git(bare, "worktree", "add", "-b", "feature/close", wt)
+        self.run_git(wt, "remote", "add", "origin", bare)
+        self.run_git(wt, "push", "-u", "origin", "feature/close")
+
+        self.move_to_unrelated_cwd()
+        source = GitSource(wt, "feature/close", runner=default_runner)
+        record = source.discover_worktree()
+        self.assertEqual(os.path.realpath(wt), record.path)
+        self.assertEqual("feature/close", record.branch)
+        self.assertFalse(record.bare)
+        facts = source.facts()
+        self.assertEqual(commit, facts.local_commit)
+        self.assertEqual(commit, facts.remote_commit)
+        self.assertTrue(facts.worktree_clean)
 
 
 if __name__ == "__main__":
