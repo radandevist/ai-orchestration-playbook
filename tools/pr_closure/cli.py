@@ -845,7 +845,7 @@ def _parse_adapter_result(stdout, mode):
                 "projection change at index {0} carries unknown key(s)".format(index)
             )
         change_type = change.get("type")
-        if change_type not in PROJECTION_CHANGE_TYPES:
+        if not isinstance(change_type, str) or change_type not in PROJECTION_CHANGE_TYPES:
             raise ProjectionFailure(
                 "projection change at index {0} has unknown type".format(index)
             )

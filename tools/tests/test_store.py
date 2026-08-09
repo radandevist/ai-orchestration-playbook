@@ -1653,6 +1653,66 @@ class VerificationTreeShapeTests(StoreTestCase):
         _write_verification(store, COMMIT_A)
         self.assertEqual(1, len(store.verification_paths(COMMIT_A)))
 
+    def test_absent_verification_parent_returns_empty(self):
+        store = self._store()
+        self.assertFalse((store.base_dir / "verification").exists())
+        self.assertEqual((), store.verification_paths(COMMIT_A))
+        self.assertFalse(store.verification_exists(COMMIT_A))
+
+    def test_regular_file_verification_parent_fails_closed(self):
+        store = self._store()
+        parent = store.base_dir / "verification"
+        parent.parent.mkdir(parents=True, exist_ok=True)
+        parent.write_text("not a directory")
+        with self.assertRaises(MalformedEvidence):
+            store.verification_paths(COMMIT_A)
+        with self.assertRaises(MalformedEvidence):
+            store.verification_exists(COMMIT_A)
+
+    def test_dangling_symlink_verification_parent_fails_closed(self):
+        store = self._store()
+        parent = store.base_dir / "verification"
+        parent.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(self.root / "no-such-verification-target", parent)
+        with self.assertRaises(MalformedEvidence):
+            store.verification_paths(COMMIT_A)
+        with self.assertRaises(MalformedEvidence):
+            store.verification_exists(COMMIT_A)
+
+    def test_external_directory_symlink_verification_parent_fails_closed(self):
+        store = self._store()
+        parent = store.base_dir / "verification"
+        parent.parent.mkdir(parents=True, exist_ok=True)
+        real = self.root / "external-verification-directory"
+        real.mkdir(exist_ok=True)
+        os.symlink(real, parent)
+        with self.assertRaises(MalformedEvidence):
+            store.verification_paths(COMMIT_A)
+        with self.assertRaises(MalformedEvidence):
+            store.verification_exists(COMMIT_A)
+
+    def test_external_file_symlink_verification_parent_fails_closed(self):
+        store = self._store()
+        parent = store.base_dir / "verification"
+        parent.parent.mkdir(parents=True, exist_ok=True)
+        real = self.root / "external-verification-file"
+        real.write_text("x")
+        os.symlink(real, parent)
+        with self.assertRaises(MalformedEvidence):
+            store.verification_paths(COMMIT_A)
+        with self.assertRaises(MalformedEvidence):
+            store.verification_exists(COMMIT_A)
+
+    def test_fifo_verification_parent_fails_closed(self):
+        store = self._store()
+        parent = store.base_dir / "verification"
+        parent.parent.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(parent)
+        with self.assertRaises(MalformedEvidence):
+            store.verification_paths(COMMIT_A)
+        with self.assertRaises(MalformedEvidence):
+            store.verification_exists(COMMIT_A)
+
     def test_non_directory_entry_where_config_dir_is_required_fails_closed(self):
         store = self._store()
         store.verification_dir(COMMIT_A).mkdir(parents=True, exist_ok=True)

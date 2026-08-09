@@ -1608,6 +1608,50 @@ class SyncCommandTests(CliTestCase):
         self.assertIn("state=LOCAL_VERIFY", proc.stdout)
         self.assertEqual(1, len(self.adapter_calls()))
 
+    def _plant_verification_parent(self, kind):
+        target = os.path.join(self.state_dir, PROJECT, str(PR), "verification")
+        if os.path.lexists(target):
+            os.unlink(target)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        if kind == "regular-file":
+            with open(target, "w") as handle:
+                handle.write("not a directory")
+        elif kind == "dangling-symlink":
+            os.symlink(os.path.join(self.root, "no-such-verification-target"), target)
+        elif kind == "external-directory-symlink":
+            real = os.path.join(self.root, "external-verification-directory")
+            os.makedirs(real, exist_ok=True)
+            os.symlink(real, target)
+        elif kind == "external-file-symlink":
+            real = os.path.join(self.root, "external-verification-file")
+            with open(real, "w") as handle:
+                handle.write("x")
+            os.symlink(real, target)
+        elif kind == "fifo":
+            os.mkfifo(target)
+        else:
+            raise AssertionError("unknown parent kind {0!r}".format(kind))
+        return target
+
+    def test_sync_apply_refuses_malformed_verification_parent_with_zero_adapter_calls(self):
+        for kind in (
+            "regular-file",
+            "dangling-symlink",
+            "external-directory-symlink",
+            "external-file-symlink",
+            "fifo",
+        ):
+            with self.subTest(parent=kind):
+                config, args = self.prepare_projection()
+                args.append("--apply")
+                self._plant_verification_parent(kind)
+                proc = self.run_cli(*args, extra_env=self.adapter_env())
+                self.assertEqual(3, proc.returncode)
+                self.assertEqual("", proc.stdout)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertIn("verification", proc.stderr)
+                self.assertEqual([], self.adapter_calls())
+
 
 class AdapterBoundaryTests(CliTestCase):
     """T6LC-F7 end-to-end: the projection adapter stream and diagnostic
@@ -1707,6 +1751,39 @@ class AdapterBoundaryTests(CliTestCase):
         self.assertEqual(5, proc.returncode)
         self.assertNotIn("super_secret_change_key", proc.stderr)
         self.assertEqual(2, len(self.adapter_calls()))
+
+    def test_unhashable_change_type_is_typed_failure_without_traceback_or_leak(self):
+        config, args = self.prepare_projection()
+        cases = (
+            (
+                "list",
+                {"type": ["super_secret_list_key", "super_secret_list_value"], "summary": "x"},
+                ("super_secret_list_key", "super_secret_list_value"),
+            ),
+            (
+                "object",
+                {"type": {"super_secret_object_key": "super_secret_object_value"}, "summary": "x"},
+                ("super_secret_object_key", "super_secret_object_value"),
+            ),
+        )
+        for label, change, needles in cases:
+            with self.subTest(shape=label):
+                proc = self.run_cli(
+                    *args,
+                    extra_env=self.adapter_env(
+                        output={
+                            "schema_version": 1,
+                            "applied": False,
+                            "changes": [change],
+                        }
+                    ),
+                )
+                self.assertEqual(5, proc.returncode)
+                self.assertIn("unknown type", proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                for needle in needles:
+                    self.assertNotIn(needle, proc.stderr)
+        self.assertEqual(len(cases), len(self.adapter_calls()))
 
 
 class AdapterProcessBoundaryTests(CliTestCase):
@@ -2522,6 +2599,26 @@ class ProjectionResultContractTests(CliTestCase):
             _parse_adapter_result(
                 '{"schema_version": 1, "applied": false, "changes": '
                 '[{"type": "bogus", "summary": "x"}]}',
+                "dry-run",
+            )
+
+    def test_adapter_result_rejects_list_change_type(self):
+        from pr_closure.cli import ProjectionFailure, _parse_adapter_result
+
+        with self.assertRaises(ProjectionFailure):
+            _parse_adapter_result(
+                '{"schema_version": 1, "applied": false, "changes": '
+                '[{"type": ["secret", "value"], "summary": "x"}]}',
+                "dry-run",
+            )
+
+    def test_adapter_result_rejects_object_change_type(self):
+        from pr_closure.cli import ProjectionFailure, _parse_adapter_result
+
+        with self.assertRaises(ProjectionFailure):
+            _parse_adapter_result(
+                '{"schema_version": 1, "applied": false, "changes": '
+                '[{"type": {"secret": "value"}, "summary": "x"}]}',
                 "dry-run",
             )
 

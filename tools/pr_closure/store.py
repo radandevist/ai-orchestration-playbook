@@ -244,49 +244,77 @@ class RunStore:
         :class:`MalformedEvidence` instead of being skipped (T6L-F6). Valid
         multiple config/attempt trees remain accepted.
 
-        The commit root itself is validated with lstat/no-follow semantics
-        (T6LC-F10): a genuinely nonexistent ``verification/<commit>`` means no
-        evidence and returns ``()``, while a present regular file, symlink,
-        FIFO/device/socket, or any other non-real-directory root raises
-        :class:`MalformedEvidence` instead of being treated as absent.
+        The ``verification`` parent is validated first with lstat/no-follow
+        semantics (T6LC-F10): a genuinely absent parent chain means no evidence
+        and returns ``()``, while a present regular file, symlink (dangling or
+        pointing to any external target), FIFO/device/socket, or any other
+        non-real-directory parent raises :class:`MalformedEvidence`. The commit
+        root is then validated the same way: a genuinely nonexistent
+        ``verification/<commit>`` means no evidence and returns ``()``, while a
+        present regular file, symlink, FIFO/device/socket, or any other
+        non-real-directory root raises :class:`MalformedEvidence` instead of
+        being treated as absent. Filesystem shape or race errors while
+        validating or enumerating fail closed as :class:`MalformedEvidence`.
         """
+        parent = self._base / "verification"
         directory = self.verification_dir(commit)
+        try:
+            parent_entry = parent.lstat()
+        except FileNotFoundError:
+            return ()
+        except OSError as error:
+            raise MalformedEvidence(
+                "cannot validate verification parent: {0}".format(parent)
+            ) from error
+        if not stat.S_ISDIR(parent_entry.st_mode):
+            raise MalformedEvidence(
+                "verification parent must be a real directory: {0}".format(parent)
+            )
         try:
             entry = directory.lstat()
         except FileNotFoundError:
             return ()
+        except OSError as error:
+            raise MalformedEvidence(
+                "cannot validate verification commit root: {0}".format(directory)
+            ) from error
         if not stat.S_ISDIR(entry.st_mode):
             raise MalformedEvidence(
                 "verification commit root must be a real directory: {0}".format(
                     directory
                 )
             )
-        paths = []
-        for digest_dir in sorted(directory.iterdir()):
-            if _DIGEST_RE.fullmatch(digest_dir.name) is None:
-                raise MalformedEvidence(
-                    "verification config directory must be an exact lowercase "
-                    "64-hex digest: {0}".format(digest_dir)
-                )
-            if digest_dir.is_symlink() or not digest_dir.is_dir():
-                raise MalformedEvidence(
-                    "verification config directory must be a real directory: {0}".format(
-                        digest_dir
-                    )
-                )
-            for path in sorted(digest_dir.iterdir()):
-                if (
-                    path.is_symlink()
-                    or not path.is_file()
-                    or not path.name.endswith(".json")
-                    or _DIGEST_RE.fullmatch(path.stem) is None
-                ):
+        try:
+            paths = []
+            for digest_dir in sorted(directory.iterdir()):
+                if _DIGEST_RE.fullmatch(digest_dir.name) is None:
                     raise MalformedEvidence(
-                        "verification attempt must be a direct <attempt-id>.json "
-                        "file: {0}".format(path)
+                        "verification config directory must be an exact lowercase "
+                        "64-hex digest: {0}".format(digest_dir)
                     )
-                paths.append(path)
-        return tuple(paths)
+                if digest_dir.is_symlink() or not digest_dir.is_dir():
+                    raise MalformedEvidence(
+                        "verification config directory must be a real directory: {0}".format(
+                            digest_dir
+                        )
+                    )
+                for path in sorted(digest_dir.iterdir()):
+                    if (
+                        path.is_symlink()
+                        or not path.is_file()
+                        or not path.name.endswith(".json")
+                        or _DIGEST_RE.fullmatch(path.stem) is None
+                    ):
+                        raise MalformedEvidence(
+                            "verification attempt must be a direct <attempt-id>.json "
+                            "file: {0}".format(path)
+                        )
+                    paths.append(path)
+            return tuple(paths)
+        except OSError as error:
+            raise MalformedEvidence(
+                "cannot enumerate verification tree: {0}".format(directory)
+            ) from error
 
     def review_dir(self, commit) -> Path:
         return self._base / "reviews" / _require_commit(commit)
