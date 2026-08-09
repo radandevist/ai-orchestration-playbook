@@ -77,7 +77,7 @@ class ReviewValidationTests(unittest.TestCase):
             "reviewed_commit": "a" * 40,
             "base_commit": "b" * 40,
             "implementer_family": "deepseek",
-            "reviewer_family": "claude",
+            "reviewer_family": "gpt-5.6-luna",
             "local_evidence": ["tests:tools/tests/test_review.py"],
             "ci_evidence": ["ci:pr-check/run-1"],
             "verdict": "APPROVED_WITH_FOLLOW_UPS",

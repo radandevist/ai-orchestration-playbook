@@ -1,12 +1,12 @@
 # PublyApp PR Closure Adoption Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans together with the AI orchestration playbook. DeepSeek V4 Flash implements; a different model family reviews every pushed tip. Do not merge.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans together with the AI orchestration playbook. DeepSeek V4 Flash implements; GPT-5.6 Luna at `xhigh` independently reviews every pushed tip. Do not merge.
 
 **Goal:** Make PublyApp the first live user of the mechanical closure gate and drive PRs #1054, #1061, #1065, #1066, #1078, and #1083 to an evidence-backed `APPROVED`, `APPROVED_WITH_FOLLOW_UPS`, or genuine `NEEDS_OWNER` state.
 
 **Architecture:** Runtime state lives outside the PublyApp repository under the durable Hermes orchestration directory, while the repo adapter points agents to the portable gate. Each existing PR keeps its own branch and resolved worktree. The orchestrator derives one next action per PR from live GitHub, local Git, verification, and structured cross-family review records; Trello mirrors that state but never decides it.
 
-**Tech Stack:** `pr-closure` framework, Git, GitHub CLI/API, OpenCode with DeepSeek V4 Flash, Claude Opus 5, Node.js 24, pnpm, Playwright/Docker Compose, Trello MCP projection.
+**Tech Stack:** `pr-closure` framework, Git, GitHub CLI/API, DeepSeek V4 Flash implementation lane, GPT-5.6 Luna `xhigh` review lane, Node.js 24, pnpm, Playwright/Docker Compose, Trello MCP projection.
 
 **Dependency:** Complete `docs/superpowers/plans/2026-08-08-pr-closure-framework.md` first. Do not emulate the gate with shell conditionals if the framework is not ready.
 
@@ -28,8 +28,8 @@
 - Resolve every worktree with `git worktree list --porcelain`; never construct a path from a PR number.
 - Preserve staged, dirty, and untracked user work. Stop a lane if its resolved worktree is not a clean named checkpoint.
 - Before every worker dispatch, append the required preflight ledger row with `decision: dispatch`.
-- DeepSeek V4 Flash is the default implementer, invoked through OpenCode with `--auto --variant high` or `--variant max`; never pass `xhigh` because that variant is silently dropped.
-- Claude Opus 5 is the default cross-family reviewer for these PRs. A reviewer never edits the branch.
+- DeepSeek V4 Flash is the default implementer, invoked through the configured project harness at `high`; use the explicit OpenModel provider wiring from the playbook packet template.
+- GPT-5.6 Luna at `xhigh` is the default cross-family reviewer for these PRs; record the ledgered pre-merge escalation reason. No new Claude model calls. A reviewer never edits the branch.
 - Serialize Docker/Playwright/full-suite work with the framework's heavy-job lease. Lightweight source fixes and focused unit tests may run concurrently only when they use different worktrees.
 - Every approval is bound to the exact pushed 40-character commit reported by GitHub. A push invalidates the prior approval automatically.
 - Temporary mutation probes must live outside the tracked tree or be removed and proven absent before review can approve.
@@ -155,7 +155,7 @@ It forbids reading orchestration material, spawning agents, switching branches/w
 
 - [ ] **Step 5: Trigger design reset for repeated root causes**
 
-If the same root cause has survived two correction rounds, enter `DESIGN_RESET`. Commission a fresh Claude reviewer to reproduce the mechanism, author a structural fix packet with a paired regression test, prove the test fails under the intended revert, revert any review probe, and return the packet. Do not send another orchestrator-written syntax patch.
+If the same root cause has survived two correction rounds, enter `DESIGN_RESET`. Commission a fresh GPT-5.6 Luna reviewer to reproduce the mechanism, author a structural fix packet with a paired regression test, prove the test fails under the intended revert, revert any review probe, and return the packet. Do not send another orchestrator-written syntax patch.
 
 ### Task 4: Clear red CI before deeper review work
 
@@ -197,7 +197,7 @@ For each changed branch: run targeted tests, local review-ready commands, commit
 
 - [ ] **Step 1: Put PR #1054 into design reset**
 
-Its repeated central guard weakness must not receive another narrow allowlist/syntax patch. Have a fresh Claude reviewer reproduce the surviving bypass, map sibling paths, author the structural packet and paired mutation proof, then revert the probe. Dispatch DeepSeek against that packet.
+Its repeated central guard weakness must not receive another narrow allowlist/syntax patch. Have a fresh GPT-5.6 Luna reviewer reproduce the surviving bypass, map sibling paths, author the structural packet and paired mutation proof, then revert the probe. Dispatch DeepSeek against that packet.
 
 - [ ] **Step 2: Apply PR #1061's latest exact blockers**
 
@@ -224,7 +224,7 @@ Use each PR's existing branch. Never force-push unless a separately approved reb
 
 Check whether the previously running reviewer completed. Before importing it, prove any temporary probe is absent and the worktree is clean. If the reviewer output is incomplete, stale, or tied to a different tip, discard it as authority and start a fresh review.
 
-- [ ] **Step 2: Review each current tip with Claude Opus 5**
+- [ ] **Step 2: Review each current tip with GPT-5.6 Luna at `xhigh`**
 
 The review brief includes the originating issue/spec, full diff from merge base, repo standards, prior blocker IDs, exact pushed tip, and required commands. The reviewer is read-only and returns the versioned JSON record plus a concise human report.
 
