@@ -47,7 +47,8 @@
 - **review_schema:** `<supported review-record schema version, currently 1>`
 - **review_publication_cmd:** `<publish a compact review link/summary on the PR, or none>`
 - **follow_up_issue_cmd:** `<create and verify a linked follow-up issue>`
-- **tracking_projection:** `<project-board (e.g. Trello) mapping executable, or none — exact closure_config key; see the safe projection boundary below>`
+- **tracking_projection:** `<explicit project-board mapping identifier (e.g. trello:publyapp), or none — exact closure_config key; see the safe projection boundary below>`
+- **projection_adapter:** `<absolute, non-symlink path to the projection executable — harness binding passed to pr-closure sync as --projection-adapter; required only when tracking_projection is non-none>`
 - **infra_retry_budget:** `<maximum automatic reruns of proven infrastructure failures before NEEDS_OWNER — exact closure_config key>`
 - **stagnation_budget_minutes:** `<maximum time without a qualifying progress event before STALLED — exact closure_config key>`
 - **lane_liveness_cmd:** `<output-growth or CPU-time advancement check for lane liveness>`
@@ -62,9 +63,12 @@ names — `schema_version`, `project`, `repository`, `repo_path`, `default_branc
 `tools/schemas/project-closure-v1.json`). The fields above are the declarative project bindings the
 harness resolves against; the gate itself reads only the `closure_config` JSON.
 
-**Safe tracking-projection boundary.** When `tracking_projection` is set, it must be an absolute,
-non-symlink, executable file. The gate invokes it as an argv list — never through a shell — over a
-versioned, bounded JSON protocol (deadline and output caps included). The adapter never emits secrets
-on stdout. The gate distinguishes dry-run (`sync` without `--apply`) from apply (`sync --apply`), and
-the project board is selected explicitly by the adapter, never guessed. A projection failure never
-mutates authoritative closure evidence.
+**Safe tracking-projection boundary.** `tracking_projection` is the explicit board mapping
+identifier (for example `trello:publyapp`) or `none`; it is mapping data passed to the projection
+executable, never an executable itself. When it is non-`none`, the gate requires the separate
+`--projection-adapter /absolute/non-symlink/executable` argument (the adapter doc binds that path in
+`projection_adapter`). The gate invokes that executable as an argv list — never through a shell —
+over a versioned, bounded JSON protocol (deadline and output caps included), passing the mapping as
+`--mapping`. The adapter never emits secrets on stdout. The gate distinguishes dry-run (`sync`
+without `--apply`) from apply (`sync --apply`), and the project board is selected explicitly by the
+mapping, never guessed. A projection failure never mutates authoritative closure evidence.

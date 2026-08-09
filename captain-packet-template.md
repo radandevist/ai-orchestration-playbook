@@ -83,13 +83,31 @@ unsupported accusation.
 
 ## Launch Shapes
 
-Codex packet into a clone/worktree:
+Every lane is launched with an explicit model selection — no unspecified `<model>` command is an
+active shape. Non-OpenAI models (for example `deepseek-v4-flash`) resolve through the host's
+OpenModel provider wiring (the project harness pattern); OpenAI-family models use their catalog id.
+
+DeepSeek implementation packet into a clone/worktree:
 
 ```bash
 codex exec --ephemeral --skip-git-repo-check \
   --dangerously-bypass-approvals-and-sandbox \
+  -c model="deepseek-v4-flash" \
+  -c model_provider="openmodel" \
+  -c model_reasoning_effort="high" \
   -C /absolute/target/clone \
-  -m <model> \
+  - < /absolute/run/packet.md
+```
+
+OpenAI review packet (GPT-5.6 Luna at `xhigh` — record the ledgered escalation reason, playbook
+§1.5/§2.6):
+
+```bash
+codex exec --ephemeral --skip-git-repo-check \
+  --dangerously-bypass-approvals-and-sandbox \
+  -c model="gpt-5.6-luna" \
+  -c model_reasoning_effort="xhigh" \
+  -C /absolute/target/clone \
   - < /absolute/run/packet.md
 ```
 

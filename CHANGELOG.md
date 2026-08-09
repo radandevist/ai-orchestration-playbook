@@ -9,6 +9,7 @@ All notable changes to the AI Orchestration Playbook are recorded here. This is 
 - Added a safe tracking-projection protocol: absolute non-symlink adapter invoked as an argv list (never through a shell) over a versioned bounded JSON protocol, dry-run/apply distinction, and projection failure that never mutates authoritative closure evidence.
 - Hardened the fail-closed direction: missing, stale, malformed, or contradictory evidence is `UNVERIFIED`; empty, undersized, or markerless lane output is failure even with exit 0.
 - Documented the current all-project model policy: implementation default DeepSeek V4 Flash, independent review default GPT-5.6 Luna at `xhigh`, no new Claude implementation/review/coordination calls, historical Claude artifacts remain usable without rerun, reviewer family must differ from implementer family.
+- Corrected the active dispatch and adapter templates: implementation/review launch shapes now select DeepSeek V4 Flash and GPT-5.6 Luna explicitly (no unspecified `<model>` shape), `tracking_projection` is documented as the board mapping with `--projection-adapter` as the separate absolute non-symlink executable, and the `sync` copy/paste examples show both dry-run and `--apply` forms.
 - Added the `tools/pr-closure` CLI and schemas to the README with installation, the status command, one-time legacy-verdict import (never silently approved), and project migration/preflight behavior.
 
 ## [0.1.3] - 2026-07-04 — Parallelism gates on heavy jobs, not agent headcount

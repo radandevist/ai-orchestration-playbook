@@ -29,7 +29,7 @@ These hold on every run, for every agent. They override speed, convenience, and 
 3. **Never merge without explicit, per-request human authorization.** A human says "merge X" each time. Prior approval of one merge never implies the next.
    *Why:* merging is the one irreversible, outward-facing step; it's the human's call, every time.
 
-4. **The review loop is mandatory before integration, and the reviewer must be a different model family than the implementer.** Every executor result gets an independent review pass before it's integrated. The reviewer runs on a different provider/model family than produced the result (Codex implements → Claude reviews, and vice versa) — never review Codex output with Codex. Feed findings back until clean. Reviews must be rigorous: cover the full requirements coverage matrix plus affected-risk analysis — tests, performance, security, robustness, completeness, design patterns, code reuse (DRY), code elegance, and better-approach pressure while sticking to locked decisions/specs/plans.
+4. **The review loop is mandatory before integration, and the reviewer must be a different model family than the implementer.** Every executor result gets an independent review pass before it's integrated. The reviewer runs on a different provider/model family than produced the result — implementation defaults to DeepSeek V4 Flash, independent review defaults to GPT-5.6 Luna (see §2.6), and a family never reviews its own output: an OpenAI-family reviewer may cover a DeepSeek implementation, but never an OpenAI-family implementation. Feed findings back until clean. Reviews must be rigorous: cover the full requirements coverage matrix plus affected-risk analysis — tests, performance, security, robustness, completeness, design patterns, code reuse (DRY), code elegance, and better-approach pressure while sticking to locked decisions/specs/plans.
    *Why:* an executor checking its own work is not a second opinion; cross-family review is what catches the plausible-but-wrong result. Same-family review also doubles that family's token spend on one task — the review re-ingests the full diff and coverage matrix on the same context window. Routing the review to the other family both sharpens the check and halves the per-family input cost.
 
 5. **Effort ceiling — default high; xhigh requires ledgered escalation.** Cap executor/review effort at `high` by default. `xhigh` is allowed only with a ledgered escalation reason: final integration review, security/auth change, high-risk billing/data operation, architecture dispute, or pre-merge gate. Every xhigh use must be recorded in the run preflight ledger.
@@ -72,7 +72,7 @@ Each phase below states a portable **principle**, the **why**, a tagged **exampl
 **Principle.** Run N executors concurrently, each in its **own isolated worktree**, each handed one **self-contained brief** (§3).
 **Why.** Isolation prevents executors from colliding on the working tree; self-contained briefs keep an executor from needing context it doesn't have.
 If the run must outlive the current orchestrator session (overnight work, disconnect-prone client, quota-reset wait), make it **durable**: materialize a run directory with prompts, reports, status markers, and a monitor entrypoint, then launch only as many concurrent executors as the adapter says the host can sustain.
-For multi-clone work, start one captain from the adapter `captain_root` (usually the parent directory above sibling clones), keep a hot backlog of 3-5 ready packets, and dispatch bounded one-shot workers into `clone_roots`. Use provider lanes, not free-for-all sessions: each heavy Claude/Codex lane takes the next surgical packet that fits its role and current headroom; local/cheap lanes handle prep, tests, logs, summaries, and mechanical checks. Burst heavy concurrency only when packets are independently briefable (file-disjoint edits, cross-family reviews, competing design probes, or separated debugging probes).
+For multi-clone work, start one captain from the adapter `captain_root` (usually the parent directory above sibling clones), keep a hot backlog of 3-5 ready packets, and dispatch bounded one-shot workers into `clone_roots`. Use provider lanes, not free-for-all sessions: each heavy lane takes the next surgical packet that fits its role and current headroom — the DeepSeek V4 Flash implementation lane and the GPT-5.6 Luna `xhigh` independent-review lane (§2.6; the review `xhigh` is ledgered per §1.5); the local lane handles prep, tests, logs, summaries, and mechanical checks. Burst heavy concurrency only when packets are independently briefable (file-disjoint edits, cross-family reviews, competing design probes, or separated debugging probes).
 **Name each worktree after the pull request it produces, never after the issue** (`pr<NUMBER>`, e.g. `pr994`). One issue routinely spawns several competing implementations, and the moment it does, issue-named directories collide and the human can no longer tell which tree holds which attempt. The PR number is also what a reviewer actually searches for. Because that number does not exist until the branch is pushed, create the worktree under a provisional slug, push and open the PR immediately, then `git worktree move` it onto its `pr<NUMBER>` name — the provisional window is minutes, not days.
 *Example (PublyApp/.NET):* 7 parallel executor briefs, one per triage PR, each in `.worktrees/pr<NUMBER>`.
 **STOP triggers:** more than one hot captain is steering the same board → collapse to one captain; concurrent **heavy-resource** jobs (Docker/e2e stacks, full builds/test suites) exceed host capacity → serialize those — agent *headcount* is not the cap, lightweight agents run many-in-parallel; a task isn't truly file-disjoint from a sibling in the same wave → re-decompose; the parent session may disappear before children finish and no durable monitor path exists → harden the run first.
@@ -148,8 +148,17 @@ When the human explicitly optimizes for latency, you may batch several low-risk 
 ```bash
 pr-closure status --config <project-closure.json> --pr <N>
 pr-closure check-transition --config <project-closure.json> --pr <N> --to <STATE>
-pr-closure sync --config <project-closure.json> --pr <N> [--apply]
+# tracking projection — dry-run (default) and apply forms:
+pr-closure sync --config <project-closure.json> --pr <N> \
+  --projection-adapter /absolute/non-symlink/executable
+pr-closure sync --config <project-closure.json> --pr <N> \
+  --projection-adapter /absolute/non-symlink/executable --apply
 ```
+
+`sync` reads the board mapping from the config's `tracking_projection` key. When that key is
+`none`, no adapter is needed: `sync` prints the derived state and refuses `--apply`. When it names a
+mapping (for example `trello:publyapp`), the separate `--projection-adapter
+/absolute/non-symlink/executable` argument is required for both the dry-run and the apply form.
 
 `pr-closure check-transition` is a **mandatory precondition** before every state-changing closure action (dispatch, fix, rerun, review, follow-up filing, projection apply, ready report). A denied transition stops the action. Missing evidence and tool/API failures are non-zero exits — fail closed, never infer a favorable state. Exit codes are stable: `0` read/check succeeded, `2` invalid input, `3` source unavailable or malformed, `4` transition denied, `5` verification/projection command failed, `6` heavy-job lease unavailable. Evidence lives in a durable run directory outside temporary session folders; the run's `state.json` is a cache, never the authority. Empty, undersized, or markerless lane output is failure even with exit 0.
 
@@ -202,7 +211,7 @@ The captain keeps a hot backlog of the next 3-5 packets. A packet is ready only 
 *Example (PublyApp/.NET) — a single-PR brief, abbreviated:*
 
 > `--effort high --write --no-sandbox`
-> Create worktree `…/.claude/worktrees/538a-rename` off `origin/develop`. Use `git -C "<absolute-worktree-path>"` for every git command.
+> Create worktree `…/.worktrees/538a-rename` off `origin/develop`. Use `git -C "<absolute-worktree-path>"` for every git command.
 > **Read first:** `apps/api/Modules/Auth/Handlers/PassWordLogin.cs` (confirm class is already `PasswordLogin`).
 > **Work:** rename the file to `PasswordLogin.cs` (two-step temp rename — Windows is case-insensitive: `→ _tmp.cs → PasswordLogin.cs`, commit between).
 > **Verify:** `dotnet restore` (fresh worktree) → `just build-api` (expect 0/0) → arch spec filter (expect pass).
@@ -259,8 +268,8 @@ PR-opening repos must also supply the closure fields from §2.6 (see `adapter-te
 | `captain_root` | repo parent when coordinating sibling clones; otherwise repo root |
 | `clone_roots` | sibling local clones/worktrees approved by the adapter, or `none` |
 | `host_parallelism` | at most 3 concurrent executor waves; never run multiple heavy `dotnet` / `pnpm` verification jobs at once |
-| `executor` | `codex:codex-rescue` @ effort `high` |
-| `model_ladder` | primary `codex:codex-rescue` @ `high`; on quota/rate-limit fall back per repo policy to the next approved executor without changing the orchestration contract |
+| `executor` | DeepSeek V4 Flash implementation lane (`codex exec -c model="deepseek-v4-flash" -c model_provider="openmodel" -c model_reasoning_effort="high"`) |
+| `model_ladder` | primary `deepseek-v4-flash` @ `high`; on quota/rate-limit fall back per repo policy to the next approved executor (never a Claude model) without changing the orchestration contract |
 | `provider_lanes` | DeepSeek V4 Flash lane for implementation; GPT-5.6 Luna `xhigh` lane for independent review; local lane for grep/log/test prep |
 | `hot_backlog` | keep 3-5 ready packets in the run `dump_dir`; do not launch broad exploratory packets |
 | `packet_template` | `~/ai-orchestration-playbook/captain-packet-template.md` |
@@ -309,7 +318,7 @@ Tools report three states: `missing` (not installed), `available` (installed, re
 - Never re-ship full context on retry. On quota/rate-limit (429) or a flaked dispatch, stop and re-route — do **not** resend the entire brief on a fixed retry cycle. A retry storm that re-ingests the brief every N seconds is pure wasted input; kill the executor/broker rather than letting it loop.
 
 ### 5.6 Cross-family review routing
-The mandatory review (§1.4) runs on a **different model family than the implementer**. This is a token tactic as much as a quality one: reviewing Codex output with Codex makes one task two full-context Codex passes (the review re-ingests the diff + the rigorous coverage matrix). Routing the review to the other family halves the per-family input load on the heavy path and gives a genuinely independent check. Record the implementer/reviewer route split in the preflight ledger (§6) — a row where both are the same family is a STOP-and-reconsider, not a dispatch.
+The mandatory review (§1.4) runs on a **different model family than the implementer**. This is a token tactic as much as a quality one: reviewing a DeepSeek implementation with another DeepSeek executor makes one task two full-context DeepSeek passes (the review re-ingests the diff + the rigorous coverage matrix). Routing the review to the other family halves the per-family input load on the heavy path and gives a genuinely independent check. Record the implementer/reviewer route split in the preflight ledger (§6) — a row where both are the same family is a STOP-and-reconsider, not a dispatch.
 
 ### 5.7 Parallel-session discipline
 When the human would otherwise open 2-3 orchestration sessions for sibling clones, use the captain/lane model instead (§1.9, §2.3). Keep one hot captain and launch bounded one-shot packets into clones. Track waste as **fresh input per completed packet**, not raw activity: if multiple packets re-ship the same broad context, stop and distill the stable prefix once before launching more. Do not throttle useful independent packets just because they are parallel; throttle duplicate context and heavy-resource jobs.
@@ -324,7 +333,7 @@ Before dispatching any executor or subagent, append one JSONL preflight row to t
 
 ```
 run_id, timestamp
-captain: {session_id, board_dir, packet_id, lane: claude|codex|local|other, target_clone, hot_backlog_size}
+captain: {session_id, board_dir, packet_id, lane: deepseek|openai-review|local|other, target_clone, hot_backlog_size}
 task_risk: {level: low|medium|high|critical, reasons: []}
 scope: {repo, worktree, branch, dirty_state}
 routes: {implementer: {provider, model, quota_signal}, reviewer: {provider, model, quota_signal}, fallbacks: []}

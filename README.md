@@ -178,7 +178,22 @@ PYTHONPATH="$HOME/ai-orchestration-playbook/tools" \
 ```
 
 `check-transition` is the mandatory precondition before every state-changing closure action
-(`--to <STATE>`), and `sync` plans or applies the tracking projection (`--apply`).
+(`--to <STATE>`). `sync` plans (dry-run, the default) or applies (`--apply`) the tracking projection;
+the board mapping comes from the config's `tracking_projection` key, and both forms pass the separate
+`--projection-adapter` executable, required only when that mapping is non-`none`:
+
+```bash
+PYTHONPATH="$HOME/ai-orchestration-playbook/tools" \
+  "$HOME/ai-orchestration-playbook/tools/pr-closure" sync \
+  --config /absolute/project-closure.json --pr 123 \
+  --projection-adapter /absolute/non-symlink/executable
+
+# dry-run by default; add --apply to write the projection:
+PYTHONPATH="$HOME/ai-orchestration-playbook/tools" \
+  "$HOME/ai-orchestration-playbook/tools/pr-closure" sync \
+  --config /absolute/project-closure.json --pr 123 \
+  --projection-adapter /absolute/non-symlink/executable --apply
+```
 
 ### One-time import of legacy verdicts
 
