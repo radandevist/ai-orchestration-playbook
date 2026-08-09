@@ -22,6 +22,15 @@ from pr_closure.state import derive_state
 FIXTURES_ROOT = Path(__file__).resolve().parent / "fixtures"
 FIXTURE_DIRS = ("digital_prevention", "publyapp")
 
+# Exact required scenario-ID manifest (Task 8A): four Digital Prevention and
+# five PublyApp cases. The loader must reject any tree that drifts from this
+# set: a missing required ID, an unexpected extra ID, a project-directory
+# mismatch, or a duplicated ID.
+REQUIRED_SCENARIO_IDS = {
+    "digital_prevention": ("dp-1", "dp-2", "dp-3", "dp-4"),
+    "publyapp": ("pa-1", "pa-2", "pa-3", "pa-4", "pa-5"),
+}
+
 FIXTURE_VERSION = 1
 REQUIRED_KEYS = (
     "fixture_version",
@@ -75,18 +84,36 @@ NOW = datetime(2000, 1, 1, 12, 0, 0)
 _COMMIT_ID_RE = re.compile(COMMIT_ID_PATTERN)
 
 
+def _scenario_id(scenario):
+    """Stable scenario id from the scenario string.
+
+    A scenario is '<stable-id>-<slug>: <rationale>'; the stable id is the
+    first two dash-separated tokens before the colon, e.g.
+    'dp-1-branch-accounting-regression: ...' -> 'dp-1'.
+    """
+    head = scenario.partition(":")[0].strip()
+    parts = head.split("-")
+    if len(parts) < 2:
+        raise ValueError(f"scenario {scenario!r} has no stable id prefix")
+    return "-".join(parts[:2])
+
+
 def load_fixtures():
     """Load and validate every fixture; raise on any contract violation.
 
     Rejects unknown/missing keys, unknown state/CI/verdict values, malformed
-    commit shapes, duplicate scenario IDs, and non-array blocking IDs.
+    commit shapes, duplicate scenario IDs, non-array blocking IDs, and any
+    drift from the required scenario-ID manifest: a missing required ID, an
+    unexpected extra ID, a project-directory mismatch, or a duplicated ID.
     """
     fixtures = []
     seen_scenarios = {}
     for dirname in FIXTURE_DIRS:
+        required_ids = REQUIRED_SCENARIO_IDS[dirname]
         fixture_dir = FIXTURES_ROOT / dirname
         if not fixture_dir.is_dir():
             raise FileNotFoundError(f"missing fixture directory: {fixture_dir}")
+        seen_ids = {}
         for path in sorted(fixture_dir.glob("*.json")):
             raw = json.loads(path.read_text())
             _validate_fixture(raw, path)
@@ -96,7 +123,22 @@ def load_fixtures():
                     f"duplicate scenario id {scenario!r} in {path} and {seen_scenarios[scenario]}"
                 )
             seen_scenarios[scenario] = path
+            scenario_id = _scenario_id(scenario)
+            if scenario_id not in required_ids:
+                raise ValueError(
+                    f"{path}: unexpected scenario id {scenario_id!r} in {dirname}; "
+                    f"required ids are {', '.join(required_ids)}"
+                )
+            if scenario_id in seen_ids:
+                raise ValueError(
+                    f"{path}: duplicate scenario id {scenario_id!r} in {dirname} "
+                    f"(also {seen_ids[scenario_id]})"
+                )
+            seen_ids[scenario_id] = path
             fixtures.append((path, raw, _build_snapshot(raw["snapshot"], path)))
+        missing = [scenario_id for scenario_id in required_ids if scenario_id not in seen_ids]
+        if missing:
+            raise ValueError(f"{dirname}: missing required scenario id(s) {', '.join(missing)}")
     return fixtures
 
 
@@ -268,6 +310,78 @@ class FixtureContractRejectionTests(unittest.TestCase):
             with mock.patch.object(sys.modules[__name__], "FIXTURES_ROOT", root):
                 with self.assertRaises(ValueError):
                     load_fixtures()
+
+
+class FixtureInventoryTests(unittest.TestCase):
+    """The required scenario-ID manifest is mechanically pinned: the loader
+    rejects a missing required ID, an unexpected extra ID, a project-directory
+    mismatch, and duplicated stable IDs -- not just a low fixture count."""
+
+    def _real_layout(self):
+        return {
+            dirname: {
+                path.stem: json.loads(path.read_text())
+                for path in sorted((FIXTURES_ROOT / dirname).glob("*.json"))
+            }
+            for dirname in FIXTURE_DIRS
+        }
+
+    def _load_layout(self, layout):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for dirname, files in layout.items():
+                (root / dirname).mkdir()
+                for stem, raw in files.items():
+                    (root / dirname / f"{stem}.json").write_text(json.dumps(raw))
+            with mock.patch.object(sys.modules[__name__], "FIXTURES_ROOT", root):
+                return load_fixtures()
+
+    def _unrelated_fixture(self, layout, scenario):
+        extra = copy.deepcopy(next(iter(layout["publyapp"].values())))
+        extra["scenario"] = scenario
+        return extra
+
+    def test_missing_required_scenario_id_rejected(self):
+        layout = self._real_layout()
+        del layout["digital_prevention"]["dp-2-preexisting-audit-gap-follow-up"]
+        with self.assertRaises(ValueError):
+            self._load_layout(layout)
+
+    def test_remove_and_replace_required_fixture_rejected(self):
+        # The Luna probe: delete a required paid-failure fixture and add an
+        # unrelated valid fixture. Nine files with unique scenarios are no
+        # longer enough -- the inventory must reject the replacement.
+        layout = self._real_layout()
+        del layout["publyapp"]["pa-3-browser-cache-infra-retry"]
+        layout["publyapp"]["zz-1-unrelated-extra"] = self._unrelated_fixture(
+            layout, "zz-1-unrelated-extra: valid but unrelated scenario"
+        )
+        with self.assertRaises(ValueError):
+            self._load_layout(layout)
+
+    def test_unexpected_extra_scenario_id_rejected(self):
+        layout = self._real_layout()
+        layout["digital_prevention"]["dp-9-extra"] = self._unrelated_fixture(
+            layout, "dp-9-extra: scenario outside the required set"
+        )
+        with self.assertRaises(ValueError):
+            self._load_layout(layout)
+
+    def test_project_directory_mismatch_rejected(self):
+        layout = self._real_layout()
+        layout["digital_prevention"]["pa-1-unpushed-fix-reviewed-absent"] = (
+            layout["publyapp"].pop("pa-1-unpushed-fix-reviewed-absent")
+        )
+        with self.assertRaises(ValueError):
+            self._load_layout(layout)
+
+    def test_duplicate_scenario_id_rejected(self):
+        layout = self._real_layout()
+        layout["digital_prevention"]["dp-1-twin"] = self._unrelated_fixture(
+            layout, "dp-1-twin: second fixture claiming stable id dp-1"
+        )
+        with self.assertRaises(ValueError):
+            self._load_layout(layout)
 
 
 class FixtureDerivationTests(unittest.TestCase):
