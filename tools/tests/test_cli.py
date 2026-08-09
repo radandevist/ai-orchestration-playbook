@@ -893,10 +893,10 @@ class WorkerEvidenceBoundaryTests(CliTestCase):
 
     def test_sync_exit_zero_empty_worker_output_fails_closed(self):
         config, args = self.prepare_projection()
-        proc = self.run_cli(
-            *args,
-            extra_env=self.adapter_env(output=None, exit_code=0),
-        )
+        raw = os.path.join(self.root, "empty.out")
+        with open(raw, "w") as handle:
+            handle.write("")
+        proc = self.run_cli(*args, extra_env=self.adapter_env(raw_file=raw))
         self.assertEqual(5, proc.returncode)
         self.assertEqual("", proc.stdout)
         self.assertIn("projection adapter", proc.stderr)
