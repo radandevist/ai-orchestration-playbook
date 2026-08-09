@@ -883,6 +883,121 @@ class RecordVerificationTests(CliTestCase):
         meta_path = os.path.join(self.state_dir, PROJECT, str(PR), "heavy-job.meta.json")
         self.assertFalse(os.path.exists(meta_path))
 
+
+class WorkerEvidenceBoundaryTests(CliTestCase):
+    """T8B3: exit-zero but empty or markerless worker output is rejected, and
+    the verification pipeline binds each command's own exit status so the
+    command that actually failed can never be recorded green."""
+
+    # -- case 1: exit-zero but empty or markerless worker output ----------
+
+    def test_sync_exit_zero_empty_worker_output_fails_closed(self):
+        config, args = self.prepare_projection()
+        proc = self.run_cli(
+            *args,
+            extra_env=self.adapter_env(output=None, exit_code=0),
+        )
+        self.assertEqual(5, proc.returncode)
+        self.assertEqual("", proc.stdout)
+        self.assertIn("projection adapter", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(1, len(self.adapter_calls()))
+
+    def test_sync_exit_zero_markerless_text_worker_output_fails_closed(self):
+        config, args = self.prepare_projection()
+        raw = os.path.join(self.root, "markerless-text.out")
+        with open(raw, "w") as handle:
+            handle.write("ok\n")
+        proc = self.run_cli(*args, extra_env=self.adapter_env(raw_file=raw))
+        self.assertEqual(5, proc.returncode)
+        self.assertEqual("", proc.stdout)
+        self.assertIn("projection adapter", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(1, len(self.adapter_calls()))
+
+    def test_sync_exit_zero_markerless_json_worker_output_fails_closed(self):
+        config, args = self.prepare_projection()
+        raw = os.path.join(self.root, "markerless-json.out")
+        with open(raw, "w") as handle:
+            json.dump({"changes": []}, handle)
+        proc = self.run_cli(*args, extra_env=self.adapter_env(raw_file=raw))
+        self.assertEqual(5, proc.returncode)
+        self.assertEqual("", proc.stdout)
+        self.assertIn("projection adapter", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(1, len(self.adapter_calls()))
+
+    # -- case 2: per-command exit binding; never green for the failed one --
+
+    def test_failing_acceptance_command_binds_its_own_exit_and_never_green(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config(
+            overrides={
+                "local_review_ready_commands": ["true"],
+                "closure_acceptance_commands": ["exit 7"],
+            }
+        )
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(5, proc.returncode)
+        self.assertFalse(os.path.isfile(self.verification_path(COMMIT_A)))
+        failed = [e for e in self.read_events() if e["event_type"] == "verification"]
+        self.assertEqual(1, len(failed))
+        self.assertEqual("FAILED", failed[0]["outcome"])
+        self.assertEqual(
+            ["local_review_ready", "closure_acceptance"],
+            [c["phase"] for c in failed[0]["commands"]],
+        )
+        self.assertEqual([0, 7], [c["exit_status"] for c in failed[0]["commands"]])
+        self.assertEqual(
+            hashlib.sha256(b"true").hexdigest(),
+            failed[0]["commands"][0]["command_digest"],
+        )
+        self.assertEqual(
+            hashlib.sha256(b"exit 7").hexdigest(),
+            failed[0]["commands"][1]["command_digest"],
+        )
+        self.assertEqual(
+            hashlib.sha256(b"exit 7").hexdigest(),
+            failed[0]["failed_command_digest"],
+        )
+        status = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(0, status.returncode, status.stderr)
+        self.assertFalse(json.loads(status.stdout)["local_verification"])
+
+    def test_failing_local_review_command_binds_its_own_exit_and_never_green(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config(
+            overrides={
+                "local_review_ready_commands": ["exit 9"],
+                "closure_acceptance_commands": ["true"],
+            }
+        )
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(5, proc.returncode)
+        self.assertFalse(os.path.isfile(self.verification_path(COMMIT_A)))
+        failed = [e for e in self.read_events() if e["event_type"] == "verification"]
+        self.assertEqual(1, len(failed))
+        self.assertEqual("FAILED", failed[0]["outcome"])
+        self.assertEqual(
+            ["local_review_ready"],
+            [c["phase"] for c in failed[0]["commands"]],
+        )
+        self.assertEqual([9], [c["exit_status"] for c in failed[0]["commands"]])
+        self.assertEqual(
+            hashlib.sha256(b"exit 9").hexdigest(),
+            failed[0]["commands"][0]["command_digest"],
+        )
+        self.assertEqual(
+            hashlib.sha256(b"exit 9").hexdigest(),
+            failed[0]["failed_command_digest"],
+        )
+        status = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(0, status.returncode, status.stderr)
+        self.assertFalse(json.loads(status.stdout)["local_verification"])
+
+
 class RecordInfraFailureTests(CliTestCase):
     def test_record_infra_failure_stores_bounded_commit_bound_evidence(self):
         self.set_git()
