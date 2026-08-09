@@ -26,12 +26,18 @@ def review_ready():
         remote_commit=COMMIT_A,
         ci_commit=COMMIT_A,
         verification_commit=COMMIT_A,
+        durable_tip=COMMIT_A,
         worktree_clean=True,
         local_verification=True,
         ci_state=CiState.PASSING,
         review_owned=False,
         review_verdict=None,
         review_commit=None,
+        head_branch="feature/close",
+        base_branch="develop",
+        checked_out_branch="feature/close",
+        pr_state="OPEN",
+        pr_is_draft=False,
     )
 
 
@@ -332,6 +338,7 @@ class CommitShapeValidationTests(unittest.TestCase):
         "ci_commit",
         "review_commit",
         "verification_commit",
+        "durable_tip",
     )
     BAD_COMMITS = (
         "",
@@ -603,6 +610,147 @@ class BoundaryAssertionTests(unittest.TestCase):
         decision = derive_state(snap, NOW)
         self.assertEqual(ClosureState.UNVERIFIED, decision.state)
         self.assertIn("CI result pending", decision.reasons)
+
+
+class DurableTipSeamTests(unittest.TestCase):
+    """T6 seam: the CLI binds every durable record to one observed tip
+    (Evidence.DURABLE_TIP / Contradiction.DURABLE_TIP_MISMATCH). Missing or
+    mismatched durable-tip evidence must never approve."""
+
+    def test_missing_durable_tip_is_unverified(self):
+        snap = replace(review_ready(), durable_tip=None)
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+        self.assertIn("durable tip evidence", decision.reasons)
+
+    def test_durable_tip_evidence_key_absent_is_unverified(self):
+        snap = replace(
+            review_ready(),
+            evidence_available=frozenset(ALL_EVIDENCE - {Evidence.DURABLE_TIP}),
+        )
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+        self.assertIn("durable tip evidence", decision.reasons)
+
+    def test_durable_tip_mismatch_is_unverified(self):
+        snap = replace(review_ready(), durable_tip=COMMIT_B)
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+        self.assertIn("durable tip mismatch", decision.reasons)
+
+    def test_durable_tip_matching_tip_approves(self):
+        decision = derive_state(approved_snapshot(), NOW)
+        self.assertEqual(ClosureState.APPROVED, decision.state)
+
+    def test_durable_tip_contradiction_beats_apparent_approval(self):
+        snap = replace(
+            approved_snapshot(),
+            durable_tip=COMMIT_B,
+            contradictions=frozenset({Contradiction.DURABLE_TIP_MISMATCH}),
+        )
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+
+    def test_non_str_durable_tip_raises(self):
+        snap = replace(review_ready(), durable_tip=123)
+        with self.assertRaises(TypeError):
+            derive_state(snap, NOW)
+
+    def test_malformed_durable_tip_raises(self):
+        for bad in ("", "   ", "a" * 39, "A" * 40, "g" * 40):
+            with self.subTest(value=bad):
+                snap = replace(review_ready(), durable_tip=bad)
+                with self.assertRaises(ValueError):
+                    derive_state(snap, NOW)
+
+
+class LifecycleFactPinsTests(unittest.TestCase):
+    """C6C-F8: head/base/checked-out branch, PR state, and draft status are
+    pinned before any terminal approval; every fact has a contradiction test."""
+
+    def test_draft_pr_never_derives_approval(self):
+        snap = replace(approved_snapshot(), pr_is_draft=True)
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+        self.assertIn("draft pull request", decision.reasons)
+
+    def test_non_open_pr_is_unverified(self):
+        for state in ("CLOSED", "MERGED"):
+            with self.subTest(state=state):
+                snap = replace(approved_snapshot(), pr_state=state)
+                decision = derive_state(snap, NOW)
+                self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+                self.assertIn("pull request is not open", decision.reasons)
+
+    def test_checked_out_branch_mismatch_is_unverified(self):
+        snap = replace(approved_snapshot(), checked_out_branch="other/branch")
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+        self.assertIn("checked-out branch mismatch", decision.reasons)
+
+    def test_head_branch_mismatch_is_unverified(self):
+        snap = replace(approved_snapshot(), head_branch="other/head")
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+
+    def test_missing_pr_state_evidence_is_unverified(self):
+        snap = replace(approved_snapshot(), pr_state=None, pr_is_draft=None)
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+        self.assertIn("PR state evidence", decision.reasons)
+
+    def test_missing_head_branch_evidence_is_unverified(self):
+        snap = replace(
+            approved_snapshot(),
+            head_branch=None,
+            evidence_available=frozenset(ALL_EVIDENCE - {Evidence.HEAD_BRANCH}),
+        )
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+        self.assertIn("head branch evidence", decision.reasons)
+
+    def test_missing_base_branch_evidence_is_unverified(self):
+        snap = replace(
+            approved_snapshot(),
+            base_branch=None,
+            evidence_available=frozenset(ALL_EVIDENCE - {Evidence.BASE_BRANCH}),
+        )
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+        self.assertIn("base branch evidence", decision.reasons)
+
+    def test_missing_checked_out_branch_evidence_is_unverified(self):
+        snap = replace(
+            approved_snapshot(),
+            checked_out_branch=None,
+            evidence_available=frozenset(ALL_EVIDENCE - {Evidence.CHECKED_OUT_BRANCH}),
+        )
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+        self.assertIn("checked-out branch evidence", decision.reasons)
+
+    def test_draft_never_approves_even_with_everything_else_valid(self):
+        snap = replace(
+            approved_snapshot(),
+            pr_is_draft=True,
+            worktree_clean=True,
+            ci_state=CiState.PASSING,
+        )
+        decision = derive_state(snap, NOW)
+        self.assertNotEqual(ClosureState.APPROVED, decision.state)
+        self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+
+    def test_malformed_branch_types_raise(self):
+        for field in ("head_branch", "base_branch", "checked_out_branch", "pr_state"):
+            with self.subTest(field=field):
+                snap = replace(review_ready(), **{field: 42})
+                with self.assertRaises(TypeError):
+                    derive_state(snap, NOW)
+
+    def test_malformed_pr_is_draft_type_raises(self):
+        snap = replace(review_ready(), pr_is_draft="yes")
+        with self.assertRaises(TypeError):
+            derive_state(snap, NOW)
 
 
 if __name__ == "__main__":

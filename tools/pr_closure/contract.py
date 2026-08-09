@@ -1,19 +1,27 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import sys
+from pathlib import Path
 from typing import Dict, List, Mapping, NamedTuple, Optional, Tuple
 
-from pr_closure.model import Disposition, Severity, Verdict
+from pr_closure.model import Disposition, ProjectConfig, Severity, Verdict
 
 
 class ReviewValidationError(ValueError):
     """Raised when a review record or model family violates the contract."""
 
 
+class ConfigValidationError(ValueError):
+    """Raised when a project closure configuration violates the contract."""
+
+
 END = "(?![\\s\\S])"
 COMMIT_ID_PATTERN = "^[0-9a-f]{40}" + END
+COMMAND_DIGEST_PATTERN = "^[0-9a-f]{64}" + END
 REPOSITORY_PATTERN = "^[^/\\s]+/[^/\\s]+" + END
 
 NON_BLANK = {"minLength": 1, "pattern": "\\S"}
@@ -74,6 +82,68 @@ class _Field(NamedTuple):
 
 def _f(name: str, kind: str, params: Optional[Dict] = None) -> _Field:
     return _Field(name, kind, params or {})
+
+
+# Non-durable session areas. Config roots living here (or anywhere beneath
+# them, including through symlinks) are rejected by Python; JSON Schema can
+# only express the leading-slash requirement. Must stay consistent with
+# ``pr_closure.store._FORBIDDEN_ROOT_SPECS``; the differential suite pins the
+# equality, and ``store.py`` cannot import this module (it already imports
+# ``COMMIT_ID_PATTERN`` from here, which would be a cycle).
+CONFIG_FORBIDDEN_ROOT_SPECS = ("/tmp", os.path.expanduser("~/.claude/jobs"))
+
+_ANY_WHITESPACE_RE = re.compile(r"\s")
+
+
+def _forbidden_config_roots() -> Tuple[str, ...]:
+    return tuple(os.path.realpath(os.path.abspath(spec)) for spec in CONFIG_FORBIDDEN_ROOT_SPECS)
+
+
+def _is_forbidden_path(resolved: str) -> bool:
+    for root in _forbidden_config_roots():
+        if resolved == root or resolved.startswith(root + os.sep):
+            return True
+    return False
+
+
+PROJECT_CONFIG_FIELDS = (
+    _f("schema_version", "const_int", {"value": 1}),
+    _f("project", "project_component"),
+    _f("repository", "pattern", {"pattern": REPOSITORY_PATTERN}),
+    _f("repo_path", "durable_path"),
+    _f("default_branch", "branch"),
+    _f("closure_state_dir", "durable_path"),
+    _f("local_review_ready_commands", "command_array", {"min_items": 1}),
+    _f("closure_acceptance_commands", "command_array", {"min_items": 1}),
+    _f("infra_retry_budget", "integer", {"minimum": 1}),
+    _f("stagnation_budget_minutes", "integer", {"minimum": 1}),
+    _f("heavy_job_limit", "const_int", {"value": 1}),
+    _f("tracking_projection", "nullable_text"),
+)
+
+PROJECT_CONFIG_ALLOWED_KEYS = tuple(field.name for field in PROJECT_CONFIG_FIELDS)
+PROJECT_CONFIG_REQUIRED_KEYS = tuple(field.name for field in PROJECT_CONFIG_FIELDS)
+
+CONFIG_SEMANTIC_ASYMMETRIES = (
+    SemanticAsymmetry(
+        "exact_integer_types",
+        "integer-valued JSON numbers such as schema_version 1.0, infra_retry_budget 1.0, "
+        "or heavy_job_limit 1.0 satisfy JSON Schema integer/const semantics, while the "
+        "Python gate requires exact int values and rejects floats and booleans.",
+    ),
+    SemanticAsymmetry(
+        "forbidden_temporary_paths",
+        "repo_path and closure_state_dir must resolve to durable absolute paths outside "
+        "/tmp and the session job area; JSON Schema can only express the leading-slash "
+        "requirement, so this schema accepts /tmp roots the Python gate rejects.",
+    ),
+    SemanticAsymmetry(
+        "unsafe_project_component",
+        "the project name must be a single safe path component (no slash, backslash, NUL, "
+        "or surrounding whitespace, and not '.' or '..'); JSON Schema cannot exclude "
+        "'.'/'..'/NUL, so this schema accepts spellings the Python gate rejects.",
+    ),
+)
 
 
 RECORD_FIELDS = (
@@ -174,6 +244,18 @@ def _check_enum(name: str, raw, values) -> str:
     return raw
 
 
+def command_digest(command: str) -> str:
+    """SHA-256 content digest of a configured command string.
+
+    Durable evidence binds what ran through this digest and never persists the
+    raw command text (C6D-F4); the digest is the comparison key for
+    config-change staleness (C6D-F2).
+    """
+    if not isinstance(command, str):
+        raise ReviewValidationError("command_digest requires a string command")
+    return hashlib.sha256(command.encode("utf-8")).hexdigest()
+
+
 def _check_string_array(name: str, raw, min_items: int) -> Tuple[str, ...]:
     items = require_list(raw, name)
     if not all(isinstance(item, str) and item.strip() for item in items):
@@ -181,6 +263,53 @@ def _check_string_array(name: str, raw, min_items: int) -> Tuple[str, ...]:
     if len(items) < min_items:
         raise ReviewValidationError(f"{name} must contain at least {min_items} item(s)")
     return tuple(items)
+
+
+def _check_project_component(name: str, raw) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise ReviewValidationError(f"{name} must be a non-empty string")
+    if raw != raw.strip():
+        raise ReviewValidationError(f"{name} must not have surrounding whitespace")
+    if raw in (".", ".."):
+        raise ReviewValidationError(f"{name} must not be '.' or '..'")
+    if any(char in raw for char in ("/", "\\", "\x00")):
+        raise ReviewValidationError(f"{name} must be a single safe path component")
+    return raw
+
+
+def _check_durable_path(name: str, raw) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise ReviewValidationError(f"{name} must be a non-empty absolute path")
+    expanded = os.path.expanduser(raw)
+    if not os.path.isabs(expanded):
+        raise ReviewValidationError(f"{name} must be an absolute path")
+    resolved = os.path.realpath(expanded)
+    if _is_forbidden_path(resolved):
+        raise ReviewValidationError(
+            f"{name} must not live under a temporary session area: {resolved}"
+        )
+    return resolved
+
+
+def _check_branch(name: str, raw) -> str:
+    if not isinstance(raw, str) or not raw.strip() or _ANY_WHITESPACE_RE.search(raw):
+        raise ReviewValidationError(f"{name} must be a non-empty string without whitespace")
+    return raw
+
+
+def _check_command_array(name: str, raw, min_items: int) -> Tuple[str, ...]:
+    items = require_list(raw, name)
+    if not all(isinstance(item, str) and item.strip() for item in items):
+        raise ReviewValidationError(f"{name} must be a list of non-empty command strings")
+    if len(items) < min_items:
+        raise ReviewValidationError(f"{name} must contain at least {min_items} item(s)")
+    return tuple(items)
+
+
+def _check_nullable_text(name: str, raw) -> Optional[str]:
+    if raw is None:
+        return None
+    return _check_text(name, raw)
 
 
 def check(fields, record: Mapping, parsers: Optional[Dict] = None) -> Dict:
@@ -216,6 +345,16 @@ def check(fields, record: Mapping, parsers: Optional[Dict] = None) -> Dict:
             values[name] = [parser(item) for item in items]
         elif kind == "follow_up":
             values[name] = raw
+        elif kind == "project_component":
+            values[name] = _check_project_component(name, raw)
+        elif kind == "durable_path":
+            values[name] = _check_durable_path(name, raw)
+        elif kind == "branch":
+            values[name] = _check_branch(name, raw)
+        elif kind == "command_array":
+            values[name] = _check_command_array(name, raw, params.get("min_items", 0))
+        elif kind == "nullable_text":
+            values[name] = _check_nullable_text(name, raw)
         else:
             raise AssertionError(f"unknown contract kind: {kind!r}")
     return values
@@ -234,6 +373,39 @@ def check_follow_up(record, disposition) -> Optional[int]:
             "follow_up_issue only applies to FOLLOW_UP_ISSUE findings"
         )
     return None
+
+
+def validate_project_config(record: Mapping) -> ProjectConfig:
+    """Validate a version-1 project closure configuration.
+
+    Rejects unknown or missing keys, booleans/floats where integers are
+    required, unsupported schema versions, unsafe project/repository/branch
+    values, relative or forbidden temporary/session paths, empty command
+    lists, empty/whitespace/non-string commands, non-positive budgets, and
+    heavy-job limits other than the exact exclusive limit of 1. Path values
+    are resolved before they are returned; no filesystem state is created.
+    """
+    record = require_mapping(record, "project config")
+    try:
+        reject_unknown_keys(record, PROJECT_CONFIG_ALLOWED_KEYS, "project config")
+        require_present(record, PROJECT_CONFIG_REQUIRED_KEYS, "project config")
+        values = check(PROJECT_CONFIG_FIELDS, record)
+    except ReviewValidationError as error:
+        raise ConfigValidationError(str(error)) from error
+    return ProjectConfig(
+        schema_version=values["schema_version"],
+        project=values["project"],
+        repository=values["repository"],
+        repo_path=values["repo_path"],
+        default_branch=values["default_branch"],
+        closure_state_dir=values["closure_state_dir"],
+        local_review_ready_commands=values["local_review_ready_commands"],
+        closure_acceptance_commands=values["closure_acceptance_commands"],
+        infra_retry_budget=values["infra_retry_budget"],
+        stagnation_budget_minutes=values["stagnation_budget_minutes"],
+        heavy_job_limit=values["heavy_job_limit"],
+        tracking_projection=values["tracking_projection"],
+    )
 
 
 def _property_schema(name: str, kind: str, params: Dict) -> Dict:
@@ -268,6 +440,19 @@ def _property_schema(name: str, kind: str, params: Dict) -> Dict:
         if "minimum" in params:
             schema["minimum"] = params["minimum"]
         return schema
+    if kind == "project_component":
+        return {"type": "string", "pattern": "^[^/\\\\\\s]+$"}
+    if kind == "durable_path":
+        return {"type": "string", "minLength": 1, "pattern": "^/\\S"}
+    if kind == "branch":
+        return {"type": "string", "pattern": "^\\S+$"}
+    if kind == "command_array":
+        schema = {"type": "array", "items": dict({"type": "string"}, **NON_BLANK)}
+        if params.get("min_items", 0) > 0:
+            schema["minItems"] = params["min_items"]
+        return schema
+    if kind == "nullable_text":
+        return {"type": ["string", "null"], **NON_BLANK}
     raise AssertionError(f"unknown contract kind: {kind!r}")
 
 
@@ -322,9 +507,48 @@ def _comment() -> str:
     )
 
 
+def _project_comment() -> str:
+    return (
+        "Generated from tools/pr_closure/contract.py by "
+        "PYTHONPATH=tools python3 -m pr_closure.contract - never hand-edit. "
+        "Residual semantics JSON Schema cannot express are enforced in Python and are "
+        "documented verbatim: "
+        + "; ".join(
+            f"{asymmetry.id}: {asymmetry.description}"
+            for asymmetry in CONFIG_SEMANTIC_ASYMMETRIES
+        )
+    )
+
+
+def project_json_schema() -> Dict:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://ai-orchestration-playbook/schemas/project-closure-v1.json",
+        "title": "PR Closure Project Configuration",
+        "description": (
+            "Fail-closed versioned project configuration for the PR closure gate. "
+            "Path safety and component rules JSON Schema cannot express are enforced "
+            "in Python."
+        ),
+        "$comment": _project_comment(),
+        "type": "object",
+        "required": list(PROJECT_CONFIG_REQUIRED_KEYS),
+        "additionalProperties": False,
+        "properties": {field.name: _property_schema(*field) for field in PROJECT_CONFIG_FIELDS},
+    }
+
+
 def render_schema() -> str:
     return json.dumps(json_schema(), indent=2) + "\n"
 
 
+def render_project_schema() -> str:
+    return json.dumps(project_json_schema(), indent=2) + "\n"
+
+
 if __name__ == "__main__":
+    project_schema_path = (
+        Path(__file__).resolve().parent.parent / "schemas" / "project-closure-v1.json"
+    )
+    project_schema_path.write_text(render_project_schema())
     sys.stdout.write(render_schema())

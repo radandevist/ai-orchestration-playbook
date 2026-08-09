@@ -148,6 +148,16 @@ def _missing_evidence(snapshot, ci_state, review_verdict) -> list:
         Evidence.CI_COMMIT not in available or snapshot.ci_commit is None
     ):
         missing.append("CI commit evidence")
+    if Evidence.DURABLE_TIP not in available or snapshot.durable_tip is None:
+        missing.append("durable tip evidence")
+    if Evidence.PR not in available or snapshot.pr_state is None or snapshot.pr_is_draft is None:
+        missing.append("PR state evidence")
+    if Evidence.HEAD_BRANCH not in available or snapshot.head_branch is None:
+        missing.append("head branch evidence")
+    if Evidence.BASE_BRANCH not in available or snapshot.base_branch is None:
+        missing.append("base branch evidence")
+    if Evidence.CHECKED_OUT_BRANCH not in available or snapshot.checked_out_branch is None:
+        missing.append("checked-out branch evidence")
     if review_verdict is Verdict.INCONCLUSIVE:
         missing.append("conclusive review evidence")
     if (snapshot.review_owned or review_verdict is not None) and snapshot.review_commit is None:
@@ -177,6 +187,22 @@ def _contradictions(snapshot) -> list:
         and snapshot.review_commit != snapshot.local_commit
     ):
         contradictions.append("reviewed commit mismatch")
+    if (
+        snapshot.local_commit is not None
+        and snapshot.durable_tip is not None
+        and snapshot.durable_tip != snapshot.local_commit
+    ):
+        contradictions.append("durable tip mismatch")
+    if (
+        snapshot.head_branch is not None
+        and snapshot.checked_out_branch is not None
+        and snapshot.head_branch != snapshot.checked_out_branch
+    ):
+        contradictions.append("checked-out branch mismatch")
+    if snapshot.pr_state is not None and snapshot.pr_state != "OPEN":
+        contradictions.append("pull request is not open")
+    if snapshot.pr_is_draft is True:
+        contradictions.append("draft pull request")
     return contradictions
 
 
@@ -213,6 +239,7 @@ def _validate(snapshot, now) -> None:
         ("worktree_clean", snapshot.worktree_clean),
         ("local_verification", snapshot.local_verification),
         ("follow_ups_complete", snapshot.follow_ups_complete),
+        ("pr_is_draft", snapshot.pr_is_draft),
     ):
         if value is not None and not isinstance(value, bool):
             raise TypeError(f"{name} must be a bool or None")
@@ -223,6 +250,11 @@ def _validate(snapshot, now) -> None:
         ("ci_commit", snapshot.ci_commit),
         ("review_commit", snapshot.review_commit),
         ("verification_commit", snapshot.verification_commit),
+        ("durable_tip", snapshot.durable_tip),
+        ("head_branch", snapshot.head_branch),
+        ("base_branch", snapshot.base_branch),
+        ("checked_out_branch", snapshot.checked_out_branch),
+        ("pr_state", snapshot.pr_state),
         ("repeated_root_cause", snapshot.repeated_root_cause),
     ):
         if value is not None and not isinstance(value, str):
@@ -234,6 +266,7 @@ def _validate(snapshot, now) -> None:
         ("ci_commit", snapshot.ci_commit),
         ("review_commit", snapshot.review_commit),
         ("verification_commit", snapshot.verification_commit),
+        ("durable_tip", snapshot.durable_tip),
     ):
         if value is not None and _COMMIT_ID_RE.fullmatch(value) is None:
             raise ReviewValidationError(

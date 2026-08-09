@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-orchestration-playbook/schemas/project-closure-v1.json",
+  "title": "PR Closure Project Configuration",
+  "description": "Fail-closed versioned project configuration for the PR closure gate. Path safety and component rules JSON Schema cannot express are enforced in Python.",
+  "$comment": "Generated from tools/pr_closure/contract.py by PYTHONPATH=tools python3 -m pr_closure.contract - never hand-edit. Residual semantics JSON Schema cannot express are enforced in Python and are documented verbatim: exact_integer_types: integer-valued JSON numbers such as schema_version 1.0, infra_retry_budget 1.0, or heavy_job_limit 1.0 satisfy JSON Schema integer/const semantics, while the Python gate requires exact int values and rejects floats and booleans.; forbidden_temporary_paths: repo_path and closure_state_dir must resolve to durable absolute paths outside /tmp and the session job area; JSON Schema can only express the leading-slash requirement, so this schema accepts /tmp roots the Python gate rejects.; unsafe_project_component: the project name must be a single safe path component (no slash, backslash, NUL, or surrounding whitespace, and not '.' or '..'); JSON Schema cannot exclude '.'/'..'/NUL, so this schema accepts spellings the Python gate rejects.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "project",
+    "repository",
+    "repo_path",
+    "default_branch",
+    "closure_state_dir",
+    "local_review_ready_commands",
+    "closure_acceptance_commands",
+    "infra_retry_budget",
+    "stagnation_budget_minutes",
+    "heavy_job_limit",
+    "tracking_projection"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "project": {
+      "type": "string",
+      "pattern": "^[^/\\\\\\s]+$"
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^[^/\\s]+/[^/\\s]+(?![\\s\\S])"
+    },
+    "repo_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^/\\S"
+    },
+    "default_branch": {
+      "type": "string",
+      "pattern": "^\\S+$"
+    },
+    "closure_state_dir": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^/\\S"
+    },
+    "local_review_ready_commands": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      },
+      "minItems": 1
+    },
+    "closure_acceptance_commands": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      },
+      "minItems": 1
+    },
+    "infra_retry_budget": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "stagnation_budget_minutes": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "heavy_job_limit": {
+      "type": "integer",
+      "const": 1
+    },
+    "tracking_projection": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "pattern": "\\S"
+    }
+  }
+}

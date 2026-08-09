@@ -16,15 +16,18 @@ from pr_closure.state import derive_state
 from pr_closure.sources import (
     CheckOutcome,
     CheckResult,
+    GitHubIssueSource,
     GitHubSource,
     GitSource,
     PullRequestFacts,
     SourceMalformed,
     SourceUnavailable,
+    WorktreeResolver,
     _parse_worktree_block,
     classify_ci,
     default_runner,
     parse_check,
+    redact,
     require_infra_event,
 )
 
@@ -33,10 +36,11 @@ COMMIT_B = "b" * 40
 COMMIT_C = "c" * 40
 NOW = datetime(2026, 8, 8, 12, 0, 0)
 
-PR_JSON_FIELDS = "number,headRefName,headRefOid,isDraft,state,statusCheckRollup,url"
+PR_JSON_FIELDS = "number,headRefName,headRefOid,isDraft,state,statusCheckRollup,url,baseRefName"
 GH_BASE = {
     "number": 42,
     "headRefName": "feature/close",
+    "baseRefName": "develop",
     "headRefOid": COMMIT_A,
     "isDraft": False,
     "state": "OPEN",
@@ -208,7 +212,7 @@ class MalformedOutputTests(TempDirTestCase):
             source.read_pr()
 
     def test_missing_pr_key_raises(self):
-        for key in ("number", "headRefName", "headRefOid", "isDraft", "state", "statusCheckRollup", "url"):
+        for key in ("number", "headRefName", "headRefOid", "isDraft", "state", "statusCheckRollup", "url", "baseRefName"):
             with self.subTest(key=key):
                 data = dict(GH_BASE)
                 del data[key]
@@ -435,6 +439,7 @@ class GitHeadTests(TempDirTestCase):
             repository="owner/repo",
             number=42,
             head_branch=self.branch,
+            base_ref_name="develop",
             head_oid=COMMIT_C,
             is_draft=False,
             state="OPEN",
@@ -503,10 +508,19 @@ class GitHubPrTests(TempDirTestCase):
         self.assertEqual("owner/repo", pr.repository)
         self.assertEqual(42, pr.number)
         self.assertEqual("feature/close", pr.head_branch)
+        self.assertEqual("develop", pr.base_ref_name)
         self.assertEqual(COMMIT_A, pr.head_oid)
         self.assertFalse(pr.is_draft)
         self.assertEqual("OPEN", pr.state)
         self.assertEqual("https://github.com/owner/repo/pull/42", pr.url)
+
+    def test_base_ref_name_is_bound_and_validated(self):
+        for bad in ("", "   ", 42, None, ["develop"]):
+            with self.subTest(value=bad):
+                runner = RecordingRunner({"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response(baseRefName=bad)})
+                source = GitHubSource("owner/repo", 42, runner=runner)
+                with self.assertRaises(SourceMalformed):
+                    source.read_pr()
 
     def test_invalid_repository_shape_rejected(self):
         for bad in ("norepo", "/repo", "owner/", "owner repo/x", ""):
@@ -647,11 +661,212 @@ class GitHubPrTests(TempDirTestCase):
         )
 
 
+class WorktreeResolverTests(TempDirTestCase):
+    def resolver(self, anchor, blocks, **kwargs):
+        responses = {
+            "git -C {0} worktree list --porcelain".format(anchor): (
+                0,
+                porcelain_output([porcelain_block(block) for block in blocks]),
+                "",
+            )
+        }
+        return WorktreeResolver(anchor, runner=RecordingRunner(responses), **kwargs)
+
+    def test_resolves_exactly_one_worktree_by_checked_out_branch(self):
+        anchor = os.path.join(self.tmp, "main")
+        pr_wt = os.path.join(self.tmp, "elsewhere", "pr")
+        resolver = self.resolver(
+            anchor,
+            [
+                ["worktree " + anchor, "HEAD " + COMMIT_A, "branch refs/heads/develop"],
+                ["worktree " + pr_wt, "HEAD " + COMMIT_A, "branch refs/heads/feature/close"],
+            ],
+        )
+        record = resolver.resolve("feature/close")
+        self.assertEqual(pr_wt, record.path)
+        self.assertEqual("feature/close", record.branch)
+        self.assertEqual(COMMIT_A, record.head)
+        self.assertFalse(record.bare)
+
+    def test_resolved_path_is_never_constructed(self):
+        anchor = os.path.join(self.tmp, "main")
+        pr_wt = os.path.join(self.tmp, "elsewhere", "pr")
+        resolver = self.resolver(
+            anchor,
+            [
+                ["worktree " + anchor, "HEAD " + COMMIT_A, "branch refs/heads/develop"],
+                ["worktree " + pr_wt, "HEAD " + COMMIT_A, "branch refs/heads/feature/close"],
+            ],
+        )
+        record = resolver.resolve("feature/close")
+        self.assertEqual(pr_wt, record.path)
+        self.assertNotEqual(anchor, record.path)
+
+    def test_missing_branch_binding_fails_closed(self):
+        anchor = os.path.join(self.tmp, "main")
+        resolver = self.resolver(
+            anchor,
+            [["worktree " + anchor, "HEAD " + COMMIT_A, "branch refs/heads/develop"]],
+        )
+        with self.assertRaisesRegex(SourceMalformed, "feature/close"):
+            resolver.resolve("feature/close")
+
+    def test_duplicate_branch_binding_fails_closed(self):
+        anchor = os.path.join(self.tmp, "main")
+        resolver = self.resolver(
+            anchor,
+            [
+                ["worktree " + anchor, "HEAD " + COMMIT_A, "branch refs/heads/develop"],
+                ["worktree " + os.path.join(self.tmp, "one"), "HEAD " + COMMIT_A, "branch refs/heads/feature/close"],
+                ["worktree " + os.path.join(self.tmp, "two"), "HEAD " + COMMIT_A, "branch refs/heads/feature/close"],
+            ],
+        )
+        with self.assertRaisesRegex(SourceMalformed, "duplicate"):
+            resolver.resolve("feature/close")
+
+    def test_detached_worktree_never_matches(self):
+        anchor = os.path.join(self.tmp, "main")
+        resolver = self.resolver(
+            anchor,
+            [
+                ["worktree " + anchor, "HEAD " + COMMIT_A, "branch refs/heads/develop"],
+                ["worktree " + os.path.join(self.tmp, "wt"), "HEAD " + COMMIT_A, "detached"],
+            ],
+        )
+        with self.assertRaises(SourceMalformed):
+            resolver.resolve("feature/close")
+
+    def test_bare_worktree_never_matches(self):
+        anchor = os.path.join(self.tmp, "main")
+        resolver = self.resolver(
+            anchor,
+            [
+                ["worktree " + anchor, "HEAD " + COMMIT_A, "branch refs/heads/develop"],
+                ["worktree " + os.path.join(self.tmp, "bare.git"), "bare"],
+            ],
+        )
+        with self.assertRaises(SourceMalformed):
+            resolver.resolve("feature/close")
+
+    def test_resolution_uses_the_anchor_for_worktree_list(self):
+        anchor = os.path.join(self.tmp, "main")
+        runner = RecordingRunner(
+            {
+                "git -C {0} worktree list --porcelain".format(anchor): (
+                    0,
+                    porcelain_output(
+                        [
+                            porcelain_block(
+                                ["worktree " + anchor, "HEAD " + COMMIT_A, "branch refs/heads/develop"]
+                            )
+                        ]
+                    ),
+                    "",
+                )
+            }
+        )
+        resolver = WorktreeResolver(anchor, runner=runner)
+        with self.assertRaises(SourceMalformed):
+            resolver.resolve("feature/close")
+        self.assertEqual(
+            [("git", "-C", anchor, "worktree", "list", "--porcelain")],
+            runner.calls,
+        )
+
+    def test_anchor_must_be_absolute(self):
+        with self.assertRaises(SourceMalformed):
+            WorktreeResolver("relative/anchor")
+
+    def test_empty_worktree_output_fails_closed(self):
+        anchor = os.path.join(self.tmp, "main")
+        runner = RecordingRunner(
+            {"git -C {0} worktree list --porcelain".format(anchor): (0, "", "")}
+        )
+        resolver = WorktreeResolver(anchor, runner=runner)
+        with self.assertRaises(SourceMalformed):
+            resolver.resolve("feature/close")
+
+
+class GitHubIssueSourceTests(TempDirTestCase):
+    ISSUE_JSON_FIELDS = "number,state,url"
+
+    def runner_for(self, payload):
+        return RecordingRunner(
+            {"gh issue view 101 --repo owner/repo --json " + self.ISSUE_JSON_FIELDS: (0, payload, "")}
+        )
+
+    def test_read_issue_binds_number_repository_state_and_url(self):
+        payload = json.dumps(
+            {"number": 101, "state": "OPEN", "url": "https://github.com/owner/repo/issues/101"}
+        )
+        issue = GitHubIssueSource("owner/repo", 101, runner=self.runner_for(payload)).read_issue()
+        self.assertEqual("owner/repo", issue.repository)
+        self.assertEqual(101, issue.number)
+        self.assertEqual("OPEN", issue.state)
+
+    def test_issue_number_mismatch_is_malformed(self):
+        payload = json.dumps(
+            {"number": 102, "state": "OPEN", "url": "https://github.com/owner/repo/issues/102"}
+        )
+        source = GitHubIssueSource("owner/repo", 101, runner=self.runner_for(payload))
+        with self.assertRaises(SourceMalformed):
+            source.read_issue()
+
+    def test_unknown_issue_state_is_malformed(self):
+        for bad in ("DONE", "PENDING", "merged", ""):
+            with self.subTest(state=bad):
+                payload = json.dumps(
+                    {"number": 101, "state": bad, "url": "https://github.com/owner/repo/issues/101"}
+                )
+                source = GitHubIssueSource("owner/repo", 101, runner=self.runner_for(payload))
+                with self.assertRaises(SourceMalformed):
+                    source.read_issue()
+
+    def test_issue_url_must_bind_repository_and_number(self):
+        for bad in (
+            "https://github.com/other/repo/issues/101",
+            "https://github.com/owner/repo/issues/102",
+            "https://github.com/owner/repo/pull/101",
+            "https://evil.com/owner/repo/issues/101",
+        ):
+            with self.subTest(url=bad):
+                payload = json.dumps({"number": 101, "state": "OPEN", "url": bad})
+                source = GitHubIssueSource("owner/repo", 101, runner=self.runner_for(payload))
+                with self.assertRaises(SourceMalformed):
+                    source.read_issue()
+
+    def test_issue_missing_keys_are_malformed(self):
+        for key in ("number", "state", "url"):
+            with self.subTest(key=key):
+                data = {"number": 101, "state": "OPEN", "url": "https://github.com/owner/repo/issues/101"}
+                del data[key]
+                source = GitHubIssueSource("owner/repo", 101, runner=self.runner_for(json.dumps(data)))
+                with self.assertRaisesRegex(SourceMalformed, key):
+                    source.read_issue()
+
+    def test_issue_source_argv_is_exact_without_shell(self):
+        payload = json.dumps(
+            {"number": 101, "state": "OPEN", "url": "https://github.com/owner/repo/issues/101"}
+        )
+        runner = self.runner_for(payload)
+        GitHubIssueSource("owner/repo", 101, runner=runner).read_issue()
+        self.assertEqual(
+            [("gh", "issue", "view", "101", "--repo", "owner/repo", "--json", self.ISSUE_JSON_FIELDS)],
+            runner.calls,
+        )
+
+    def test_invalid_repository_or_number_rejected(self):
+        with self.assertRaises(SourceMalformed):
+            GitHubIssueSource("norepo", 101)
+        with self.assertRaises(SourceMalformed):
+            GitHubIssueSource("owner/repo", 0)
+
+
 class CheckRollupTests(TempDirTestCase):
     def test_check_run_passing(self):
         pr = PullRequestFacts(
-            repository="owner/repo", number=42, head_branch="f", head_oid=COMMIT_A,
-            is_draft=False, state="OPEN", url="u",
+            repository="owner/repo", number=42, head_branch="f", base_ref_name="develop",
+            head_oid=COMMIT_A, is_draft=False, state="OPEN", url="u",
             checks=(parse_check(check_run("lint", "COMPLETED", "SUCCESS")),),
         )
         self.assertEqual(CheckOutcome.PASSING, pr.checks[0].outcome)
@@ -900,6 +1115,169 @@ class DiagnosticTests(TempDirTestCase):
         event = dict(VALID_INFRA_EVENT, event_type="INFRA_RETRY")
         with self.assertRaises(SourceMalformed):
             require_infra_event(event)
+
+
+class RedactionTests(TempDirTestCase):
+    """T4R-N1 closure: common secret carriers are redacted from diagnostics,
+    useful context survives, and non-secret prose controls stay untouched."""
+
+    def test_authorization_bearer_header_redacted(self):
+        out = redact("error: Authorization: Bearer ghp_SUPERSECRET rejected")
+        self.assertNotIn("ghp_SUPERSECRET", out)
+        self.assertIn("authorization: bearer ***", out.casefold())
+
+    def test_authorization_bearer_redacts_all_alpha_secret(self):
+        out = redact("denied: Authorization: Bearer supersecret")
+        self.assertNotIn("supersecret", out)
+        self.assertIn("***", out)
+
+    def test_gh_token_colon_form_redacted(self):
+        out = redact("error: GH_TOKEN: ghp_WHITESPACESECRET invalid")
+        self.assertNotIn("ghp_WHITESPACESECRET", out)
+        self.assertIn("GH_TOKEN: ***", out)
+
+    def test_secret_key_colon_value_form_redacted(self):
+        out = redact("error: API_KEY: abc123def rejected")
+        self.assertNotIn("abc123def", out)
+        self.assertIn("API_KEY: ***", out)
+
+    def test_lowercase_key_colon_value_redacted(self):
+        out = redact("error: token: supersecret rejected")
+        self.assertNotIn("supersecret", out)
+        self.assertIn("token: ***", out)
+
+    def test_short_colon_value_redacted_regardless_of_length(self):
+        out = redact("error: GH_TOKEN: ab rejected")
+        self.assertNotIn("ab", out)
+        self.assertIn("GH_TOKEN: ***", out)
+
+    def test_mixed_case_key_colon_value_redacted(self):
+        out = redact("error: Token: x rejected")
+        self.assertNotIn("x", out)
+        self.assertIn("Token: ***", out)
+
+    def test_equals_separated_key_value_redacted(self):
+        out = redact("error: token=ab rejected")
+        self.assertNotIn("ab", out)
+        self.assertIn("token=***", out)
+
+    def test_secret_key_whitespace_separated_form_redacted(self):
+        out = redact("error: GH_TOKEN ghp_SPACESECRET rejected")
+        self.assertNotIn("ghp_SPACESECRET", out)
+        self.assertIn("GH_TOKEN ***", out)
+
+    def test_long_all_alpha_value_after_uppercase_key_redacted(self):
+        out = redact("error: GH_TOKEN supersecret rejected")
+        self.assertNotIn("supersecret", out)
+        self.assertIn("GH_TOKEN ***", out)
+
+    def test_secret_flag_value_redacted(self):
+        out = redact("error: --token supersecret123 denied")
+        self.assertNotIn("supersecret123", out)
+        self.assertIn("--token ***", out)
+
+    def test_short_flag_value_redacted_regardless_of_length(self):
+        out = redact("error: --token ab12 denied")
+        self.assertNotIn("ab12", out)
+        self.assertIn("--token ***", out)
+
+    def test_single_char_flag_value_redacted(self):
+        out = redact("error: --password z denied")
+        self.assertNotIn("z", out)
+        self.assertIn("--password ***", out)
+
+    def test_secret_flag_equals_form_redacted(self):
+        out = redact("error: --api-key=xyz-123-abc denied")
+        self.assertNotIn("xyz-123-abc", out)
+        self.assertIn("--api-key=***", out)
+
+    def test_equivalent_secret_flags_redacted(self):
+        for flag in ("--password", "--secret", "--access-token", "--auth-token", "--gh-token"):
+            with self.subTest(flag=flag):
+                out = redact("error: {0} abc123def denied".format(flag))
+                self.assertNotIn("abc123def", out)
+                self.assertIn("***", out)
+
+    def test_ssh_url_credentials_redacted(self):
+        out = redact("fatal: unable to clone ssh://user:ghp_SSHSECRET@example.com/owner/repo")
+        self.assertNotIn("ghp_SSHSECRET", out)
+        self.assertIn("ssh://***@example.com", out)
+
+    def test_https_url_credentials_still_redacted(self):
+        out = redact("error: https://user:ghp_HTTPSECRET@example.com failed")
+        self.assertNotIn("ghp_HTTPSECRET", out)
+        self.assertIn("https://***@example.com", out)
+
+    def test_key_equals_value_form_still_redacted(self):
+        out = redact("error: (token=supersecret) denied")
+        self.assertNotIn("supersecret", out)
+        self.assertIn("token=***", out)
+
+    def test_mixed_carriers_all_redacted_in_one_line(self):
+        out = redact(
+            "Authorization: Bearer ghp_A denied; GH_TOKEN: ghp_B invalid; "
+            "--token ghp_C failed; ssh://u:ghp_D@h/x"
+        )
+        for secret in ("ghp_A", "ghp_B", "ghp_C", "ghp_D"):
+            self.assertNotIn(secret, out)
+
+    def test_bearer_prose_without_value_survives(self):
+        out = redact("policy note: bearer policies apply to push")
+        self.assertIn("bearer policies apply to push", out)
+
+    def test_short_prose_values_survive(self):
+        out = redact("docs: token is used for auth; note: token value appears in the README")
+        self.assertIn("token is used for auth", out)
+        self.assertIn("token value appears in the README", out)
+
+    def test_lowercase_prose_key_values_survive(self):
+        out = redact("note: token value appears in the README")
+        self.assertIn("token value appears in the README", out)
+
+    def test_flag_followed_by_prose_word_is_redacted(self):
+        out = redact("usage: --token is documented")
+        self.assertIn("--token ***", out)
+        self.assertNotIn("--token is", out)
+
+    def test_secret_flag_without_value_survives(self):
+        out = redact("usage: --token")
+        self.assertEqual("usage: --token", out)
+
+    def test_redaction_is_idempotent(self):
+        once = redact("error: GH_TOKEN: ghp_WHITESPACESECRET invalid")
+        twice = redact(once)
+        self.assertEqual(once, twice)
+
+    def test_command_context_redacted_through_error_message(self):
+        responses = self.base_responses()
+        responses[self.git_c("rev-parse", "HEAD")] = (
+            1,
+            "",
+            "error: GH_TOKEN: ghp_E2ESECRET rejected",
+        )
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaises(SourceUnavailable) as context:
+            source.local_head()
+        self.assertNotIn("ghp_E2ESECRET", str(context.exception))
+
+    def test_short_and_all_alpha_secrets_never_reach_source_errors(self):
+        responses = self.base_responses()
+        responses[self.git_c("rev-parse", "HEAD")] = (
+            1,
+            "",
+            "error: token: supersecret rejected; --token ab12 denied",
+        )
+        source = GitSource(self.wt, self.branch, runner=RecordingRunner(responses))
+        with self.assertRaises(SourceUnavailable) as context:
+            source.local_head()
+        self.assertNotIn("supersecret", str(context.exception))
+        self.assertNotIn("ab12", str(context.exception))
+
+    def test_existing_url_and_kv_cases_remain_pinned(self):
+        out = redact(
+            "error: https://user:supersecret@example.com failed (token=supersecret)"
+        )
+        self.assertNotIn("supersecret", out)
 
 
 class RealGitIntegrationTests(unittest.TestCase):

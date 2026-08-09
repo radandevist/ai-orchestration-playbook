@@ -5,10 +5,18 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
-from pr_closure.contract import SEMANTIC_ASYMMETRIES
+from pr_closure.contract import (
+    CONFIG_FORBIDDEN_ROOT_SPECS,
+    CONFIG_SEMANTIC_ASYMMETRIES,
+    SEMANTIC_ASYMMETRIES,
+    ConfigValidationError,
+    project_json_schema,
+    validate_project_config,
+)
 from pr_closure.review import ReviewValidationError, validate_review
 
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "review-record-v1.json"
+CONFIG_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "project-closure-v1.json"
 REQUIREMENTS_PATH = Path(__file__).resolve().parent / "requirements-test.txt"
 
 
@@ -389,6 +397,299 @@ class SchemaPythonDifferentialTests(unittest.TestCase):
             },
             counts,
         )
+
+
+def _valid_config():
+    return {
+        "schema_version": 1,
+        "project": "publyapp",
+        "repository": "owner/repo",
+        "repo_path": "/var/tmp/durable/repo",
+        "default_branch": "develop",
+        "closure_state_dir": "/var/tmp/durable/state",
+        "local_review_ready_commands": ["npm run verify"],
+        "closure_acceptance_commands": ["npm run acceptance"],
+        "infra_retry_budget": 1,
+        "stagnation_budget_minutes": 240,
+        "heavy_job_limit": 1,
+        "tracking_projection": "trello card update",
+    }
+
+
+def config_agreement_corpus():
+    """(label, config, schema_valid, python_valid, asymmetry_id) tuples for the
+    project-closure-v1 contract. Agreement and deliberate asymmetry are both
+    first-class members; every deliberate schema-accepts/Python-rejects case
+    names the independently declared semantic asymmetry that explains it."""
+
+    def add(label, mutate, schema_ok, python_ok, asymmetry_id=None):
+        config = _valid_config()
+        mutate(config)
+        cases.append((label, config, schema_ok, python_ok, asymmetry_id))
+
+    cases = []
+
+    add("valid config", lambda c: None, True, True)
+    add("null tracking_projection", lambda c: c.update({"tracking_projection": None}), True, True)
+
+    add("unknown top-level key", lambda c: c.update({"rogue": "x"}), False, False)
+    add("missing schema_version", lambda c: c.pop("schema_version"), False, False)
+    add(
+        "missing closure_acceptance_commands",
+        lambda c: c.pop("closure_acceptance_commands"),
+        False,
+        False,
+    )
+    add("unsupported schema_version", lambda c: c.update({"schema_version": 2}), False, False)
+    add("boolean schema_version", lambda c: c.update({"schema_version": True}), False, False)
+    add(
+        "boolean infra_retry_budget",
+        lambda c: c.update({"infra_retry_budget": True}),
+        False,
+        False,
+    )
+    add("boolean heavy_job_limit", lambda c: c.update({"heavy_job_limit": True}), False, False)
+    add(
+        "float infra_retry_budget",
+        lambda c: c.update({"infra_retry_budget": 1.5}),
+        False,
+        False,
+    )
+    add("zero infra_retry_budget", lambda c: c.update({"infra_retry_budget": 0}), False, False)
+    add(
+        "negative stagnation_budget_minutes",
+        lambda c: c.update({"stagnation_budget_minutes": -5}),
+        False,
+        False,
+    )
+    add("heavy_job_limit two", lambda c: c.update({"heavy_job_limit": 2}), False, False)
+    add("heavy_job_limit zero", lambda c: c.update({"heavy_job_limit": 0}), False, False)
+    add("project with slash", lambda c: c.update({"project": "a/b"}), False, False)
+    add("project with backslash", lambda c: c.update({"project": "a\\b"}), False, False)
+    add(
+        "project with surrounding whitespace",
+        lambda c: c.update({"project": " spaced "}),
+        False,
+        False,
+    )
+    add("repository without slash", lambda c: c.update({"repository": "norepo"}), False, False)
+    add(
+        "repository with space",
+        lambda c: c.update({"repository": "owner repo/x"}),
+        False,
+        False,
+    )
+    add("repository trailing slash", lambda c: c.update({"repository": "owner/"}), False, False)
+    add(
+        "repository trailing newline",
+        lambda c: c.update({"repository": "owner/repo\n"}),
+        False,
+        False,
+    )
+    add("blank default_branch", lambda c: c.update({"default_branch": "   "}), False, False)
+    add(
+        "default_branch with space",
+        lambda c: c.update({"default_branch": "branch name"}),
+        False,
+        False,
+    )
+    add("relative repo_path", lambda c: c.update({"repo_path": "relative/path"}), False, False)
+    add("empty repo_path", lambda c: c.update({"repo_path": ""}), False, False)
+    add(
+        "relative closure_state_dir",
+        lambda c: c.update({"closure_state_dir": "relative/state"}),
+        False,
+        False,
+    )
+    add(
+        "empty local_review_ready_commands",
+        lambda c: c.update({"local_review_ready_commands": []}),
+        False,
+        False,
+    )
+    add(
+        "empty closure_acceptance_commands",
+        lambda c: c.update({"closure_acceptance_commands": []}),
+        False,
+        False,
+    )
+    add(
+        "blank command item",
+        lambda c: c.update({"local_review_ready_commands": ["ok", "   "]}),
+        False,
+        False,
+    )
+    add(
+        "non-string command",
+        lambda c: c.update({"local_review_ready_commands": [42]}),
+        False,
+        False,
+    )
+    add("empty tracking_projection", lambda c: c.update({"tracking_projection": ""}), False, False)
+    add(
+        "blank tracking_projection",
+        lambda c: c.update({"tracking_projection": "   "}),
+        False,
+        False,
+    )
+    add(
+        "non-string tracking_projection",
+        lambda c: c.update({"tracking_projection": 42}),
+        False,
+        False,
+    )
+
+    add(
+        "repo_path under /tmp",
+        lambda c: c.update({"repo_path": "/tmp/scratch/repo"}),
+        True,
+        False,
+        "forbidden_temporary_paths",
+    )
+    add(
+        "closure_state_dir under /tmp",
+        lambda c: c.update({"closure_state_dir": "/tmp/scratch/state"}),
+        True,
+        False,
+        "forbidden_temporary_paths",
+    )
+    add("project dot", lambda c: c.update({"project": "."}), True, False, "unsafe_project_component")
+    add(
+        "project dotdot",
+        lambda c: c.update({"project": ".."}),
+        True,
+        False,
+        "unsafe_project_component",
+    )
+    add(
+        "project NUL byte",
+        lambda c: c.update({"project": "a\x00b"}),
+        True,
+        False,
+        "unsafe_project_component",
+    )
+    add(
+        "schema_version 1.0",
+        lambda c: c.update({"schema_version": 1.0}),
+        True,
+        False,
+        "exact_integer_types",
+    )
+    add(
+        "infra_retry_budget 1.0",
+        lambda c: c.update({"infra_retry_budget": 1.0}),
+        True,
+        False,
+        "exact_integer_types",
+    )
+    add(
+        "heavy_job_limit 1.0",
+        lambda c: c.update({"heavy_job_limit": 1.0}),
+        True,
+        False,
+        "exact_integer_types",
+    )
+
+    return cases
+
+
+class ConfigCorpusShapeTests(unittest.TestCase):
+    def test_published_config_schema_equals_generated_schema(self):
+        published = json.loads(CONFIG_SCHEMA_PATH.read_text())
+        self.assertEqual(published, project_json_schema())
+
+    def test_config_asymmetry_registry_is_complete_and_published(self):
+        declared = {item.id: item.description for item in CONFIG_SEMANTIC_ASYMMETRIES}
+        covered = set()
+        errors = []
+        for label, _, schema_ok, python_ok, asymmetry_id in config_agreement_corpus():
+            is_deliberate_asymmetry = (schema_ok, python_ok) == (True, False)
+            if is_deliberate_asymmetry and asymmetry_id is None:
+                errors.append(f"{label}: missing asymmetry id")
+            if not is_deliberate_asymmetry and asymmetry_id is not None:
+                errors.append(f"{label}: unexpected asymmetry id {asymmetry_id!r}")
+            if asymmetry_id is not None:
+                covered.add(asymmetry_id)
+        self.assertEqual([], errors)
+        self.assertEqual(set(declared), covered)
+
+        comment = json.loads(CONFIG_SCHEMA_PATH.read_text()).get("$comment", "")
+        for asymmetry_id, description in declared.items():
+            with self.subTest(asymmetry_id=asymmetry_id):
+                self.assertIn(f"{asymmetry_id}: {description}", comment)
+
+    def test_config_corpus_covers_each_structural_group(self):
+        counts = {}
+        for row in config_agreement_corpus():
+            group = _config_group_of(row)
+            counts[group] = counts.get(group, 0) + 1
+        self.assertEqual(
+            {
+                "valid": 1,
+                "null_projection": 1,
+                "structural": 31,
+                "asymmetric": 8,
+            },
+            counts,
+        )
+
+
+class ConfigSchemaPythonDifferentialTests(unittest.TestCase):
+    def test_every_config_corpus_case_matches_its_declared_outcome(self):
+        validator = Draft202012Validator(json.loads(CONFIG_SCHEMA_PATH.read_text()))
+        mismatches = []
+        for label, config, schema_ok, python_ok, _ in config_agreement_corpus():
+            got_schema = validator.is_valid(config)
+            try:
+                validate_project_config(config)
+                got_python = True
+            except ConfigValidationError:
+                got_python = False
+            expected = (schema_ok, python_ok)
+            got = (got_schema, got_python)
+            if got != expected:
+                mismatches.append(
+                    f"{label}: got schema={got_schema} python={got_python} "
+                    f"expected schema={schema_ok} python={python_ok}"
+                )
+        self.assertEqual([], mismatches)
+
+    def test_config_corpus_declares_both_agreement_and_deliberate_asymmetry(self):
+        outcomes = {row[2:4] for row in config_agreement_corpus()}
+        self.assertIn((True, True), outcomes)
+        self.assertIn((False, False), outcomes)
+        self.assertIn((True, False), outcomes)
+        self.assertNotIn((False, True), outcomes)
+
+    def test_config_validation_rejects_forbidden_paths_without_filesystem_io(self):
+        config = _valid_config()
+        config["repo_path"] = "/tmp/scratch/repo"
+        with self.assertRaises(ConfigValidationError):
+            validate_project_config(config)
+
+    def test_config_validation_returns_typed_project_config(self):
+        from pr_closure.model import ProjectConfig
+
+        config = validate_project_config(_valid_config())
+        self.assertIsInstance(config, ProjectConfig)
+        self.assertEqual("publyapp", config.project)
+        self.assertEqual("/var/tmp/durable/repo", config.repo_path)
+
+    def test_config_forbidden_roots_match_store_forbidden_roots(self):
+        from pr_closure.store import _FORBIDDEN_ROOT_SPECS
+
+        self.assertEqual(CONFIG_FORBIDDEN_ROOT_SPECS, _FORBIDDEN_ROOT_SPECS)
+
+
+def _config_group_of(row):
+    label = row[0]
+    if label == "valid config":
+        return "valid"
+    if label == "null tracking_projection":
+        return "null_projection"
+    if row[4] is not None:
+        return "asymmetric"
+    return "structural"
 
 
 def _disposition_of(row):

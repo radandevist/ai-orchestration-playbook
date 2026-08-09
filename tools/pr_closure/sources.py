@@ -39,19 +39,82 @@ class SourceMalformed(SourceError):
 # ---------------------------------------------------------------------------
 # Diagnostics (command context + stderr, never secrets)
 # ---------------------------------------------------------------------------
+#
+# T4R-N1 (fully closed): redaction covers URL credentials
+# (http(s)/ssh/git/sftp), the ``Authorization: Bearer <secret>`` header,
+# ``KEY=value`` pairs (unconstrained value), secret-key forms separated by
+# ``:`` or ``=`` (value redacted unconditionally, regardless of key case,
+# token alphabet, or length), secret-key whitespace-separated forms (redacted
+# only for non-lowercase keys with token-shaped values, so prose such as
+# ``token is used`` survives), and secret flags (``--token <value>`` and
+# ``--token=<value>``, value redacted unconditionally). Prose with no secret
+# separator or flag value, such as ``token is used for auth``, is never
+# erased. The unconstrained ``KEY=value`` and ``Authorization: Bearer`` forms
+# stay unconstrained because they are pinned by the pre-existing and Task 6
+# tests.
 
-_CREDENTIALS_IN_URL_RE = re.compile(r"(?i)(?P<scheme>https?://)[^/@\s]+@")
+_CREDENTIALS_IN_URL_RE = re.compile(r"(?i)(?P<scheme>https?://|ssh://|git://|sftp://)[^/@\s]+@")
 _SECRET_KV_RE = re.compile(r"(?i)(password|token|secret|api[_-]?key|access[_-]?token|auth[a-z_-]*)=([^&\s]+)")
+_AUTHORIZATION_BEARER_RE = re.compile(r"(?i)(\bauthorization\s*:\s*bearer\s+)\S+")
+_SECRET_KEY_SEPARATOR_RE = re.compile(
+    r"(?i)(?P<key>gh[_-]?token|github[_-]?token|access[_-]?token|api[_-]?key|"
+    r"auth[_-]?token|auth[_-]?key|password|secret|token|bearer)"
+    r"(?P<sep>\s*[:=]\s*)(?P<value>[^\s,*]+)"
+)
+_SECRET_KEY_SPACE_RE = re.compile(
+    r"(?i)(?P<key>gh[_-]?token|github[_-]?token|access[_-]?token|api[_-]?key|"
+    r"auth[_-]?token|auth[_-]?key|password|secret|token|bearer)"
+    r"(?P<sep>\s+)(?P<value>[^\s,*]+)"
+)
+_SECRET_FLAG_RE = re.compile(
+    r"(?i)(?P<flag>--(?:password|token|secret|api[_-]?key|access[_-]?token|"
+    r"auth[_-]?token|gh[_-]?token))(?P<sep>[=\s]+)(?P<value>[^\s,*]+)"
+)
+_UNSAFE_VALUE_CHARS = frozenset("0123456789_/.-+=")
 
 
-def _redact(text: str) -> str:
+def _looks_like_secret(value: str) -> bool:
+    if len(value) >= 8:
+        return True
+    return len(value) >= 4 and any(ch in _UNSAFE_VALUE_CHARS for ch in value)
+
+
+def _redact_separated(match) -> str:
+    return match.group("key") + match.group("sep") + "***"
+
+
+def _redact_space_separated(match) -> str:
+    key = match.group("key")
+    if key.islower():
+        return match.group(0)
+    value = match.group("value")
+    if not _looks_like_secret(value):
+        return match.group(0)
+    return key + match.group("sep") + "***"
+
+
+def _redact_flag(match) -> str:
+    return match.group("flag") + match.group("sep") + "***"
+
+
+def redact(text: str) -> str:
+    """Redact credentials and secret carriers from a diagnostic string.
+
+    Used for command displays and stderr so secrets never persist into CLI
+    diagnostics. Preserves surrounding context and avoids erasing prose that
+    carries no secret separator or flag value.
+    """
     text = _CREDENTIALS_IN_URL_RE.sub(r"\g<scheme>***@", text)
+    text = _AUTHORIZATION_BEARER_RE.sub(r"\1***", text)
     text = _SECRET_KV_RE.sub(lambda match: match.group(1) + "=***", text)
+    text = _SECRET_KEY_SEPARATOR_RE.sub(_redact_separated, text)
+    text = _SECRET_KEY_SPACE_RE.sub(_redact_space_separated, text)
+    text = _SECRET_FLAG_RE.sub(_redact_flag, text)
     return text
 
 
 def _describe_command(argv: Sequence[str]) -> str:
-    return _redact(" ".join(str(part) for part in argv))
+    return redact(" ".join(str(part) for part in argv))
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +147,7 @@ def _invoke(argv: Tuple[str, ...], timeout, runner: Runner) -> CommandResult:
     except OSError as error:
         raise SourceUnavailable(
             "cannot run source command {0}: {1}".format(
-                _describe_command(argv), _redact(str(error))
+                _describe_command(argv), redact(str(error))
             )
         ) from error
     if not isinstance(result, tuple) or len(result) != 3:
@@ -113,7 +176,7 @@ def _invoke(argv: Tuple[str, ...], timeout, runner: Runner) -> CommandResult:
             detail = "exited with status {0}".format(returncode)
         raise SourceUnavailable(
             "source command {0} {1}; stderr: {2}".format(
-                _describe_command(argv), detail, _redact(stderr)
+                _describe_command(argv), detail, redact(stderr)
             )
         )
     return (returncode, stdout, stderr)
@@ -379,6 +442,14 @@ class GitSource:
 
     def facts(self) -> GitFacts:
         record = self.discover_worktree()
+        if record.branch != self._branch:
+            raise SourceMalformed(
+                "worktree {0} is checked out on branch {1!r}, expected {2!r} for: {3}".format(
+                    record.path, record.branch, self._branch, _describe_command(
+                        self._git_c(record.path, WORKTREE_LIST_COMMAND)
+                    )
+                )
+            )
         local = self.local_head()
         remote = self.remote_head()
         clean, entries = self.worktree_clean()
@@ -393,12 +464,68 @@ class GitSource:
         )
 
 
+class WorktreeResolver:
+    """Fail-closed resolver of the live PR worktree from a repository anchor.
+
+    ``repo_path`` is the repository anchor (the configured main checkout, for
+    example on the PR base branch). The resolver runs ``git worktree list
+    --porcelain`` from the anchor and resolves exactly one non-bare worktree
+    whose checked-out branch equals the live PR head branch. It never
+    constructs a worktree path: the path is always the one git reported.
+    Missing, detached, duplicate, or mismatched branch bindings raise a typed
+    source error so callers fail closed before any evidence write.
+    """
+
+    def __init__(self, anchor, runner: Optional[Runner] = None, timeout=None):
+        expanded = os.path.expanduser(os.fspath(anchor))
+        if not os.path.isabs(expanded):
+            raise SourceMalformed("repository anchor path must be absolute")
+        self._resolved = os.path.realpath(expanded)
+        self._runner = runner or default_runner
+        self._timeout = timeout
+
+    @property
+    def anchor(self) -> str:
+        return self._resolved
+
+    def resolve(self, branch: str) -> WorktreeRecord:
+        if not isinstance(branch, str) or not branch.strip() or _WHITESPACE_RE.search(branch):
+            raise SourceMalformed("branch must be a non-empty string without whitespace")
+        argv = ("git", "-C", self._resolved) + WORKTREE_LIST_COMMAND
+        _, stdout, _ = _invoke(argv, self._timeout, self._runner)
+        raw = _require_non_blank(stdout, argv, "git worktree list")
+        records = [_parse_worktree_block(block, argv) for block in _split_blocks(raw)]
+        matches = [record for record in records if not record.bare and record.branch == branch]
+        if not matches:
+            raise SourceMalformed(
+                "no recorded worktree checks out branch {0!r} among {1} worktree(s) for: {2}".format(
+                    branch, len(records), _describe_command(argv)
+                )
+            )
+        if len(matches) > 1:
+            raise SourceMalformed(
+                "duplicate/contradictory worktree records check out branch {0!r} for: {1}".format(
+                    branch, _describe_command(argv)
+                )
+            )
+        return matches[0]
+
+
 # ---------------------------------------------------------------------------
 # GitHub PR reading
 # ---------------------------------------------------------------------------
 
-PR_JSON_FIELDS = "number,headRefName,headRefOid,isDraft,state,statusCheckRollup,url"
-_REQUIRED_PR_KEYS = ("number", "headRefName", "headRefOid", "isDraft", "state", "statusCheckRollup", "url")
+PR_JSON_FIELDS = "number,headRefName,headRefOid,isDraft,state,statusCheckRollup,url,baseRefName"
+_REQUIRED_PR_KEYS = (
+    "number",
+    "headRefName",
+    "headRefOid",
+    "isDraft",
+    "state",
+    "statusCheckRollup",
+    "url",
+    "baseRefName",
+)
 PR_STATES = frozenset({"OPEN", "CLOSED", "MERGED"})
 PR_CHECK_NODE_TYPES = frozenset({"CheckRun", "StatusContext", "CheckSuite"})
 CHECK_RUN_STATUSES = frozenset({"QUEUED", "IN_PROGRESS", "COMPLETED", "PENDING", "REQUESTED", "WAITING"})
@@ -439,6 +566,7 @@ class PullRequestFacts:
     repository: str
     number: int
     head_branch: str
+    base_ref_name: str
     head_oid: str
     is_draft: bool
     state: str
@@ -558,7 +686,9 @@ def parse_check(node, argv=()) -> CheckResult:
     return CheckResult(kind, name, status, conclusion, outcome, details_url)
 
 
-def _require_pr_url(value, repository: str, number: int, argv) -> str:
+def _require_github_url(value, repository: str, number: int, kind: str, argv) -> str:
+    if kind not in ("pull", "issues"):
+        raise AssertionError("unknown github url kind: {0!r}".format(kind))
     if not isinstance(value, str) or not value.strip():
         raise SourceMalformed("PR url must be a non-empty string for: {0}".format(_describe_command(argv)))
     try:
@@ -590,14 +720,18 @@ def _require_pr_url(value, repository: str, number: int, argv) -> str:
         raise SourceMalformed(
             "PR url must not carry a query or fragment for: {0}".format(_describe_command(argv))
         )
-    expected = "/{0}/pull/{1}".format(repository, number)
+    expected = "/{0}/{1}/{2}".format(repository, kind, number)
     if parsed.path not in (expected, expected + "/"):
         raise SourceMalformed(
-            "PR url must bind exactly to {0} pull request {1} for: {2}".format(
-                repository, number, _describe_command(argv)
+            "PR url must bind exactly to {0} {1} {2} for: {3}".format(
+                repository, kind, number, _describe_command(argv)
             )
         )
     return value
+
+
+def _require_pr_url(value, repository: str, number: int, argv) -> str:
+    return _require_github_url(value, repository, number, "pull", argv)
 
 
 class GitHubSource:
@@ -653,6 +787,7 @@ class GitHubSource:
                 )
             )
         head_branch = _require_non_empty_str(data["headRefName"], "headRefName", argv)
+        base_ref_name = _require_non_empty_str(data["baseRefName"], "baseRefName", argv)
         head_oid = _require_commit(data["headRefOid"], "headRefOid", argv)
         is_draft = data["isDraft"]
         if not isinstance(is_draft, bool):
@@ -673,11 +808,99 @@ class GitHubSource:
             repository=self._repository,
             number=number,
             head_branch=head_branch,
+            base_ref_name=base_ref_name,
             head_oid=head_oid,
             is_draft=is_draft,
             state=state,
             url=url,
             checks=checks,
+        )
+
+
+# ---------------------------------------------------------------------------
+# GitHub issue reading (follow-up verification)
+# ---------------------------------------------------------------------------
+
+ISSUE_JSON_FIELDS = "number,state,url"
+_REQUIRED_ISSUE_KEYS = ("number", "state", "url")
+# GitHub issues are OPEN or CLOSED; SCHEDULED is a documented scheduled state
+# the closure gate accepts as evidence of a live follow-up.
+ISSUE_STATES = frozenset({"OPEN", "CLOSED", "SCHEDULED"})
+
+
+@dataclass(frozen=True)
+class IssueFacts:
+    repository: str
+    number: int
+    state: str
+    url: str
+
+
+class GitHubIssueSource:
+    """Fail-closed reader for one GitHub issue via ``gh issue view``.
+
+    The requested repository and issue number are bound into every read: an
+    issue reporting a different number, an unknown state, or an unbound URL
+    raises a typed source error. An API failure or malformed response is an
+    error, never a favorable default.
+    """
+
+    def __init__(self, repository, issue_number, runner: Optional[Runner] = None, timeout=None):
+        if not isinstance(repository, str) or _REPOSITORY_RE.fullmatch(repository) is None:
+            raise SourceMalformed("repository must look like owner/repo: {0!r}".format(repository))
+        if not isinstance(issue_number, int) or isinstance(issue_number, bool) or issue_number < 1:
+            raise SourceMalformed("issue_number must be a positive integer")
+        self._repository = repository
+        self._issue_number = issue_number
+        self._runner = runner or default_runner
+        self._timeout = timeout
+
+    @property
+    def repository(self) -> str:
+        return self._repository
+
+    @property
+    def issue_number(self) -> int:
+        return self._issue_number
+
+    def read_issue(self) -> IssueFacts:
+        argv = (
+            "gh",
+            "issue",
+            "view",
+            str(self._issue_number),
+            "--repo",
+            self._repository,
+            "--json",
+            ISSUE_JSON_FIELDS,
+        )
+        _, stdout, _ = _invoke(argv, self._timeout, self._runner)
+        data = _parse_json_object(stdout, argv, "gh issue view")
+        missing = [key for key in _REQUIRED_ISSUE_KEYS if key not in data]
+        if missing:
+            raise SourceMalformed(
+                "gh issue view missing key(s): {0} for: {1}".format(
+                    ", ".join(missing), _describe_command(argv)
+                )
+            )
+        number = data["number"]
+        if not isinstance(number, int) or isinstance(number, bool) or number != self._issue_number:
+            raise SourceMalformed(
+                "issue number {0!r} does not bind to requested {1} for: {2}".format(
+                    number, self._issue_number, _describe_command(argv)
+                )
+            )
+        state = data["state"]
+        if not isinstance(state, str) or state not in ISSUE_STATES:
+            raise SourceMalformed(
+                "unsupported issue state {0!r} for: {1}".format(state, _describe_command(argv))
+            )
+        url = _require_github_url(data["url"], self._repository, self._issue_number, "issues", argv)
+        return IssueFacts(
+            repository=self._repository,
+            number=number,
+            state=state,
+            url=url,
         )
 
 

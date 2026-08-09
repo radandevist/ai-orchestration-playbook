@@ -58,12 +58,18 @@ class Evidence(StrEnum):
     REMOTE_COMMIT = "remote_commit"
     CI = "ci"
     CI_COMMIT = "ci_commit"
+    DURABLE_TIP = "durable_tip"
+    PR = "pr"
+    HEAD_BRANCH = "head_branch"
+    BASE_BRANCH = "base_branch"
+    CHECKED_OUT_BRANCH = "checked_out_branch"
 
 
 class Contradiction(StrEnum):
     LOCAL_REMOTE_MISMATCH = "local_remote_mismatch"
     CI_TIP_MISMATCH = "ci_tip_mismatch"
     REVIEW_TIP_MISMATCH = "review_tip_mismatch"
+    DURABLE_TIP_MISMATCH = "durable_tip_mismatch"
 
 
 ALL_EVIDENCE = frozenset(Evidence)
@@ -117,6 +123,36 @@ class ReviewRecord:
 
 
 @dataclass(frozen=True)
+class ProjectConfig:
+    """Validated version-1 project closure configuration.
+
+    ``repo_path`` and ``closure_state_dir`` are resolved durable absolute
+    paths; command arrays keep the configured shell command strings verbatim.
+    """
+
+    schema_version: int
+    project: str
+    repository: str
+    repo_path: str
+    default_branch: str
+    closure_state_dir: str
+    local_review_ready_commands: Tuple[str, ...]
+    closure_acceptance_commands: Tuple[str, ...]
+    infra_retry_budget: int
+    stagnation_budget_minutes: int
+    heavy_job_limit: int
+    tracking_projection: Optional[str]
+
+    def __post_init__(self):
+        object.__setattr__(
+            self, "local_review_ready_commands", _as_tuple(self.local_review_ready_commands)
+        )
+        object.__setattr__(
+            self, "closure_acceptance_commands", _as_tuple(self.closure_acceptance_commands)
+        )
+
+
+@dataclass(frozen=True)
 class ClosureSnapshot:
     """Already-read facts about one pull request, tied to one pushed tip.
 
@@ -131,6 +167,12 @@ class ClosureSnapshot:
     ci_commit: Optional[str] = None
     review_commit: Optional[str] = None
     verification_commit: Optional[str] = None
+    durable_tip: Optional[str] = None
+    head_branch: Optional[str] = None
+    base_branch: Optional[str] = None
+    checked_out_branch: Optional[str] = None
+    pr_state: Optional[str] = None
+    pr_is_draft: Optional[bool] = None
     worktree_clean: Optional[bool] = None
     local_verification: Optional[bool] = None
     ci_state: CiState = CiState.UNKNOWN
