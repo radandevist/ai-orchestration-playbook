@@ -119,10 +119,13 @@ PROJECT_CONFIG_FIELDS = (
     _f("stagnation_budget_minutes", "integer", {"minimum": 1}),
     _f("heavy_job_limit", "const_int", {"value": 1}),
     _f("tracking_projection", "nullable_text"),
+    _f("ci_required_checks", "check_name_array"),
 )
 
 PROJECT_CONFIG_ALLOWED_KEYS = tuple(field.name for field in PROJECT_CONFIG_FIELDS)
-PROJECT_CONFIG_REQUIRED_KEYS = tuple(field.name for field in PROJECT_CONFIG_FIELDS)
+PROJECT_CONFIG_REQUIRED_KEYS = tuple(
+    field.name for field in PROJECT_CONFIG_FIELDS if field.name != "ci_required_checks"
+)
 
 CONFIG_SEMANTIC_ASYMMETRIES = (
     SemanticAsymmetry(
@@ -285,6 +288,24 @@ def _check_string_array(name: str, raw, min_items: int) -> Tuple[str, ...]:
     return tuple(items)
 
 
+def _check_check_name_array(name: str, raw) -> Tuple[str, ...]:
+    """Validate an optional authoritative CI-check-name list.
+
+    Names are exact, non-blank, and unique. An absent or empty list keeps the
+    strict all-rollup classification; a typo fails closed at selection time as
+    a missing required check rather than silently widening the gate.
+    """
+    items = require_list(raw, name)
+    if not all(isinstance(item, str) and item.strip() for item in items):
+        raise ReviewValidationError(f"{name} must be a list of non-empty check names")
+    seen = set()
+    for item in items:
+        if item in seen:
+            raise ReviewValidationError(f"{name} must not contain duplicate check names")
+        seen.add(item)
+    return tuple(items)
+
+
 def _check_project_component(name: str, raw) -> str:
     if not isinstance(raw, str) or not raw.strip():
         raise ReviewValidationError(f"{name} must be a non-empty string")
@@ -361,6 +382,8 @@ def check(fields, record: Mapping, parsers: Optional[Dict] = None) -> Dict:
             values[name] = _check_enum(name, raw, params["values"])
         elif kind == "string_array":
             values[name] = _check_string_array(name, raw, params.get("min_items", 0))
+        elif kind == "check_name_array":
+            values[name] = _check_check_name_array(name, raw)
         elif kind == "object_array":
             items = require_list(raw, name)
             parser = parsers.get(name)
@@ -429,6 +452,7 @@ def validate_project_config(record: Mapping) -> ProjectConfig:
         stagnation_budget_minutes=values["stagnation_budget_minutes"],
         heavy_job_limit=values["heavy_job_limit"],
         tracking_projection=values["tracking_projection"],
+        ci_required_checks=values.get("ci_required_checks", ()),
     )
 
 
@@ -459,6 +483,12 @@ def _property_schema(name: str, kind: str, params: Dict) -> Dict:
         else:
             schema["items"] = {"$ref": f"#/$defs/{params['ref']}"}
         return schema
+    if kind == "check_name_array":
+        return {
+            "type": "array",
+            "items": dict({"type": "string"}, **NON_BLANK),
+            "uniqueItems": True,
+        }
     if kind == "follow_up":
         schema = {"type": "integer"}
         if "minimum" in params:

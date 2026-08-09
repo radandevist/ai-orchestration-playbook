@@ -572,6 +572,30 @@ class StatusCommandTests(CliTestCase):
         })
         self.assertEqual([], [line for line in proc.stderr.splitlines() if line])
 
+    def test_status_wires_required_checks_policy_into_ci_classification(self):
+        self.set_git()
+        rollup = [
+            {"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"__typename": "CheckRun", "name": "docs", "status": "COMPLETED", "conclusion": "SKIPPED"},
+        ]
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=rollup)
+        config = self.write_config(overrides={"ci_required_checks": ["ci"]})
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual("PASSING", json.loads(proc.stdout)["ci_state"])
+
+    def test_status_without_policy_keeps_all_rollup_strict_behavior(self):
+        self.set_git()
+        rollup = [
+            {"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"__typename": "CheckRun", "name": "docs", "status": "COMPLETED", "conclusion": "SKIPPED"},
+        ]
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=rollup)
+        config = self.write_config()
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual("UNKNOWN", json.loads(proc.stdout)["ci_state"])
+
     def test_status_text_reports_state(self):
         self.set_git()
         self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
@@ -2199,6 +2223,25 @@ class ConfigValidationTests(CliTestCase):
         for bad in ("", "   ", 42, []):
             with self.subTest(value=bad):
                 self.assert_config_rejected({"tracking_projection": bad}, "tracking_projection")
+
+    def test_rejects_blank_or_duplicate_ci_required_checks(self):
+        for bad, fragment in (
+            (["gate-a", "  "], "ci_required_checks"),
+            (["gate-a", "gate-a"], "ci_required_checks"),
+            ([42], "ci_required_checks"),
+            ("gate-a", "ci_required_checks"),
+        ):
+            with self.subTest(value=bad):
+                self.assert_config_rejected({"ci_required_checks": bad}, fragment)
+
+    def test_accepts_empty_or_declared_ci_required_checks(self):
+        self.set_git()
+        self.set_gh()
+        for value in ([], ["gate-a", "gate-b"]):
+            with self.subTest(value=value):
+                config = self.write_config(overrides={"ci_required_checks": value})
+                proc = self.run_cli("status", "--config", config, "--pr", str(PR))
+                self.assertEqual(0, proc.returncode, proc.stderr)
 
     def test_accepts_tracking_projection_string_or_null(self):
         self.set_git()

@@ -335,7 +335,12 @@ def _status_snapshot(config, pr_number):
             "test_steps_not_started": last.get("test_steps_not_started"),
             "evidence_path": last["evidence_path"],
         }
-    ci = classify_ci(pr.checks, pr.head_oid, infra_event=infra_event)
+    ci = classify_ci(
+        pr.checks,
+        pr.head_oid,
+        infra_event=infra_event,
+        required_checks=config.ci_required_checks,
+    )
 
     review_verdict = None
     review_commit = None
