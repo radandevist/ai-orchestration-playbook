@@ -2,6 +2,15 @@
 
 All notable changes to the AI Orchestration Playbook are recorded here. This is a **living document** — it is updated from real use, as sessions expose new failure modes and better patterns. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.0] - 2026-08-09 — Mechanical PR closure gate
+
+- Added §2.6 PR closure state machine as a mandatory gate: one derived state per PR, exact terminal states (`APPROVED`, `APPROVED_WITH_FOLLOW_UPS`), stale-approval invalidation, design reset, stagnation and infrastructure-retry escalation, and `pr-closure check-transition` as a mandatory precondition before every state-changing closure action.
+- Added structured multi-floor reviews: two-axis findings (severity × disposition), exact machine verdicts (`CHANGES_REQUIRED`, `APPROVED_WITH_FOLLOW_UPS`, `APPROVED`, `INCONCLUSIVE`), mandatory-block promotion, and durable structured review records as the approval authority.
+- Added a safe tracking-projection protocol: absolute non-symlink adapter invoked as an argv list (never through a shell) over a versioned bounded JSON protocol, dry-run/apply distinction, and projection failure that never mutates authoritative closure evidence.
+- Hardened the fail-closed direction: missing, stale, malformed, or contradictory evidence is `UNVERIFIED`; empty, undersized, or markerless lane output is failure even with exit 0.
+- Documented the current all-project model policy: implementation default DeepSeek V4 Flash, independent review default GPT-5.6 Luna at `xhigh`, no new Claude implementation/review/coordination calls, historical Claude artifacts remain usable without rerun, reviewer family must differ from implementer family.
+- Added the `tools/pr-closure` CLI and schemas to the README with installation, the status command, one-time legacy-verdict import (never silently approved), and project migration/preflight behavior.
+
 ## [0.1.3] - 2026-07-04 — Parallelism gates on heavy jobs, not agent headcount
 
 - Clarified §2.3 dispatch STOP-triggers: concurrency is bounded by concurrent **heavy-resource** jobs (Docker/e2e stacks, full builds/test suites), **not** subagent headcount — lightweight agents (investigations, reviews, design, non-Docker impl, unit/typecheck/lint) run many-in-parallel. Serialize only the heavy jobs.
