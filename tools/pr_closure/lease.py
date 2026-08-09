@@ -198,7 +198,11 @@ class LeaseMetadata:
     token: str
 
     def __post_init__(self):
-        if self.schema_version != LEASE_SCHEMA_VERSION:
+        if (
+            not isinstance(self.schema_version, int)
+            or isinstance(self.schema_version, bool)
+            or self.schema_version != LEASE_SCHEMA_VERSION
+        ):
             raise LeaseMetadataError(
                 f"unsupported lease schema version: {self.schema_version}"
             )
@@ -244,7 +248,9 @@ def validate_lease_metadata(data: Mapping) -> LeaseMetadata:
     return LeaseMetadata(**data)
 
 
-def _try_read_metadata(fd: int, path: Path) -> Optional[LeaseMetadata]:
+def _try_read_metadata(
+    fd: int, path: Path
+) -> Tuple[Optional[LeaseMetadata], Optional[Tuple[int, int]]]:
     """Read and validate the metadata projection next to the open lock.
 
     The read is bound to the validated PR directory descriptor ``fd`` and
@@ -253,12 +259,14 @@ def _try_read_metadata(fd: int, path: Path) -> Optional[LeaseMetadata]:
     The entry is opened with ``O_NONBLOCK`` and the opened inode is
     ``fstat``-checked before any byte is read: a FIFO, directory, socket,
     device, or multiply-linked regular file raises :class:`LeaseMetadataError`
-    immediately instead of blocking the reader. Returns None when the file
-    does not exist. Raises :class:`LeaseMetadataError` when the file exists
-    but cannot be validated (fail closed). The descriptor is closed on every
-    path.
+    immediately instead of blocking the reader. Returns ``(None, None)`` when
+    the file does not exist. Raises :class:`LeaseMetadataError` when the file
+    exists but cannot be validated (fail closed). The descriptor is closed on
+    every path. The second element is the ``(st_dev, st_ino)`` of the exact
+    validated inode, for release-time identity comparison (T5G-F3).
     """
     meta_fd = None
+    identity = None
     try:
         try:
             meta_fd = os.open(
@@ -267,7 +275,7 @@ def _try_read_metadata(fd: int, path: Path) -> Optional[LeaseMetadata]:
                 dir_fd=fd,
             )
         except FileNotFoundError:
-            return None
+            return None, None
         except OSError as error:
             raise LeaseMetadataError(
                 f"cannot read lease metadata {path}: {error}"
@@ -278,6 +286,7 @@ def _try_read_metadata(fd: int, path: Path) -> Optional[LeaseMetadata]:
             raise LeaseMetadataError(
                 f"cannot inspect lease metadata {path}: {error}"
             ) from error
+        identity = (st.st_dev, st.st_ino)
         if not stat.S_ISREG(st.st_mode):
             raise LeaseMetadataError(
                 f"lease metadata {path} is not a regular file; refusing to read it"
@@ -306,7 +315,7 @@ def _try_read_metadata(fd: int, path: Path) -> Optional[LeaseMetadata]:
         parsed = json.loads(raw)
     except json.JSONDecodeError as error:
         raise LeaseMetadataError(f"malformed lease metadata {path}: {error}") from error
-    return validate_lease_metadata(parsed)
+    return validate_lease_metadata(parsed), identity
 
 
 @dataclass(frozen=True)
@@ -405,11 +414,30 @@ class HeavyJobLease:
         self._base = self._root / self._project / str(self._pr)
         self._lock_path = self._base / LOCK_FILENAME
         self._meta_path = self._base / META_FILENAME
+        self._root_chain_identities: list = []
         self._root_identity = None
+        walk_fd = None
         try:
-            self._root_identity = os.stat(resolved_root)
-        except OSError:
-            self._root_identity = None
+            try:
+                walk_fd = os.open("/", os.O_DIRECTORY | os.O_CLOEXEC)
+                for component in (c for c in resolved_root.split(os.sep) if c):
+                    next_fd = os.open(component, self._OPEN_DIR_FLAGS, dir_fd=walk_fd)
+                    os.close(walk_fd)
+                    walk_fd = next_fd
+                    st = os.fstat(walk_fd)
+                    self._root_chain_identities.append((st.st_dev, st.st_ino))
+                else:
+                    self._root_identity = os.fstat(walk_fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        finally:
+            if walk_fd is not None:
+                try:
+                    os.close(walk_fd)
+                except OSError:
+                    pass
         self._fd: Optional[int] = None
         self._root_fd: Optional[int] = None
         self._pr_fd: Optional[int] = None
@@ -446,12 +474,14 @@ class HeavyJobLease:
         Symlink metadata entries are never followed.
         """
         if self._held:
-            return _try_read_metadata(self._pr_fd, self._meta_path)
+            metadata, _ = _try_read_metadata(self._pr_fd, self._meta_path)
+            return metadata
         root_fd, pr_fd = self._open_dir_chain(create=False)
         if pr_fd is None:
             return None
         try:
-            return _try_read_metadata(pr_fd, self._meta_path)
+            metadata, _ = _try_read_metadata(pr_fd, self._meta_path)
+            return metadata
         finally:
             os.close(pr_fd)
             os.close(root_fd)
@@ -479,25 +509,58 @@ class HeavyJobLease:
             )
 
     def _open_root(self, create: bool = True) -> Optional[int]:
-        root = os.fspath(self._root)
+        """Open the resolved root one component at a time from ``/``.
+
+        Every component is opened descriptor-relative with ``O_DIRECTORY |
+        O_NOFOLLOW | O_CLOEXEC`` and, when the component existed at
+        construction, its ``(st_dev, st_ino)`` must still match. Missing
+        components are created with descriptor-relative ``mkdir``; a parent
+        renamed or replaced by a symlink between construction and acquire
+        raises :class:`LeasePathEscape` and never creates anything in the
+        replacement target (T5G-F2).
+        """
+        components = [c for c in os.fspath(self._root).split(os.sep) if c]
+        fd = os.open("/", os.O_DIRECTORY | os.O_CLOEXEC)
         try:
-            try:
-                fd = os.open(root, self._OPEN_DIR_FLAGS)
-            except FileNotFoundError:
-                if not create:
-                    return None
-                os.makedirs(root, mode=0o700, exist_ok=True)
-                fd = os.open(root, self._OPEN_DIR_FLAGS)
-        except OSError as error:
-            raise LeasePathEscape(
-                f"cannot open lease root {self._root}: {error.strerror or error}"
-            ) from error
-        try:
+            for depth, component in enumerate(components, start=1):
+                try:
+                    try:
+                        next_fd = os.open(component, self._OPEN_DIR_FLAGS, dir_fd=fd)
+                    except FileNotFoundError:
+                        if not create:
+                            os.close(fd)
+                            return None
+                        try:
+                            os.mkdir(component, 0o700, dir_fd=fd)
+                        except FileExistsError:
+                            pass
+                        next_fd = os.open(component, self._OPEN_DIR_FLAGS, dir_fd=fd)
+                except OSError as error:
+                    raise LeasePathEscape(
+                        f"cannot open lease root {self._root}: "
+                        f"{error.strerror or error}"
+                    ) from error
+                try:
+                    self._assert_root_component_identity(next_fd, depth)
+                except BaseException:
+                    os.close(next_fd)
+                    raise
+                os.close(fd)
+                fd = next_fd
             self._assert_root_identity(fd)
+            return fd
         except BaseException:
             os.close(fd)
             raise
-        return fd
+
+    def _assert_root_component_identity(self, fd: int, depth: int) -> None:
+        if depth - 1 < len(self._root_chain_identities):
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != self._root_chain_identities[depth - 1]:
+                raise LeasePathEscape(
+                    f"lease root changed since construction; refusing to "
+                    f"operate on a replacement: {self._root}"
+                )
 
     def _assert_root_identity(self, fd: int) -> None:
         if self._root_identity is None:
@@ -601,6 +664,32 @@ class HeavyJobLease:
                 f"lock or modify its shared inode"
             )
 
+    def _assert_lock_entry_bound(self, pr_fd: int, lock_fd: int) -> None:
+        """Fail closed unless the lock name still names the opened inode.
+
+        Descriptor-relative, no-follow stat of ``heavy-job.lock``: if the
+        entry is absent, non-regular, multiply linked, or its ``(st_dev,
+        st_ino)`` differs from the opened descriptor, the pathname was
+        replaced after open and ownership must not be granted (T5G-F1).
+        """
+        try:
+            named = os.stat(LOCK_FILENAME, dir_fd=pr_fd, follow_symlinks=False)
+        except OSError as error:
+            raise LeasePathEscape(
+                f"lock file {self._lock_path} is not bound to the opened "
+                f"inode: {error.strerror or error}"
+            ) from error
+        opened = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(named.st_mode)
+            or named.st_nlink != 1
+            or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise LeasePathEscape(
+                f"lock file {self._lock_path} changed during acquisition; "
+                f"refusing the replacement entry"
+            )
+
     def _open_lock(self, pr_fd: int) -> int:
         flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
         for _ in range(8):
@@ -627,6 +716,7 @@ class HeavyJobLease:
                 self._assert_regular_single_link(fd)
                 if created:
                     os.fchmod(fd, 0o600)
+                self._assert_lock_entry_bound(pr_fd, fd)
                 return fd
             except BaseException:
                 os.close(fd)
@@ -665,7 +755,7 @@ class HeavyJobLease:
                 if error.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
                     owner = None
                     try:
-                        owner = _try_read_metadata(pr_fd, self._meta_path)
+                        owner, _ = _try_read_metadata(pr_fd, self._meta_path)
                     except LeaseMetadataError:
                         owner = None
                     raise LeaseUnavailable(
@@ -674,6 +764,7 @@ class HeavyJobLease:
                         owner=owner,
                     ) from error
                 raise
+            self._assert_lock_entry_bound(pr_fd, lock_fd)
             self._root_fd = root_fd
             self._pr_fd = pr_fd
             self._fd = lock_fd
@@ -726,6 +817,12 @@ class HeavyJobLease:
                 src_dir_fd=self._pr_fd,
                 dst_dir_fd=self._pr_fd,
             )
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
         finally:
             try:
                 os.unlink(temp_name, dir_fd=self._pr_fd)
@@ -735,29 +832,56 @@ class HeavyJobLease:
     def release(self) -> None:
         """Release the lease and remove its metadata projection.
 
-        The projection is removed only while this lease holds the lock and its
-        ownership token still matches the file. Double release and release
-        without acquisition are safe no-ops. A foreign or unvalidatable
-        projection is never removed (fail closed); the lock and every
-        directory descriptor are always closed so nothing leaks.
+        The projection is removed only while this lease holds the lock, its
+        ownership token still matches the file, and the directory entry still
+        names the exact inode that was validated (T5G-F3). Double release and
+        release without acquisition are safe no-ops. A foreign, unvalidatable,
+        or post-read-replaced projection is never removed (fail closed); the
+        lock and every directory descriptor are always closed so nothing
+        leaks. A residual compare/unlink race window remains (a hostile
+        same-UID swap strictly between the identity check and ``unlink``
+        cannot be closed atomically in portable Python); the unlink then
+        removes the entry that was verified one syscall earlier, and any
+        ``FileNotFoundError`` is treated as already-removed.
         """
         if not self._held:
             return
         self._require_same_process()
         try:
-            metadata = _try_read_metadata(self._pr_fd, self._meta_path)
+            metadata, identity = _try_read_metadata(self._pr_fd, self._meta_path)
             if metadata is not None and metadata.token != self._token:
                 raise LeaseOwnershipError(
                     "lease metadata token does not belong to this lease; "
                     "refusing to remove another owner's projection"
                 )
             if metadata is not None:
+                self._assert_metadata_entry_unchanged(identity)
                 try:
                     os.unlink(META_FILENAME, dir_fd=self._pr_fd)
                 except FileNotFoundError:
                     pass
         finally:
             self._close_all()
+
+    def _assert_metadata_entry_unchanged(self, identity: Tuple[int, int]) -> None:
+        """Refuse to unlink a metadata entry that no longer names the
+        validated inode (T5G-F3)."""
+        try:
+            named = os.stat(META_FILENAME, dir_fd=self._pr_fd, follow_symlinks=False)
+        except OSError as error:
+            raise LeaseMetadataError(
+                f"lease metadata {self._meta_path} vanished before release; "
+                f"preserving it"
+            ) from error
+        if (
+            not stat.S_ISREG(named.st_mode)
+            or named.st_nlink != 1
+            or (named.st_dev, named.st_ino) != identity
+        ):
+            raise LeaseMetadataError(
+                f"lease metadata {self._meta_path} changed after validation; "
+                f"refusing to remove the replacement entry"
+            )
 
     def _close_all(self) -> None:
         fd, self._fd = self._fd, None

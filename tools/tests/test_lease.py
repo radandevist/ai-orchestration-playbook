@@ -1,3 +1,4 @@
+import fcntl
 import json
 import math
 import os
@@ -10,6 +11,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from pr_closure import lease as lease_module
 from pr_closure.lease import (
     LEASE_SCHEMA_VERSION,
     ForbiddenLeaseRoot,
@@ -18,6 +20,7 @@ from pr_closure.lease import (
     LaneRegressionError,
     LaneSnapshot,
     LaneSnapshotError,
+    LeaseError,
     LeaseMetadata,
     LeaseMetadataError,
     LeaseOwnershipError,
@@ -862,6 +865,355 @@ class PaidFailureTests(LeaseTestCase):
             "cpu_seconds": 0.0,
         })
         self.assertFalse(is_lane_live(previous, current))
+
+
+class LockReplacementTests(LeaseTestCase):
+    """T5G-F1: the lock directory entry must bind back to the flocked inode.
+
+    A deterministic probe replaces ``heavy-job.lock`` between the descriptor
+    open and the flock; the first acquisition must refuse so that a second
+    lease can never coexist with a successfully returned first lease.
+    """
+
+    def test_lock_replaced_after_open_refuses_first_acquisition(self):
+        base = self.root / "proj" / "7"
+        real_flock = fcntl.flock
+        state = {"swapped": False}
+
+        def swapped_flock(fd, op):
+            if not state["swapped"] and op == fcntl.LOCK_EX | fcntl.LOCK_NB:
+                state["swapped"] = True
+                os.rename(base / "heavy-job.lock", base / "old.lock")
+                (base / "heavy-job.lock").write_bytes(b"replacement inode")
+            real_flock(fd, op)
+
+        self.addCleanup(setattr, fcntl, "flock", real_flock)
+        fcntl.flock = swapped_flock
+        first = self.new_lease()
+        baseline = self.fd_count()
+        with self.assertRaises(LeasePathEscape):
+            first.acquire()
+        self.assertFalse(first.is_held)
+        self.assertEqual(baseline, self.fd_count())
+        self.assertFalse(self.meta_path().exists())
+        second = self.new_lease()
+        second.acquire()
+        self.addCleanup(second.release)
+        self.assertTrue(second.is_held)
+
+    def test_clean_two_open_contention_control(self):
+        first = self.new_lease()
+        first.acquire()
+        self.addCleanup(first.release)
+        second = self.new_lease()
+        with self.assertRaises(LeaseUnavailable):
+            second.acquire()
+        self.assertFalse(second.is_held)
+        self.assertTrue(first.is_held)
+
+
+class MissingRootParentSwapTests(LeaseTestCase):
+    """T5G-F2: creating a missing root must never follow a swapped parent."""
+
+    def test_missing_root_parent_swap_to_symlink_creates_nothing(self):
+        parent = self.root / "parent"
+        root = parent / "root"
+        parent.mkdir()
+        attacker = self.root / "attacker-target"
+        attacker.mkdir()
+        lease = HeavyJobLease(root, "proj", 7, DEFAULT_ARGV)
+        moved = self.root / "parent-moved"
+        os.rename(parent, moved)
+        os.symlink(attacker, parent)
+        with self.assertRaises(LeasePathEscape):
+            lease.acquire()
+        self.assertFalse(lease.is_held)
+        self.assertEqual([], sorted(p.name for p in attacker.iterdir()))
+        self.assertEqual([], sorted(p.name for p in moved.iterdir()))
+
+    def test_unchanged_missing_root_creation_control(self):
+        root = self.root / "new" / "root"
+        lease = HeavyJobLease(root, "proj", 7, DEFAULT_ARGV)
+        lease.acquire()
+        self.addCleanup(lease.release)
+        self.assertTrue(lease.is_held)
+        self.assertTrue((root / "proj" / "7" / "heavy-job.lock").is_file())
+        self.assertTrue((root / "proj" / "7" / "heavy-job.meta.json").is_file())
+
+
+class ReleaseMetadataReplacementTests(LeaseTestCase):
+    """T5G-F3: release must unlink only the exact validated metadata inode.
+
+    A deterministic probe swaps ``heavy-job.meta.json`` after the validated
+    read; release must fail closed and preserve both the original owner bytes
+    (under the probe's backup name) and the unrelated replacement.
+    """
+
+    def test_release_refuses_replaced_metadata_entry(self):
+        base = self.root / "proj" / "7"
+        original_read = lease_module._try_read_metadata
+
+        def swapped_read(fd, path):
+            result = original_read(fd, path)
+            metadata = result[0] if isinstance(result, tuple) else result
+            if metadata is not None:
+                os.rename(
+                    "heavy-job.meta.json",
+                    "owner-backup.json",
+                    src_dir_fd=fd,
+                    dst_dir_fd=fd,
+                )
+                with os.fdopen(
+                    os.open(
+                        "heavy-job.meta.json",
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                        0o600,
+                        dir_fd=fd,
+                    ),
+                    "wb",
+                ) as handle:
+                    handle.write(b"unrelated replacement")
+            return result
+
+        first = self.new_lease()
+        first.acquire()
+        owner_token = json.loads(
+            self.meta_path().read_text(encoding="utf-8")
+        )["token"]
+        self.addCleanup(setattr, lease_module, "_try_read_metadata", original_read)
+        lease_module._try_read_metadata = swapped_read
+        with self.assertRaises(LeaseMetadataError):
+            first.release()
+        self.assertFalse(first.is_held)
+        self.assertEqual(
+            b"unrelated replacement", (base / "heavy-job.meta.json").read_bytes()
+        )
+        backup = json.loads(
+            (base / "owner-backup.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(owner_token, backup["token"])
+
+    def test_release_removes_only_owner_metadata_control(self):
+        base = self.root / "proj" / "7"
+        lease = self.new_lease()
+        lease.acquire()
+        unrelated = base / "unrelated-bytes.txt"
+        unrelated.write_bytes(b"keep me")
+        lease.release()
+        self.assertFalse(lease.is_held)
+        self.assertFalse(self.meta_path().exists())
+        self.assertEqual(b"keep me", unrelated.read_bytes())
+        replacement = self.new_lease()
+        replacement.acquire()
+        self.addCleanup(replacement.release)
+
+
+class MetadataWriteFailureTests(LeaseTestCase):
+    """T5G-F4: the raw temporary descriptor must close on every write failure.
+
+    Each probe injects one failure into the metadata write path, then verifies
+    acquisition unwinds, no descriptor leaks, no lease stays held, and a fresh
+    lease can still acquire.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._saved_os_attrs = {}
+
+    def install_os_patch(self, name, wrapper):
+        self._saved_os_attrs[name] = getattr(os, name)
+        setattr(os, name, wrapper)
+
+    def restore_os(self):
+        for name, saved in self._saved_os_attrs.items():
+            setattr(os, name, saved)
+        self._saved_os_attrs.clear()
+
+    def assert_unwinds_without_leak(self, install_failure, expected):
+        base = self.root / "proj" / "7"
+        baseline = self.fd_count()
+        install_failure()
+        try:
+            with self.assertRaises(expected):
+                self.new_lease().acquire()
+            self.assertEqual(baseline, self.fd_count())
+        finally:
+            self.restore_os()
+        self.assertEqual(
+            [],
+            sorted(p.name for p in base.iterdir() if p.name.startswith(".meta-")),
+        )
+        fresh = self.new_lease()
+        fresh.acquire()
+        self.addCleanup(fresh.release)
+        self.assertTrue(fresh.is_held)
+
+    def test_fdopen_failure_closes_raw_descriptor(self):
+        real_fdopen = os.fdopen
+
+        def failing_fdopen(fd, mode, *args, **kwargs):
+            if mode == "wb":
+                raise RuntimeError("injected fdopen failure")
+            return real_fdopen(fd, mode, *args, **kwargs)
+
+        self.assert_unwinds_without_leak(
+            lambda: self.install_os_patch("fdopen", failing_fdopen),
+            RuntimeError,
+        )
+
+    def test_write_failure_closes_descriptor(self):
+        real_fdopen = os.fdopen
+
+        def broken_write_fdopen(fd, mode, *args, **kwargs):
+            handle = real_fdopen(fd, mode, *args, **kwargs)
+            if mode == "wb":
+
+                def boom(*a, **k):
+                    raise RuntimeError("injected write failure")
+
+                handle.write = boom
+            return handle
+
+        self.assert_unwinds_without_leak(
+            lambda: self.install_os_patch("fdopen", broken_write_fdopen),
+            RuntimeError,
+        )
+
+    def test_flush_failure_closes_descriptor(self):
+        real_fdopen = os.fdopen
+
+        def broken_flush_fdopen(fd, mode, *args, **kwargs):
+            handle = real_fdopen(fd, mode, *args, **kwargs)
+            if mode == "wb":
+
+                def boom(*a, **k):
+                    raise RuntimeError("injected flush failure")
+
+                handle.flush = boom
+            return handle
+
+        self.assert_unwinds_without_leak(
+            lambda: self.install_os_patch("fdopen", broken_flush_fdopen),
+            RuntimeError,
+        )
+
+    def test_fsync_failure_closes_descriptor(self):
+        def failing_fsync(fd):
+            raise RuntimeError("injected fsync failure")
+
+        self.assert_unwinds_without_leak(
+            lambda: self.install_os_patch("fsync", failing_fsync),
+            RuntimeError,
+        )
+
+    def test_fchmod_failure_closes_descriptor(self):
+        def failing_fchmod(fd, mode):
+            raise RuntimeError("injected fchmod failure")
+
+        self.assert_unwinds_without_leak(
+            lambda: self.install_os_patch("fchmod", failing_fchmod),
+            RuntimeError,
+        )
+
+    def test_replace_failure_closes_descriptor_and_cleans_temp(self):
+        def failing_replace(*args, **kwargs):
+            raise OSError("injected replace failure")
+
+        self.assert_unwinds_without_leak(
+            lambda: self.install_os_patch("replace", failing_replace),
+            OSError,
+        )
+
+    def test_cleanup_failure_after_replace_failure_closes_descriptor(self):
+        def failing_replace(*args, **kwargs):
+            raise OSError("injected replace failure")
+
+        def failing_unlink(name, *args, **kwargs):
+            raise OSError("injected cleanup failure")
+
+        base = self.root / "proj" / "7"
+        baseline = self.fd_count()
+        self.install_os_patch("replace", failing_replace)
+        self.install_os_patch("unlink", failing_unlink)
+        try:
+            with self.assertRaises(OSError):
+                self.new_lease().acquire()
+            self.assertEqual(baseline, self.fd_count())
+        finally:
+            self.restore_os()
+        leftovers = sorted(
+            p.name for p in base.iterdir() if p.name.startswith(".meta-")
+        )
+        self.assertEqual(1, len(leftovers))
+        (base / leftovers[0]).unlink()
+        fresh = self.new_lease()
+        fresh.acquire()
+        self.addCleanup(fresh.release)
+        self.assertTrue(fresh.is_held)
+
+
+class SchemaVersionTypeTests(LeaseTestCase):
+    """T5G-F5: schema_version must be an exact non-bool int equal to 1."""
+
+    def valid_record(self, **overrides):
+        record = {
+            "schema_version": 1,
+            "pid": 424242,
+            "command_argv": ["heavy", "job"],
+            "command_display": "heavy job",
+            "project": "proj",
+            "pr": 7,
+            "started_at": "2026-08-08T12:00:00+00:00",
+            "token": "f" * 32,
+        }
+        record.update(overrides)
+        return record
+
+    def test_schema_version_requires_exact_int_one(self):
+        for bad in (True, False, 1.0, "1", 2, 0, None, 1.5):
+            with self.subTest(schema_version=bad):
+                with self.assertRaises(LeaseMetadataError):
+                    validate_lease_metadata(self.valid_record(schema_version=bad))
+
+    def test_malformed_schema_contended_read_returns_no_owner(self):
+        for bad in (True, 1.0, "1", 2):
+            with self.subTest(schema_version=bad):
+                lease = self.new_lease()
+                lease.acquire()
+                try:
+                    token = json.loads(
+                        self.meta_path().read_text(encoding="utf-8")
+                    )["token"]
+                    record = self.valid_record(token=token, schema_version=bad)
+                    self.meta_path().write_text(json.dumps(record), encoding="utf-8")
+                    second = self.new_lease()
+                    with self.assertRaises(LeaseUnavailable) as caught:
+                        second.acquire()
+                    self.assertIsNone(caught.exception.owner)
+                    self.assertFalse(second.is_held)
+                    self.assertTrue(lease.is_held)
+                finally:
+                    try:
+                        lease.release()
+                    except LeaseError:
+                        pass
+
+    def test_malformed_schema_release_refuses_and_preserves(self):
+        for bad in (True, 1.0, "1", 2):
+            with self.subTest(schema_version=bad):
+                lease = self.new_lease()
+                lease.acquire()
+                token = json.loads(
+                    self.meta_path().read_text(encoding="utf-8")
+                )["token"]
+                record = self.valid_record(token=token, schema_version=bad)
+                self.meta_path().write_text(json.dumps(record), encoding="utf-8")
+                with self.assertRaises(LeaseMetadataError):
+                    lease.release()
+                self.assertFalse(lease.is_held)
+                self.assertEqual(
+                    json.dumps(record), self.meta_path().read_text(encoding="utf-8")
+                )
 
 
 if __name__ == "__main__":
