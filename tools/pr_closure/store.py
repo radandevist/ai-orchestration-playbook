@@ -243,10 +243,24 @@ class RunStore:
         attempt JSON filename, or a nested directory/symlink shape raises
         :class:`MalformedEvidence` instead of being skipped (T6L-F6). Valid
         multiple config/attempt trees remain accepted.
+
+        The commit root itself is validated with lstat/no-follow semantics
+        (T6LC-F10): a genuinely nonexistent ``verification/<commit>`` means no
+        evidence and returns ``()``, while a present regular file, symlink,
+        FIFO/device/socket, or any other non-real-directory root raises
+        :class:`MalformedEvidence` instead of being treated as absent.
         """
         directory = self.verification_dir(commit)
-        if not directory.is_dir():
+        try:
+            entry = directory.lstat()
+        except FileNotFoundError:
             return ()
+        if not stat.S_ISDIR(entry.st_mode):
+            raise MalformedEvidence(
+                "verification commit root must be a real directory: {0}".format(
+                    directory
+                )
+            )
         paths = []
         for digest_dir in sorted(directory.iterdir()):
             if _DIGEST_RE.fullmatch(digest_dir.name) is None:

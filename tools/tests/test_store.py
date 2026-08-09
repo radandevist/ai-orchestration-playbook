@@ -1606,6 +1606,53 @@ class VerificationTreeShapeTests(StoreTestCase):
         with self.assertRaises(MalformedEvidence):
             store.bound_verification(COMMIT_A, _expected_commands())
 
+    def test_absent_commit_root_returns_empty(self):
+        store = self._store()
+        self.assertEqual((), store.verification_paths(COMMIT_A))
+        self.assertFalse(store.verification_exists(COMMIT_A))
+
+    def test_regular_file_commit_root_fails_closed(self):
+        store = self._store()
+        target = store.verification_dir(COMMIT_A)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("not a directory")
+        with self.assertRaises(MalformedEvidence):
+            store.verification_paths(COMMIT_A)
+        with self.assertRaises(MalformedEvidence):
+            store.verification_exists(COMMIT_A)
+
+    def test_symlink_commit_root_fails_closed(self):
+        for label, kind in (("to-directory", "directory"), ("to-file", "file")):
+            with self.subTest(link=label):
+                store = self._store()
+                root = store.verification_dir(COMMIT_A)
+                root.parent.mkdir(parents=True, exist_ok=True)
+                if kind == "directory":
+                    real = self.root / "real-verification-dir"
+                    real.mkdir(exist_ok=True)
+                else:
+                    real = self.root / "real-verification-file"
+                    real.write_text("x")
+                os.symlink(real, root)
+                try:
+                    with self.assertRaises(MalformedEvidence):
+                        store.verification_paths(COMMIT_A)
+                finally:
+                    root.unlink()
+
+    def test_fifo_commit_root_fails_closed(self):
+        store = self._store()
+        target = store.verification_dir(COMMIT_A)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(target)
+        with self.assertRaises(MalformedEvidence):
+            store.verification_paths(COMMIT_A)
+
+    def test_real_directory_commit_root_remains_accepted(self):
+        store = self._store()
+        _write_verification(store, COMMIT_A)
+        self.assertEqual(1, len(store.verification_paths(COMMIT_A)))
+
     def test_non_directory_entry_where_config_dir_is_required_fails_closed(self):
         store = self._store()
         store.verification_dir(COMMIT_A).mkdir(parents=True, exist_ok=True)

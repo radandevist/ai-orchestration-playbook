@@ -7,9 +7,13 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from pr_closure.cli import ProjectionFailure, _invoke_adapter
 from pr_closure.lease import HeavyJobLease
 from pr_closure.store import RunStore
 
@@ -167,15 +171,67 @@ def main():
         import time
 
         time.sleep(float(os.environ["FAKE_ADAPTER_SLEEP"]))
-    raw = os.environ.get("FAKE_ADAPTER_OUTPUT")
-    if raw:
-        out = json.loads(raw)
+    raw_file = os.environ.get("FAKE_ADAPTER_RAW_FILE")
+    if raw_file:
+        with open(raw_file, "rb") as handle:
+            sys.stdout.buffer.write(handle.read())
     else:
-        out = {"schema_version": 1, "applied": mode == "apply", "changes": []}
-    sys.stdout.write(json.dumps(out))
+        raw = os.environ.get("FAKE_ADAPTER_OUTPUT")
+        if raw:
+            out = json.loads(raw)
+        else:
+            out = {"schema_version": 1, "applied": mode == "apply", "changes": []}
+        sys.stdout.write(json.dumps(out))
 
 
 sys.exit(main())
+'''
+
+
+_PIPE_HOLDER_SCRIPT = r'''#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(120)"],
+)
+with open(os.environ["ADAPTER_PIDFILE"], "w") as handle:
+    handle.write(str(child.pid))
+'''
+
+_STDOUT_OVERFLOW_SCRIPT = r'''#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+import time
+
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(120)"],
+)
+with open(os.environ["ADAPTER_PIDFILE"], "w") as handle:
+    handle.write(str(child.pid))
+sys.stdout.buffer.write(b"x" * 70000)
+sys.stdout.buffer.flush()
+while True:
+    time.sleep(1)
+'''
+
+_STDERR_OVERFLOW_SCRIPT = r'''#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+import time
+
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(120)"],
+)
+with open(os.environ["ADAPTER_PIDFILE"], "w") as handle:
+    handle.write(str(child.pid))
+sys.stderr.write("y" * 5000)
+sys.stderr.flush()
+while True:
+    time.sleep(1)
 '''
 
 
@@ -206,6 +262,7 @@ class CliTestCase(unittest.TestCase):
         with open(path, "w") as handle:
             handle.write(script)
         os.chmod(path, stat.S_IRWXU)
+        return path
 
     def _write_json(self, path, data):
         with open(path, "w") as handle:
@@ -339,7 +396,7 @@ class CliTestCase(unittest.TestCase):
             return paths[0]
         return os.path.join(base, "no-attempt.json")
 
-    def adapter_env(self, output=None, exit_code=None, stderr=None, sleep=None):
+    def adapter_env(self, output=None, exit_code=None, stderr=None, sleep=None, raw_file=None):
         env = {
             "FAKE_ADAPTER_LOG": self.adapter_log,
         }
@@ -351,6 +408,8 @@ class CliTestCase(unittest.TestCase):
             env["FAKE_ADAPTER_STDERR"] = stderr
         if sleep is not None:
             env["FAKE_ADAPTER_SLEEP"] = str(sleep)
+        if raw_file is not None:
+            env["FAKE_ADAPTER_RAW_FILE"] = raw_file
         return env
 
     def adapter_calls(self):
@@ -358,6 +417,16 @@ class CliTestCase(unittest.TestCase):
             return []
         with open(self.adapter_log) as handle:
             return [json.loads(line) for line in handle if line.strip()]
+
+    def prepare_projection(self, mapping="trello:publyapp", adapter=True):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        overrides = {"tracking_projection": mapping}
+        config = self.write_config(overrides=overrides)
+        args = ["sync", "--config", config, "--pr", str(PR)]
+        if adapter:
+            args += ["--projection-adapter", os.path.join(self.bin_dir, "adapter")]
+        return config, args
 
     def prepare_approved(self, verdict="APPROVED", **review_overrides):
         """Full green pipeline: verification (both phases) plus a bound review."""
@@ -1289,15 +1358,6 @@ class CheckTransitionTests(CliTestCase):
 
 
 class SyncCommandTests(CliTestCase):
-    def prepare_projection(self, mapping="trello:publyapp", adapter=True):
-        self.set_git()
-        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
-        overrides = {"tracking_projection": mapping}
-        config = self.write_config(overrides=overrides)
-        args = ["sync", "--config", config, "--pr", str(PR)]
-        if adapter:
-            args += ["--projection-adapter", os.path.join(self.bin_dir, "adapter")]
-        return config, args
 
     def test_sync_dry_run_with_adapter_reports_proposed_changes(self):
         config, args = self.prepare_projection()
@@ -1474,6 +1534,260 @@ class SyncCommandTests(CliTestCase):
             "FOLLOW_UP_FILING", "APPROVED_WITH_FOLLOW_UPS", "APPROVED",
             "NEEDS_OWNER", "STALLED",
         })
+
+    def _plant_verification_root(self, kind):
+        base = os.path.join(self.state_dir, PROJECT, str(PR), "verification")
+        os.makedirs(base, exist_ok=True)
+        target = os.path.join(base, COMMIT_A)
+        if kind == "regular-file":
+            with open(target, "w") as handle:
+                handle.write("not a directory")
+        elif kind == "symlink":
+            real = os.path.join(self.root, "verification-target")
+            os.makedirs(real, exist_ok=True)
+            os.symlink(real, target)
+        elif kind == "fifo":
+            os.mkfifo(target)
+        else:
+            raise AssertionError("unknown root kind {0!r}".format(kind))
+        return target
+
+    def test_sync_apply_refuses_regular_file_verification_root_with_zero_adapter_calls(self):
+        config, args = self.prepare_projection()
+        args.append("--apply")
+        self._plant_verification_root("regular-file")
+        proc = self.run_cli(*args, extra_env=self.adapter_env())
+        self.assertEqual(3, proc.returncode)
+        self.assertEqual("", proc.stdout)
+        self.assertIn("verification", proc.stderr)
+        self.assertEqual([], self.adapter_calls())
+
+    def test_sync_apply_refuses_symlink_verification_root_with_zero_adapter_calls(self):
+        config, args = self.prepare_projection()
+        args.append("--apply")
+        self._plant_verification_root("symlink")
+        proc = self.run_cli(*args, extra_env=self.adapter_env())
+        self.assertEqual(3, proc.returncode)
+        self.assertEqual("", proc.stdout)
+        self.assertIn("verification", proc.stderr)
+        self.assertEqual([], self.adapter_calls())
+
+    def test_sync_apply_refuses_fifo_verification_root_with_zero_adapter_calls(self):
+        config, args = self.prepare_projection()
+        args.append("--apply")
+        self._plant_verification_root("fifo")
+        proc = self.run_cli(*args, extra_env=self.adapter_env())
+        self.assertEqual(3, proc.returncode)
+        self.assertEqual("", proc.stdout)
+        self.assertIn("verification", proc.stderr)
+        self.assertEqual([], self.adapter_calls())
+
+    def test_sync_apply_absent_verification_root_projects_valid_intermediate_state(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config(
+            overrides={
+                "tracking_projection": "trello:publyapp",
+                "local_review_ready_commands": ["exit 7"],
+            }
+        )
+        failed = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(5, failed.returncode)
+        # A FAILED verification leaves no artifact, so the verification root is
+        # genuinely absent while the durable commit event remains: LOCAL_VERIFY
+        # is a valid intermediate state and stays projectable (T6L-F6).
+        self.assertFalse(
+            os.path.exists(os.path.join(self.state_dir, PROJECT, str(PR), "verification"))
+        )
+        proc = self.run_cli(
+            "sync", "--config", config, "--pr", str(PR), "--apply",
+            "--projection-adapter", os.path.join(self.bin_dir, "adapter"),
+            extra_env=self.adapter_env(),
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("state=LOCAL_VERIFY", proc.stdout)
+        self.assertEqual(1, len(self.adapter_calls()))
+
+
+class AdapterBoundaryTests(CliTestCase):
+    """T6LC-F7 end-to-end: the projection adapter stream and diagnostic
+    boundary is byte-bounded, typed, and never echoes adapter text."""
+
+    def test_stdout_byte_cap_counts_bytes_not_characters(self):
+        config, args = self.prepare_projection()
+        raw = os.path.join(self.root, "adapter-wide-utf8.bin")
+        with open(raw, "w", encoding="utf-8") as handle:
+            handle.write("\u00e9" * 40000)
+        proc = self.run_cli(*args, extra_env=self.adapter_env(raw_file=raw))
+        self.assertEqual(5, proc.returncode)
+        self.assertIn("exceeded the bounded stream limit", proc.stderr)
+        self.assertNotIn("malformed JSON", proc.stderr)
+        self.assertEqual(1, len(self.adapter_calls()))
+
+    def test_invalid_utf8_stdout_is_typed_failure_without_traceback(self):
+        config, args = self.prepare_projection()
+        raw = os.path.join(self.root, "adapter-invalid-utf8.bin")
+        with open(raw, "wb") as handle:
+            handle.write(
+                b'{"schema_version": 1, "applied": false, "changes": [], "x": "\xff\xfe"}'
+            )
+        proc = self.run_cli(*args, extra_env=self.adapter_env(raw_file=raw))
+        self.assertEqual(5, proc.returncode)
+        self.assertIn("invalid UTF-8", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertNotIn("xff", proc.stderr)
+        self.assertEqual(1, len(self.adapter_calls()))
+
+    def test_nonzero_adapter_stderr_is_never_echoed(self):
+        config, args = self.prepare_projection()
+        args.append("--apply")
+        secret = "SUPERSECRET-ADAPTER-BARE-SECRET"
+        proc = self.run_cli(
+            *args,
+            extra_env=self.adapter_env(exit_code=9, stderr=secret),
+        )
+        self.assertEqual(5, proc.returncode)
+        self.assertNotIn(secret, proc.stderr)
+        self.assertIn("exited with status 9", proc.stderr)
+        self.assertEqual(1, len(self.adapter_calls()))
+
+    def test_unknown_result_key_never_appears_in_diagnostics(self):
+        config, args = self.prepare_projection()
+        secret_key = "super_secret_result_key"
+        secret_value = "super_secret_result_value"
+        proc = self.run_cli(
+            *args,
+            extra_env=self.adapter_env(
+                output={
+                    "schema_version": 1,
+                    "applied": False,
+                    "changes": [],
+                    secret_key: secret_value,
+                }
+            ),
+        )
+        self.assertEqual(5, proc.returncode)
+        self.assertNotIn(secret_key, proc.stderr)
+        self.assertNotIn(secret_value, proc.stderr)
+        self.assertEqual(1, len(self.adapter_calls()))
+
+    def test_unknown_change_type_and_key_never_appear_in_diagnostics(self):
+        config, args = self.prepare_projection()
+        proc = self.run_cli(
+            *args,
+            extra_env=self.adapter_env(
+                output={
+                    "schema_version": 1,
+                    "applied": False,
+                    "changes": [
+                        {"type": "super_secret_type", "summary": "super secret summary"}
+                    ],
+                }
+            ),
+        )
+        self.assertEqual(5, proc.returncode)
+        self.assertNotIn("super_secret_type", proc.stderr)
+        self.assertNotIn("super secret summary", proc.stderr)
+        proc = self.run_cli(
+            *args,
+            extra_env=self.adapter_env(
+                output={
+                    "schema_version": 1,
+                    "applied": False,
+                    "changes": [
+                        {
+                            "type": "card_update",
+                            "summary": "ok",
+                            "super_secret_change_key": "x",
+                        }
+                    ],
+                }
+            ),
+        )
+        self.assertEqual(5, proc.returncode)
+        self.assertNotIn("super_secret_change_key", proc.stderr)
+        self.assertEqual(2, len(self.adapter_calls()))
+
+
+class AdapterProcessBoundaryTests(CliTestCase):
+    """T6LC-F7 in-process: capture honors one strict deadline over parent
+    execution and pipe EOF, the whole process group is terminated, and no
+    live descendant survives timeout or overflow."""
+
+    def _run_adapter(self, script, timeout):
+        outcome = {}
+
+        def _worker():
+            try:
+                outcome["value"] = _invoke_adapter([script], timeout=timeout)
+                outcome["raised"] = None
+            except BaseException as error:  # noqa: BLE001 - typed assertion surface
+                outcome["raised"] = error
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        started = time.monotonic()
+        worker.start()
+        worker.join(timeout=8.0)
+        outcome["elapsed"] = time.monotonic() - started
+        if worker.is_alive():
+            outcome["raised"] = AssertionError(
+                "_invoke_adapter did not return within the outer deadline"
+            )
+        return outcome
+
+    def _assert_descendant_not_live(self, pidfile):
+        with open(pidfile) as handle:
+            pid = int(handle.read().strip())
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not self._is_live(pid):
+                return
+            time.sleep(0.05)
+        self.fail("descendant pid {0} is still live after cleanup".format(pid))
+
+    def _is_live(self, pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        try:
+            with open("/proc/{0}/stat".format(pid)) as handle:
+                state = handle.read().rsplit(")", 1)[1].split()[0]
+        except (OSError, IndexError):
+            return False
+        return state not in ("Z", "X")
+
+    def test_parent_exit_with_pipe_holding_descendant_times_out_bounded_and_reaps_group(self):
+        pidfile = os.path.join(self.root, "holder.pid")
+        script = self._write_fake("holder-adapter", _PIPE_HOLDER_SCRIPT)
+        with mock.patch.dict(os.environ, {"ADAPTER_PIDFILE": pidfile}):
+            outcome = self._run_adapter(script, timeout=1.0)
+        self.assertIsInstance(outcome["raised"], ProjectionFailure)
+        self.assertIn("timed out", str(outcome["raised"]))
+        self.assertLess(outcome["elapsed"], 5.0)
+        self._assert_descendant_not_live(pidfile)
+
+    def test_stdout_overflow_leaves_no_live_descendant(self):
+        pidfile = os.path.join(self.root, "overflow.pid")
+        script = self._write_fake("overflow-adapter", _STDOUT_OVERFLOW_SCRIPT)
+        with mock.patch.dict(os.environ, {"ADAPTER_PIDFILE": pidfile}):
+            outcome = self._run_adapter(script, timeout=5.0)
+        self.assertIsInstance(outcome["raised"], ProjectionFailure)
+        self.assertIn("exceeded the bounded stream limit", str(outcome["raised"]))
+        self.assertLess(outcome["elapsed"], 5.0)
+        self._assert_descendant_not_live(pidfile)
+
+    def test_stderr_overflow_leaves_no_live_descendant(self):
+        pidfile = os.path.join(self.root, "stderr-overflow.pid")
+        script = self._write_fake("stderr-overflow-adapter", _STDERR_OVERFLOW_SCRIPT)
+        with mock.patch.dict(os.environ, {"ADAPTER_PIDFILE": pidfile}):
+            outcome = self._run_adapter(script, timeout=5.0)
+        self.assertIsInstance(outcome["raised"], ProjectionFailure)
+        self.assertIn("exceeded the bounded stream limit", str(outcome["raised"]))
+        self.assertLess(outcome["elapsed"], 5.0)
+        self._assert_descendant_not_live(pidfile)
 
 
 class SourceFailureRedactionTests(CliTestCase):

@@ -18,10 +18,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import selectors
+import signal
 import stat
 import subprocess
 import sys
-import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -652,96 +653,141 @@ def _require_projection_adapter(path):
     return path
 
 
+def _terminate_process_group(proc) -> None:
+    """Kill the adapter's entire process group, with a per-platform fallback.
+
+    The adapter starts as a session leader (``start_new_session=True``), so
+    every descendant that does not create its own session shares the group;
+    killing the group closes inherited pipe ends that would otherwise hang a
+    bounded read loop. Platforms without process groups fall back to killing
+    only the direct child.
+    """
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+            return
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _reap_process(proc) -> None:
+    """Reap the direct child with a bound, so cleanup never hangs the CLI."""
+    try:
+        proc.wait(timeout=5)
+    except (subprocess.TimeoutExpired, TimeoutError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, TimeoutError):
+            pass
+
+
 def _invoke_adapter(argv, timeout):
     """Invoke the projection adapter as an argv list, never through a shell.
 
-    stdout and stderr are bounded while reading through separate reader
-    threads (T6L-F7); the adapter is terminated and reaped on overflow or
-    timeout, and raw adapter output is never echoed on any CLI stream. Only
-    the bounded stdout (validated later) is returned to the caller.
+    stdout and stderr are captured as raw bytes through one deadline-bounded
+    selector loop (T6LC-F7): a single deadline covers parent execution and
+    pipe EOF, the 65,536-byte stdout and 4,096-byte stderr limits are
+    enforced while reading, and the entire process group is terminated and
+    reaped on timeout, overflow, or read failure. The bounded stdout is
+    decoded strictly as UTF-8 only after capture; invalid UTF-8, overflow,
+    timeout, and read errors are typed :class:`ProjectionFailure` values with
+    fixed safe messages. Adapter stderr and adapter-controlled text are never
+    echoed on any CLI stream.
     """
     try:
         proc = subprocess.Popen(
             list(argv),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            text=False,
+            start_new_session=os.name == "posix",
         )
     except OSError as error:
         raise ProjectionFailure(
             "cannot run projection adapter: {0}".format(redact(str(error)))
         ) from error
 
-    stdout_parts = []
-    stderr_parts = []
-    overflow = []
-
-    def _drain(stream, sink, limit, name):
-        try:
+    deadline = time.monotonic() + timeout
+    streams = {
+        proc.stdout: {
+            "limit": PROJECTION_STDOUT_MAX_BYTES,
+            "buf": bytearray(),
+        },
+        proc.stderr: {
+            "limit": PROJECTION_STDERR_MAX_BYTES,
+            "buf": bytearray(),
+        },
+    }
+    reason = None
+    try:
+        with selectors.DefaultSelector() as selector:
+            for stream in streams:
+                selector.register(stream, selectors.EVENT_READ, stream)
+            closed = set()
             while True:
-                chunk = stream.read(65536)
-                if not chunk:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    reason = "timeout"
                     break
-                sink.append(chunk)
-                if sum(len(part) for part in sink) > limit:
-                    overflow.append(name)
+                ready = selector.select(timeout=min(remaining, 0.25))
+                for key, _ in ready:
+                    stream = key.fileobj
+                    try:
+                        chunk = stream.read1(65536)
+                    except OSError:
+                        reason = "read"
+                        break
+                    if not chunk:
+                        closed.add(stream)
+                        selector.unregister(stream)
+                        continue
+                    entry = streams[stream]
+                    entry["buf"].extend(chunk)
+                    if len(entry["buf"]) > entry["limit"]:
+                        reason = "overflow"
+                        break
+                if reason is not None:
                     break
-        finally:
+                if proc.poll() is not None and closed == set(streams):
+                    break
+    except OSError:
+        reason = "read"
+    finally:
+        if reason is not None or proc.poll() is None:
+            _terminate_process_group(proc)
+            _reap_process(proc)
+        for stream in streams:
             try:
                 stream.close()
             except OSError:
                 pass
 
-    stdout_thread = threading.Thread(
-        target=_drain,
-        args=(proc.stdout, stdout_parts, PROJECTION_STDOUT_MAX_BYTES, "stdout"),
-        daemon=True,
-    )
-    stderr_thread = threading.Thread(
-        target=_drain,
-        args=(proc.stderr, stderr_parts, PROJECTION_STDERR_MAX_BYTES, "stderr"),
-        daemon=True,
-    )
-    stdout_thread.start()
-    stderr_thread.start()
-    try:
-        returncode = proc.wait(timeout=timeout)
-    except (subprocess.TimeoutExpired, TimeoutError):
-        proc.kill()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
+    if reason == "timeout":
         raise ProjectionFailure(
             "projection adapter timed out after {0}s".format(timeout)
         )
-    if overflow:
-        if proc.poll() is None:
-            proc.kill()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+    if reason == "overflow":
         raise ProjectionFailure(
             "projection adapter output exceeded the bounded stream limit"
         )
-    stdout_thread.join()
-    stderr_thread.join()
-    stdout = "".join(stdout_parts)
-    stderr = "".join(stderr_parts)
-    if returncode != 0:
-        _err(
-            "projection adapter exited with status {0}".format(returncode)
-        )
-        if stderr.strip():
-            _err(
-                "projection adapter stderr (bounded): "
-                + redact(stderr[:PROJECTION_STDERR_MAX_BYTES])
-            )
+    if reason == "read":
+        raise ProjectionFailure("projection adapter stream read failed")
+    if proc.returncode != 0:
         raise ProjectionFailure(
-            "projection adapter exited with status {0}".format(returncode)
+            "projection adapter exited with status {0}".format(proc.returncode)
         )
-    return stdout
+    try:
+        return bytes(streams[proc.stdout]["buf"]).decode("utf-8")
+    except UnicodeDecodeError:
+        raise ProjectionFailure("projection adapter returned invalid UTF-8 output")
 
 
 def _parse_adapter_result(stdout, mode):
@@ -756,19 +802,13 @@ def _parse_adapter_result(stdout, mode):
     """
     try:
         data = json.loads(stdout)
-    except json.JSONDecodeError as error:
-        raise ProjectionFailure(
-            "projection adapter returned malformed JSON: {0}".format(error)
-        )
+    except json.JSONDecodeError:
+        raise ProjectionFailure("projection adapter returned malformed JSON")
     if not isinstance(data, dict):
         raise ProjectionFailure("projection adapter must return a JSON object")
     unknown = sorted(key for key in data if key not in PROJECTION_RESULT_ALLOWED_KEYS)
     if unknown:
-        raise ProjectionFailure(
-            "projection adapter result carries unknown key(s): {0}".format(
-                ", ".join(unknown)
-            )
-        )
+        raise ProjectionFailure("projection adapter result carries unknown key(s)")
     schema_version = data.get("schema_version")
     if (
         not isinstance(schema_version, int)
@@ -802,16 +842,12 @@ def _parse_adapter_result(stdout, mode):
         )
         if unknown_change:
             raise ProjectionFailure(
-                "projection change at index {0} carries unknown key(s): {1}".format(
-                    index, ", ".join(unknown_change)
-                )
+                "projection change at index {0} carries unknown key(s)".format(index)
             )
         change_type = change.get("type")
         if change_type not in PROJECTION_CHANGE_TYPES:
             raise ProjectionFailure(
-                "projection change at index {0} has unknown type {1!r}".format(
-                    index, change_type
-                )
+                "projection change at index {0} has unknown type".format(index)
             )
         summary = change.get("summary")
         if not isinstance(summary, str) or not (1 <= len(summary) <= PROJECTION_CHANGE_SUMMARY_MAX):
