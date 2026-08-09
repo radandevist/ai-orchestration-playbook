@@ -84,6 +84,15 @@
       ],
       "minLength": 1,
       "pattern": "\\S"
+    },
+    "ci_required_checks": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      },
+      "uniqueItems": true
     }
   }
 }

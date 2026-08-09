@@ -1010,6 +1010,85 @@ class CiClassificationTests(TempDirTestCase):
         ci = classify_ci((), COMMIT_A)
         self.assertEqual(CiState.UNKNOWN, ci.ci_state)
 
+    # -- required-check policy: opt-in exact selection --
+
+    def test_required_checks_green_set_with_unrelated_skipped_is_passing(self):
+        checks = (
+            parse_check(check_run("lint", "COMPLETED", "SUCCESS")),
+            parse_check(check_run("docs", "COMPLETED", "SKIPPED")),
+        )
+        ci = classify_ci(checks, COMMIT_A, required_checks=("lint",))
+        self.assertEqual(CiState.PASSING, ci.ci_state)
+        self.assertEqual(2, len(ci.checks))
+
+    def test_required_checks_missing_name_is_never_passing(self):
+        checks = (parse_check(check_run("lint", "COMPLETED", "SUCCESS")),)
+        ci = classify_ci(checks, COMMIT_A, required_checks=("lint", "missing-gate"))
+        self.assertEqual(CiState.UNKNOWN, ci.ci_state)
+        self.assertTrue(any("missing" in reason for reason in ci.reasons))
+
+    def test_required_checks_duplicate_live_result_is_never_passing(self):
+        checks = (
+            parse_check(check_run("build", "COMPLETED", "SUCCESS")),
+            parse_check(check_run("build", "COMPLETED", "SUCCESS")),
+        )
+        ci = classify_ci(checks, COMMIT_A, required_checks=("build",))
+        self.assertEqual(CiState.UNKNOWN, ci.ci_state)
+        self.assertTrue(any("duplicate" in reason for reason in ci.reasons))
+
+    def test_required_checks_selected_failure_is_branch_failure(self):
+        checks = (
+            parse_check(check_run("lint", "COMPLETED", "SUCCESS")),
+            parse_check(check_run("test", "COMPLETED", "FAILURE")),
+            parse_check(check_run("docs", "COMPLETED", "SKIPPED")),
+        )
+        ci = classify_ci(checks, COMMIT_A, required_checks=("lint", "test"))
+        self.assertEqual(CiState.BRANCH_FAILURE, ci.ci_state)
+        self.assertIsNone(ci.infra_job)
+
+    def test_required_checks_selected_skipped_cannot_pass(self):
+        checks = (
+            parse_check(check_run("lint", "COMPLETED", "SKIPPED")),
+            parse_check(check_run("test", "COMPLETED", "SUCCESS")),
+        )
+        ci = classify_ci(checks, COMMIT_A, required_checks=("lint", "test"))
+        self.assertEqual(CiState.UNKNOWN, ci.ci_state)
+
+    def test_required_checks_selected_pending_is_pending(self):
+        checks = (
+            parse_check(check_run("lint", "COMPLETED", "SUCCESS")),
+            parse_check(check_run("test", "IN_PROGRESS")),
+        )
+        ci = classify_ci(checks, COMMIT_A, required_checks=("lint", "test"))
+        self.assertEqual(CiState.PENDING, ci.ci_state)
+
+    def test_required_checks_unrelated_failure_is_non_authoritative(self):
+        checks = (
+            parse_check(check_run("lint", "COMPLETED", "SUCCESS")),
+            parse_check(check_run("cleanup", "COMPLETED", "FAILURE")),
+        )
+        ci = classify_ci(checks, COMMIT_A, required_checks=("lint",))
+        self.assertEqual(CiState.PASSING, ci.ci_state)
+
+    def test_empty_required_checks_keeps_all_rollup_behavior(self):
+        checks = (
+            parse_check(check_run("lint", "COMPLETED", "SUCCESS")),
+            parse_check(check_run("test", "COMPLETED", "SKIPPED")),
+        )
+        ci = classify_ci(checks, COMMIT_A, required_checks=())
+        self.assertEqual(CiState.UNKNOWN, ci.ci_state)
+
+    def test_required_checks_infra_uses_only_selected_failure(self):
+        checks = (
+            parse_check(check_run("build", "COMPLETED", "FAILURE")),
+            parse_check(check_run("cleanup", "COMPLETED", "FAILURE")),
+        )
+        ci = classify_ci(
+            checks, COMMIT_A, infra_event=VALID_INFRA_EVENT, required_checks=("build",)
+        )
+        self.assertEqual(CiState.INFRA_FAILURE, ci.ci_state)
+        self.assertEqual("build", ci.infra_job)
+
     def test_infra_event_authorizes_infrastructure_classification(self):
         checks = (parse_check(check_run("build", "COMPLETED", "FAILURE")),)
         ci = classify_ci(checks, COMMIT_A, infra_event=VALID_INFRA_EVENT)

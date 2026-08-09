@@ -431,6 +431,42 @@ def config_agreement_corpus():
 
     add("valid config", lambda c: None, True, True)
     add("null tracking_projection", lambda c: c.update({"tracking_projection": None}), True, True)
+    add(
+        "valid ci_required_checks",
+        lambda c: c.update({"ci_required_checks": ["gate-a", "gate-b"]}),
+        True,
+        True,
+    )
+    add(
+        "empty ci_required_checks legacy",
+        lambda c: c.update({"ci_required_checks": []}),
+        True,
+        True,
+    )
+    add(
+        "blank ci_required_checks item",
+        lambda c: c.update({"ci_required_checks": ["gate-a", "  "]}),
+        False,
+        False,
+    )
+    add(
+        "duplicate ci_required_checks",
+        lambda c: c.update({"ci_required_checks": ["gate-a", "gate-a"]}),
+        False,
+        False,
+    )
+    add(
+        "non-string ci_required_checks item",
+        lambda c: c.update({"ci_required_checks": [42]}),
+        False,
+        False,
+    )
+    add(
+        "string ci_required_checks",
+        lambda c: c.update({"ci_required_checks": "gate-a"}),
+        False,
+        False,
+    )
 
     add("unknown top-level key", lambda c: c.update({"rogue": "x"}), False, False)
     add("missing schema_version", lambda c: c.pop("schema_version"), False, False)
@@ -634,7 +670,9 @@ class ConfigCorpusShapeTests(unittest.TestCase):
             {
                 "valid": 1,
                 "null_projection": 1,
-                "structural": 31,
+                "required_valid": 1,
+                "required_empty": 1,
+                "structural": 35,
                 "asymmetric": 9,
             },
             counts,
@@ -694,6 +732,10 @@ def _config_group_of(row):
         return "valid"
     if label == "null tracking_projection":
         return "null_projection"
+    if label == "valid ci_required_checks":
+        return "required_valid"
+    if label == "empty ci_required_checks legacy":
+        return "required_empty"
     if row[4] is not None:
         return "asymmetric"
     return "structural"

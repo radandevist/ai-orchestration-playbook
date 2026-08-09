@@ -971,18 +971,53 @@ def require_infra_event(event) -> InfraEvidence:
     )
 
 
-def classify_ci(checks, head_oid: str, infra_event=None) -> CiFacts:
-    """Classify one PR's complete status-check rollup, never via an aggregate gate.
+def _classify_outcomes(checks, required: bool):
+    """Apply the existing outcome precedence to one effective check set."""
+    if not checks:
+        return CiState.UNKNOWN, ("no status checks present",)
+    outcomes = [check.outcome for check in checks]
+    if any(outcome is CheckOutcome.FAILURE for outcome in outcomes):
+        return (
+            CiState.BRANCH_FAILURE,
+            ("at least one required check failed",) if required else ("at least one check failed",),
+        )
+    if any(outcome is CheckOutcome.PENDING for outcome in outcomes):
+        return (
+            CiState.PENDING,
+            ("required checks still pending",) if required else ("checks still pending",),
+        )
+    if any(outcome is not CheckOutcome.PASSING for outcome in outcomes):
+        reason = (
+            "not every required check is passing evidence"
+            if required
+            else "not every check is passing evidence"
+        )
+        return CiState.UNKNOWN, (reason,)
+    return (
+        CiState.PASSING,
+        ("all required checks passing",) if required else ("all checks passing",),
+    )
+
+
+def classify_ci(checks, head_oid: str, infra_event=None, required_checks=()) -> CiFacts:
+    """Classify one PR's status-check rollup, never via an aggregate gate.
 
     Every check outcome is explicit: a single failed check wins over any green
     checks, pending checks stay pending, and skipped/neutral checks are never
     counted as passing evidence. A failed rollup may be reclassified as
     ``INFRA_FAILURE`` only when a durable ``INFRA_FAILURE`` event on the PR head
     commit names the failed job and proves no code-test step began, and the
-    rollup holds exactly one failing check with that job's name; anything else
-    leaves the state at branch failure with an explicit reason. The commit CI
-    is bound to is the PR head OID and returned verbatim so local/remote/head/CI
-    differences stay visible.
+    effective rollup holds exactly one failing check with that job's name;
+    anything else leaves the state at branch failure with an explicit reason.
+    The commit CI is bound to is the PR head OID and returned verbatim so
+    local/remote/head/CI differences stay visible.
+
+    An empty ``required_checks`` keeps the strict all-rollup behavior above.
+    When non-empty, only checks whose names exactly match the declared list are
+    authoritative: each declared name must appear exactly once in the live
+    rollup, and the existing outcome precedence applies to that selection.
+    Missing or duplicated declared names fail closed as ``UNKNOWN``, and checks
+    outside the declared list never decide the state.
     """
     checks = tuple(checks)
     for check in checks:
@@ -990,25 +1025,42 @@ def classify_ci(checks, head_oid: str, infra_event=None) -> CiFacts:
             raise TypeError("checks must contain CheckResult values")
     head_oid = _require_commit(head_oid, "PR head", ())
 
-    if not checks:
-        base, reasons = CiState.UNKNOWN, ("no status checks present",)
-    else:
-        outcomes = [check.outcome for check in checks]
-        if any(outcome is CheckOutcome.FAILURE for outcome in outcomes):
-            base, reasons = CiState.BRANCH_FAILURE, ("at least one check failed",)
-        elif any(outcome is CheckOutcome.PENDING for outcome in outcomes):
-            base, reasons = CiState.PENDING, ("checks still pending",)
-        elif any(outcome is not CheckOutcome.PASSING for outcome in outcomes):
-            base, reasons = CiState.UNKNOWN, ("not every check is passing evidence",)
+    required = tuple(required_checks)
+    effective = checks
+    if required:
+        by_name = {}
+        duplicates = set()
+        for check in checks:
+            if check.name in by_name:
+                if check.name in required:
+                    duplicates.add(check.name)
+            else:
+                by_name[check.name] = check
+        missing = [name for name in required if name not in by_name]
+        if missing or duplicates:
+            reasons = []
+            if missing:
+                reasons.append(
+                    "required check(s) missing: {0}".format(", ".join(sorted(missing)))
+                )
+            if duplicates:
+                reasons.append(
+                    "required check(s) with duplicate live results: {0}".format(
+                        ", ".join(sorted(duplicates))
+                    )
+                )
+            base = CiState.UNKNOWN
+            effective = ()
         else:
-            base, reasons = CiState.PASSING, ("all checks passing",)
+            effective = tuple(by_name[name] for name in required)
+            base, reasons = _classify_outcomes(effective, required=True)
+    else:
+        base, reasons = _classify_outcomes(checks, required=False)
 
     infra_job = None
     if base is CiState.BRANCH_FAILURE and infra_event is not None:
         evidence = require_infra_event(infra_event)
-        failed_checks = [
-            check for check in checks if check.outcome is CheckOutcome.FAILURE
-        ]
+        failed_checks = [check for check in effective if check.outcome is CheckOutcome.FAILURE]
         if evidence.commit != head_oid:
             reasons = (
                 "infrastructure evidence commit {0} does not match PR head {1}; "

@@ -142,6 +142,7 @@ class ProjectConfig:
     stagnation_budget_minutes: int
     heavy_job_limit: int
     tracking_projection: Optional[str]
+    ci_required_checks: Tuple[str, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(
@@ -150,6 +151,7 @@ class ProjectConfig:
         object.__setattr__(
             self, "closure_acceptance_commands", _as_tuple(self.closure_acceptance_commands)
         )
+        object.__setattr__(self, "ci_required_checks", _as_tuple(self.ci_required_checks))
 
 
 @dataclass(frozen=True)
