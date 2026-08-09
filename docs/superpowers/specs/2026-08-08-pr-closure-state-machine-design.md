@@ -153,6 +153,16 @@ record produces `UNVERIFIED`.
 
 The closure gate reduces wasted cycles, not review pressure.
 
+### Default model lanes
+
+- Implementation defaults to DeepSeek V4 Flash.
+- Independent review defaults to GPT-5.6 Luna at `xhigh` reasoning effort.
+- Claude models are not used for new implementation, review, or coordination work.
+- Historical Claude review artifacts remain valid evidence when they already satisfy the structured
+  cross-family contract; they are not rerun solely because the default changed.
+- The mechanical rule remains model-family separation: an OpenAI-family reviewer may review a
+  DeepSeek implementation, but it may not review an OpenAI-family implementation.
+
 - Every `REVIEW_READY` commit receives a fresh independent cross-family review.
 - Any blocking finding returns the pull request to implementation.
 - Every fix receives another independent review after CI and local verification are green.
