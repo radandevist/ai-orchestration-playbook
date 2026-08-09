@@ -1,6 +1,6 @@
 # Required CI Check Policy Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use executing-plans with the AI orchestration playbook. DeepSeek V4 Flash implements; GPT-5.6 Luna at xhigh independently reviews. Do not push or merge without the owner approval recorded for this run.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use executing-plans with the AI orchestration playbook. DeepSeek V4 Flash implements at `max`; GPT-5.6 Luna at xhigh independently reviews. Do not push or merge without the owner approval recorded for this run.
 
 **Goal:** Add an opt-in, fail-closed authoritative CI-check list to the PR closure gate.
 

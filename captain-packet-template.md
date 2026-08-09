@@ -94,7 +94,7 @@ codex exec --ephemeral --skip-git-repo-check \
   --dangerously-bypass-approvals-and-sandbox \
   -c model="deepseek-v4-flash" \
   -c model_provider="openmodel" \
-  -c model_reasoning_effort="high" \
+  -c model_reasoning_effort="max" \
   -C /absolute/target/clone \
   - < /absolute/run/packet.md
 ```

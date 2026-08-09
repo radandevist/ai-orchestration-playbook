@@ -162,7 +162,7 @@ mapping (for example `trello:publyapp`), the separate `--projection-adapter
 
 `pr-closure check-transition` is a **mandatory precondition** before every state-changing closure action (dispatch, fix, rerun, review, follow-up filing, projection apply, ready report). A denied transition stops the action. Missing evidence and tool/API failures are non-zero exits — fail closed, never infer a favorable state. Exit codes are stable: `0` read/check succeeded, `2` invalid input, `3` source unavailable or malformed, `4` transition denied, `5` verification/projection command failed, `6` heavy-job lease unavailable. Evidence lives in a durable run directory outside temporary session folders; the run's `state.json` is a cache, never the authority. Empty, undersized, or markerless lane output is failure even with exit 0.
 
-**Model policy (all projects).** Implementation defaults to DeepSeek V4 Flash. Independent review defaults to GPT-5.6 Luna at `xhigh` reasoning effort. No new Claude implementation, review, or coordination calls. Historical Claude artifacts remain valid evidence when they already satisfy the structured cross-family contract; they are not rerun solely because the default changed. The reviewer family must differ from the implementer family — an OpenAI-family reviewer may review a DeepSeek implementation, but never an OpenAI-family implementation.
+**Model policy (all projects).** Implementation defaults to DeepSeek V4 Flash at its highest supported effort (`max`). Independent review defaults to GPT-5.6 Luna at `xhigh` reasoning effort. No new Claude implementation, review, or coordination calls. Historical Claude artifacts remain valid evidence when they already satisfy the structured cross-family contract; they are not rerun solely because the default changed. The reviewer family must differ from the implementer family — an OpenAI-family reviewer may review a DeepSeek implementation, but never an OpenAI-family implementation.
 
 **Adversarial review is preserved.** The gate reduces wasted cycles, not review pressure: every `REVIEW_READY` commit gets a fresh independent cross-family review, every fix is re-reviewed once CI and local gates are green, and there is no maximum review count.
 
@@ -268,8 +268,8 @@ PR-opening repos must also supply the closure fields from §2.6 (see `adapter-te
 | `captain_root` | repo parent when coordinating sibling clones; otherwise repo root |
 | `clone_roots` | sibling local clones/worktrees approved by the adapter, or `none` |
 | `host_parallelism` | at most 3 concurrent executor waves; never run multiple heavy `dotnet` / `pnpm` verification jobs at once |
-| `executor` | DeepSeek V4 Flash implementation lane (`codex exec -c model="deepseek-v4-flash" -c model_provider="openmodel" -c model_reasoning_effort="high"`) |
-| `model_ladder` | primary `deepseek-v4-flash` @ `high`; on quota/rate-limit fall back per repo policy to the next approved executor (never a Claude model) without changing the orchestration contract |
+| `executor` | DeepSeek V4 Flash implementation lane (`codex exec -c model="deepseek-v4-flash" -c model_provider="openmodel" -c model_reasoning_effort="max"`) |
+| `model_ladder` | primary `deepseek-v4-flash` @ `max`; on quota/rate-limit fall back per repo policy to the next approved executor (never a Claude model) without changing the orchestration contract |
 | `provider_lanes` | DeepSeek V4 Flash lane for implementation; GPT-5.6 Luna `xhigh` lane for independent review; local lane for grep/log/test prep |
 | `hot_backlog` | keep 3-5 ready packets in the run `dump_dir`; do not launch broad exploratory packets |
 | `packet_template` | `~/ai-orchestration-playbook/captain-packet-template.md` |

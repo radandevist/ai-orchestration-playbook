@@ -1,6 +1,6 @@
 # PublyApp PR Closure Adoption Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans together with the AI orchestration playbook. DeepSeek V4 Flash implements; GPT-5.6 Luna at `xhigh` independently reviews every pushed tip. Do not merge.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans together with the AI orchestration playbook. DeepSeek V4 Flash implements at `max`; GPT-5.6 Luna at `xhigh` independently reviews every pushed tip. Do not merge.
 
 **Goal:** Make PublyApp the first live user of the mechanical closure gate and drive PRs #1054, #1061, #1065, #1066, #1078, and #1083 to an evidence-backed `APPROVED`, `APPROVED_WITH_FOLLOW_UPS`, or genuine `NEEDS_OWNER` state.
 
@@ -28,7 +28,7 @@
 - Resolve every worktree with `git worktree list --porcelain`; never construct a path from a PR number.
 - Preserve staged, dirty, and untracked user work. Stop a lane if its resolved worktree is not a clean named checkpoint.
 - Before every worker dispatch, append the required preflight ledger row with `decision: dispatch`.
-- DeepSeek V4 Flash is the default implementer, invoked through the configured project harness at `high`; use the explicit OpenModel provider wiring from the playbook packet template.
+- DeepSeek V4 Flash is the default implementer, invoked through the configured project harness at `max`; use the explicit OpenModel provider wiring from the playbook packet template.
 - GPT-5.6 Luna at `xhigh` is the default cross-family reviewer for these PRs; record the ledgered pre-merge escalation reason. No new Claude model calls. A reviewer never edits the branch.
 - Serialize Docker/Playwright/full-suite work with the framework's heavy-job lease. Lightweight source fixes and focused unit tests may run concurrently only when they use different worktrees.
 - Every approval is bound to the exact pushed 40-character commit reported by GitHub. A push invalidates the prior approval automatically.
