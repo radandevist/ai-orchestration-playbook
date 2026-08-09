@@ -1379,6 +1379,13 @@ class SyncCommandTests(CliTestCase):
         calls = self.adapter_calls()
         self.assertEqual("apply", calls[0][calls[0].index("--mode") + 1])
 
+    def test_sync_gh_failure_never_invokes_projection_adapter(self):
+        config, args = self.prepare_projection()
+        self.set_gh_failure("GraphQL: Could not resolve to a PullRequest")
+        proc = self.run_cli(*args, extra_env=self.adapter_env())
+        self.assertEqual(3, proc.returncode)
+        self.assertEqual([], self.adapter_calls())
+
     def test_sync_apply_without_projection_exits_two_and_never_calls_adapter(self):
         config, args = self.prepare_projection(mapping=None)
         args.append("--apply")

@@ -147,6 +147,28 @@ class SourceFailureTests(TempDirTestCase):
         with self.assertRaises(SourceUnavailable):
             source.read_pr()
 
+    def test_gh_no_pr_failure_is_never_an_empty_success(self):
+        runner = RecordingRunner(
+            {
+                "gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: (
+                    1,
+                    "",
+                    "GraphQL: Could not resolve to a PullRequest",
+                )
+            }
+        )
+        source = GitHubSource("owner/repo", 42, runner=runner)
+        with self.assertRaises(SourceUnavailable):
+            source.read_pr()
+
+    def test_gh_blank_success_is_never_a_no_pr_result(self):
+        runner = RecordingRunner(
+            {"gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: (0, "", "")}
+        )
+        source = GitHubSource("owner/repo", 42, runner=runner)
+        with self.assertRaises(SourceMalformed):
+            source.read_pr()
+
     def test_git_failure_raises_source_unavailable(self):
         responses = self.base_responses()
         responses[self.git_c("worktree", "list", "--porcelain")] = (128, "", "fatal: not a git repository")

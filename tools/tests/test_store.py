@@ -402,6 +402,26 @@ class ForbiddenEvidencePathTests(StoreTestCase):
                 with self.assertRaises(ForbiddenEvidencePath):
                     store.record_commit(COMMIT_A, path)
 
+    def test_rejects_missing_tmp_session_path(self):
+        store = RunStore(self.root, "proj", 42)
+        missing = os.path.join(
+            tempfile.gettempdir(),
+            "missing-harness-session-{0}".format(os.getpid()),
+            "evidence.json",
+        )
+        with self.assertRaises(ForbiddenEvidencePath):
+            store.record_commit(COMMIT_A, missing)
+
+    def test_rejects_missing_claude_jobs_session_path(self):
+        store = RunStore(self.root, "proj", 42)
+        missing = os.path.join(
+            os.path.expanduser("~/.claude/jobs"),
+            "missing-session-{0}".format(os.getpid()),
+            "evidence.json",
+        )
+        with self.assertRaises(ForbiddenEvidencePath):
+            store.record_commit(COMMIT_A, missing)
+
     def test_allows_lookalike_roots_that_are_not_descendants(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("ok"))
