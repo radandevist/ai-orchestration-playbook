@@ -525,6 +525,13 @@ def config_agreement_corpus():
         False,
         False,
     )
+    add(
+        "NUL command string",
+        lambda c: c.update({"local_review_ready_commands": ["echo \x00 boom"]}),
+        True,
+        False,
+        "nul_command_string",
+    )
     add("empty tracking_projection", lambda c: c.update({"tracking_projection": ""}), False, False)
     add(
         "blank tracking_projection",
@@ -628,7 +635,7 @@ class ConfigCorpusShapeTests(unittest.TestCase):
                 "valid": 1,
                 "null_projection": 1,
                 "structural": 31,
-                "asymmetric": 8,
+                "asymmetric": 9,
             },
             counts,
         )

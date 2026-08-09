@@ -143,6 +143,12 @@ CONFIG_SEMANTIC_ASYMMETRIES = (
         "or surrounding whitespace, and not '.' or '..'); JSON Schema cannot exclude "
         "'.'/'..'/NUL, so this schema accepts spellings the Python gate rejects.",
     ),
+    SemanticAsymmetry(
+        "nul_command_string",
+        "configured command strings must not contain NUL bytes because the subprocess "
+        "argv contract cannot carry them; JSON Schema's \\S pattern accepts NUL, so "
+        "this schema accepts spellings the Python gate rejects.",
+    ),
 )
 
 
@@ -256,6 +262,20 @@ def command_digest(command: str) -> str:
     return hashlib.sha256(command.encode("utf-8")).hexdigest()
 
 
+def command_sequence_digest(sequence) -> str:
+    """SHA-256 identity of an exact ordered ``(phase, command_digest)`` sequence.
+
+    This is the immutable config identity that verification attempts bind
+    (T6L-F2): a changed ordered command sequence yields a new identity, so
+    attempts for different configurations coexist at the same commit and a
+    stale identity can never be selected as current passing evidence.
+    """
+    payload = json.dumps(
+        [[phase, digest] for phase, digest in sequence], sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _check_string_array(name: str, raw, min_items: int) -> Tuple[str, ...]:
     items = require_list(raw, name)
     if not all(isinstance(item, str) and item.strip() for item in items):
@@ -301,6 +321,10 @@ def _check_command_array(name: str, raw, min_items: int) -> Tuple[str, ...]:
     items = require_list(raw, name)
     if not all(isinstance(item, str) and item.strip() for item in items):
         raise ReviewValidationError(f"{name} must be a list of non-empty command strings")
+    if any(isinstance(item, str) and "\x00" in item for item in items):
+        raise ReviewValidationError(
+            f"{name} commands must not contain NUL bytes (subprocess cannot run them)"
+        )
     if len(items) < min_items:
         raise ReviewValidationError(f"{name} must contain at least {min_items} item(s)")
     return tuple(items)

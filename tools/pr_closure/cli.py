@@ -21,6 +21,8 @@ import os
 import stat
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Optional, Tuple
@@ -29,6 +31,7 @@ from pr_closure.contract import (
     ConfigValidationError,
     ReviewValidationError,
     command_digest,
+    command_sequence_digest,
     validate_project_config,
 )
 from pr_closure.lease import (
@@ -43,7 +46,7 @@ from pr_closure.model import (
     Disposition,
     Evidence,
 )
-from pr_closure.review import validate_review
+from pr_closure.review import require_live_binding, validate_review
 from pr_closure.sources import (
     INFRA_FAILURE_EVENT,
     GitHubIssueSource,
@@ -76,6 +79,15 @@ EXIT_LEASE_UNAVAILABLE = 6
 VERIFICATION_SCHEMA_VERSION = 1
 PROJECTION_RESULT_SCHEMA_VERSION = 1
 PROJECTION_ADAPTER_TIMEOUT = 30.0
+PROJECTION_STDOUT_MAX_BYTES = 65536
+PROJECTION_STDERR_MAX_BYTES = 4096
+PROJECTION_MAX_CHANGES = 100
+PROJECTION_CHANGE_SUMMARY_MAX = 200
+PROJECTION_RESULT_ALLOWED_KEYS = ("schema_version", "applied", "changes")
+PROJECTION_CHANGE_ALLOWED_KEYS = ("type", "summary")
+PROJECTION_CHANGE_TYPES = frozenset(
+    {"list_update", "card_update", "card_create", "card_move", "card_archive"}
+)
 
 # GitHub issue states that prove a filed follow-up is still live.
 ACCEPTABLE_ISSUE_STATES = frozenset({"OPEN", "SCHEDULED"})
@@ -125,41 +137,43 @@ def _read_config(path: str) -> Mapping:
     return data
 
 
-def _run_shell_command(command: str, cwd: str) -> Tuple[dict, str, str]:
+def _run_shell_command(command: str, cwd: str) -> dict:
     """Run one configured shell command string in the resolved PR worktree.
 
     The command is always passed as exactly one ``sh -c`` argv element and
     never spliced into a larger string; CLI arguments never reach the shell.
     ``cwd`` is the exact Git-reported PR worktree path (C6D-F1), never the
-    CLI process directory or the configured anchor. The returned run record
-    carries timestamps and the exit status only; the raw command text is
-    never persisted (C6D-F4).
+    CLI process directory or the configured anchor.
+
+    stdout and stderr go to ``DEVNULL`` (T6L-F8): configured commands are
+    arbitrary and their output cannot be safely redacted, so it is never
+    captured or emitted on any CLI stream or persisted anywhere. The returned
+    run record carries timestamps and the exit status only; the raw command
+    text is never persisted (C6D-F4). A subprocess argument ``ValueError``
+    (for example an embedded NUL byte) is mapped to the typed CLI failure
+    contract (T6L-F9).
     """
     started = datetime.now(timezone.utc)
     try:
         proc = subprocess.run(
             ("sh", "-c", command),
             cwd=cwd,
-            capture_output=True,
-            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             check=False,
         )
-    except OSError as error:
+    except (OSError, ValueError) as error:
         raise VerificationFailure(
             "cannot run verification command in the PR worktree: {0}".format(
                 redact(str(error))
             )
         ) from error
     ended = datetime.now(timezone.utc)
-    return (
-        {
-            "started_at": started.isoformat(timespec="microseconds"),
-            "ended_at": ended.isoformat(timespec="microseconds"),
-            "exit_status": proc.returncode,
-        },
-        proc.stdout,
-        proc.stderr,
-    )
+    return {
+        "started_at": started.isoformat(timespec="microseconds"),
+        "ended_at": ended.isoformat(timespec="microseconds"),
+        "exit_status": proc.returncode,
+    }
 
 
 def _require_live_pr(github, config):
@@ -335,6 +349,14 @@ def _status_snapshot(config, pr_number):
             raise SourceMalformed(
                 "durable review record is invalid: {0}".format(error)
             )
+        try:
+            require_live_binding(
+                record, config.repository, pr_number, pr.head_branch, pr.head_oid
+            )
+        except ReviewValidationError as error:
+            raise SourceMalformed(
+                "durable review record fails live PR binding: {0}".format(error)
+            )
         verdicts.add(record.verdict)
         if review_commit is None:
             review_commit = record.reviewed_commit
@@ -480,18 +502,9 @@ def cmd_import_review(config, args) -> int:
     if not isinstance(data, dict):
         raise CliInputError("review artifact must be a JSON object")
     record = validate_review(data)
-    if record.reviewed_commit != pr.head_oid:
-        raise CliInputError(
-            "review reviewed_commit does not bind to the pull request head commit"
-        )
-    if record.reviewed_branch != pr.head_branch:
-        raise CliInputError(
-            "review reviewed_branch does not bind to the pull request head branch"
-        )
-    if record.repository != config.repository:
-        raise CliInputError("review repository does not bind to the configured repository")
-    if record.pr_number != args.pr:
-        raise CliInputError("review pr_number does not bind to the requested pull request")
+    require_live_binding(
+        record, config.repository, args.pr, pr.head_branch, pr.head_oid
+    )
     durable_tip = store.current_commit()
     if durable_tip is None or durable_tip != record.reviewed_commit:
         raise CliInputError(
@@ -509,6 +522,10 @@ def cmd_record_verification(config, args) -> int:
         for phase, attr in GATE_PHASES
         for command in getattr(config, attr)
     )
+    expected_commands = tuple(
+        (phase, command_digest(command)) for phase, command in commands
+    )
+    config_digest = command_sequence_digest(expected_commands)
     store, git, facts = _bind_verification_target(config, args.pr)
     commit = facts.local_commit
     worktree = facts.worktree_path
@@ -524,17 +541,13 @@ def cmd_record_verification(config, args) -> int:
         runs = []
         failed = None
         for index, (phase, command) in enumerate(commands, start=1):
-            run, stdout, stderr = _run_shell_command(command, cwd=worktree)
+            run = _run_shell_command(command, cwd=worktree)
             run["phase"] = phase
             run["command_digest"] = command_digest(command)
             run["command_label"] = "{0}:{1}".format(phase, index)
             runs.append(run)
             if run["exit_status"] != 0:
                 failed = run
-                if stderr.strip():
-                    _err("verification command stderr: " + redact(stderr))
-                if stdout.strip():
-                    _err("verification command stdout: " + redact(stdout))
                 break
         if failed is None:
             rechecked = git.facts()
@@ -551,12 +564,13 @@ def cmd_record_verification(config, args) -> int:
                 "project": config.project,
                 "pr": args.pr,
                 "commit": commit,
+                "config_digest": config_digest,
                 "outcome": "PASSED",
                 "started_at": runs[0]["started_at"],
                 "ended_at": runs[-1]["ended_at"],
                 "commands": runs,
             }
-            store.write_verification(commit, record)
+            store.write_verification(commit, config_digest, record)
             return EXIT_OK
         store.append_event(
             VERIFICATION_EVENT,
@@ -639,36 +653,107 @@ def _require_projection_adapter(path):
 
 
 def _invoke_adapter(argv, timeout):
-    """Invoke the projection adapter as an argv list, never through a shell."""
+    """Invoke the projection adapter as an argv list, never through a shell.
+
+    stdout and stderr are bounded while reading through separate reader
+    threads (T6L-F7); the adapter is terminated and reaped on overflow or
+    timeout, and raw adapter output is never echoed on any CLI stream. Only
+    the bounded stdout (validated later) is returned to the caller.
+    """
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             list(argv),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
-            check=False,
         )
-    except (subprocess.TimeoutExpired, TimeoutError) as error:
-        raise ProjectionFailure(
-            "projection adapter timed out after {0}s".format(timeout)
-        ) from error
     except OSError as error:
         raise ProjectionFailure(
             "cannot run projection adapter: {0}".format(redact(str(error)))
         ) from error
-    if proc.returncode != 0:
-        if proc.stderr.strip():
-            _err("projection adapter stderr: " + redact(proc.stderr))
-        if proc.stdout.strip():
-            _err("projection adapter stdout: " + redact(proc.stdout))
+
+    stdout_parts = []
+    stderr_parts = []
+    overflow = []
+
+    def _drain(stream, sink, limit, name):
+        try:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    break
+                sink.append(chunk)
+                if sum(len(part) for part in sink) > limit:
+                    overflow.append(name)
+                    break
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    stdout_thread = threading.Thread(
+        target=_drain,
+        args=(proc.stdout, stdout_parts, PROJECTION_STDOUT_MAX_BYTES, "stdout"),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_drain,
+        args=(proc.stderr, stderr_parts, PROJECTION_STDERR_MAX_BYTES, "stderr"),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except (subprocess.TimeoutExpired, TimeoutError):
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
         raise ProjectionFailure(
-            "projection adapter exited with status {0}".format(proc.returncode)
+            "projection adapter timed out after {0}s".format(timeout)
         )
-    return proc.stdout
+    if overflow:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        raise ProjectionFailure(
+            "projection adapter output exceeded the bounded stream limit"
+        )
+    stdout_thread.join()
+    stderr_thread.join()
+    stdout = "".join(stdout_parts)
+    stderr = "".join(stderr_parts)
+    if returncode != 0:
+        _err(
+            "projection adapter exited with status {0}".format(returncode)
+        )
+        if stderr.strip():
+            _err(
+                "projection adapter stderr (bounded): "
+                + redact(stderr[:PROJECTION_STDERR_MAX_BYTES])
+            )
+        raise ProjectionFailure(
+            "projection adapter exited with status {0}".format(returncode)
+        )
+    return stdout
 
 
 def _parse_adapter_result(stdout, mode):
-    """Validate the versioned JSON result of a projection adapter run."""
+    """Validate the versioned JSON result of a projection adapter run.
+
+    The version-1 contract is strict and bounded (T6L-F7): unknown result
+    keys are rejected, and ``changes`` must be an array of exactly
+    ``{type, summary}`` objects whose type is a documented projection change
+    type, whose summary is a bounded non-empty string, and whose count does
+    not exceed ``PROJECTION_MAX_CHANGES``. Arbitrary scalars or opaque
+    objects are never accepted.
+    """
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError as error:
@@ -677,6 +762,13 @@ def _parse_adapter_result(stdout, mode):
         )
     if not isinstance(data, dict):
         raise ProjectionFailure("projection adapter must return a JSON object")
+    unknown = sorted(key for key in data if key not in PROJECTION_RESULT_ALLOWED_KEYS)
+    if unknown:
+        raise ProjectionFailure(
+            "projection adapter result carries unknown key(s): {0}".format(
+                ", ".join(unknown)
+            )
+        )
     schema_version = data.get("schema_version")
     if (
         not isinstance(schema_version, int)
@@ -694,6 +786,40 @@ def _parse_adapter_result(stdout, mode):
     changes = data.get("changes")
     if not isinstance(changes, list):
         raise ProjectionFailure("projection adapter result must declare a changes array")
+    if len(changes) > PROJECTION_MAX_CHANGES:
+        raise ProjectionFailure(
+            "projection adapter result changes exceed the bound of {0}".format(
+                PROJECTION_MAX_CHANGES
+            )
+        )
+    for index, change in enumerate(changes):
+        if not isinstance(change, dict):
+            raise ProjectionFailure(
+                "projection change at index {0} must be an object".format(index)
+            )
+        unknown_change = sorted(
+            key for key in change if key not in PROJECTION_CHANGE_ALLOWED_KEYS
+        )
+        if unknown_change:
+            raise ProjectionFailure(
+                "projection change at index {0} carries unknown key(s): {1}".format(
+                    index, ", ".join(unknown_change)
+                )
+            )
+        change_type = change.get("type")
+        if change_type not in PROJECTION_CHANGE_TYPES:
+            raise ProjectionFailure(
+                "projection change at index {0} has unknown type {1!r}".format(
+                    index, change_type
+                )
+            )
+        summary = change.get("summary")
+        if not isinstance(summary, str) or not (1 <= len(summary) <= PROJECTION_CHANGE_SUMMARY_MAX):
+            raise ProjectionFailure(
+                "projection change at index {0} summary must be a string of 1..{1} chars".format(
+                    index, PROJECTION_CHANGE_SUMMARY_MAX
+                )
+            )
     if mode == "dry-run" and applied:
         raise ProjectionFailure("dry-run must report applied: false")
     if mode == "apply" and not applied:
@@ -739,10 +865,10 @@ def cmd_sync(config, args) -> int:
     stdout = _invoke_adapter(argv, PROJECTION_ADAPTER_TIMEOUT)
     result = _parse_adapter_result(stdout, mode)
     sys.stdout.write(
-        "state={0}\nprojection {1}: {2}\n".format(
+        "state={0}\nprojection {1}: changes={2}\n".format(
             decision.state.value,
-            "applied" if mode == "apply" else "changes",
-            redact(json.dumps(result, sort_keys=True)),
+            "applied" if mode == "apply" else "dry-run",
+            len(result["changes"]),
         )
     )
     return EXIT_OK
@@ -845,6 +971,8 @@ def main(argv: Optional[list] = None) -> int:
         return _fail(EXIT_COMMAND_FAILED, error)
     except ProjectionFailure as error:
         return _fail(EXIT_COMMAND_FAILED, error)
+    except ValueError as error:
+        return _fail(EXIT_INVALID_INPUT, error)
 
 
 if __name__ == "__main__":

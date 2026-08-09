@@ -9,11 +9,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from pr_closure.contract import command_sequence_digest
 from pr_closure.store import (
     COMMIT_EVENT,
     REVIEW_EVENT,
     VERIFICATION_EVENT,
-    ApprovalState,
     EvidenceConflict,
     ForbiddenEvidencePath,
     MalformedEvidence,
@@ -30,20 +30,30 @@ COMMIT_C = "c" * 40
 CACHE_BASE = Path.home() / ".cache" / "pr-closure-store-test"
 
 
-def _verification_record(commit=COMMIT_A, commands=None):
-    """PASSED record in the digest-bound command format (C6D-F4/C6D-F2)."""
+def _verification_record(
+    commit=COMMIT_A,
+    config_digest=None,
+    commands=None,
+    started_at="2026-08-08T12:00:00+00:00",
+    ended_at="2026-08-08T12:00:01+00:00",
+):
+    """PASSED attempt record in the digest-bound command format (C6D-F4/C6D-F2).
+
+    Carries the immutable ``config_digest`` identity so multiple attempts and
+    configurations can coexist at one commit (T6L-F2).
+    """
     if commands is None:
-        commands = (
-            ("local_review_ready", "typecheck"),
-            ("closure_acceptance", "acceptance"),
-        )
+        commands = DEFAULT_COMMANDS
+    if config_digest is None:
+        config_digest = _config_digest_of(commands)
     return {
         "schema_version": 1,
         "commit": commit,
-        "completed_at": "2026-08-08T12:00:00+00:00",
+        "config_digest": config_digest,
+        "completed_at": started_at,
         "outcome": "PASSED",
         "commands": [
-            _command_entry(phase, command, index)
+            _command_entry(phase, command, index, started_at=started_at, ended_at=ended_at)
             for index, (phase, command) in enumerate(commands, start=1)
         ],
     }
@@ -67,13 +77,32 @@ def _digest(text):
     return hashlib.sha256(text).hexdigest()
 
 
-def _command_entry(phase, command, index, exit_status=0):
+
+def _config_digest_of(commands):
+    """Immutable config identity of an ordered (phase, command) sequence."""
+    return command_sequence_digest(
+        tuple((phase, _digest(command)) for phase, command in commands)
+    )
+
+
+DEFAULT_COMMANDS = (
+    ("local_review_ready", "typecheck"),
+    ("closure_acceptance", "acceptance"),
+)
+DEFAULT_CONFIG_DIGEST = _config_digest_of(DEFAULT_COMMANDS)
+
+
+def _command_entry(
+    phase, command, index, exit_status=0,
+    started_at="2026-08-08T12:00:00+00:00",
+    ended_at="2026-08-08T12:00:01+00:00",
+):
     return {
         "phase": phase,
         "command_digest": _digest(command),
         "command_label": "{0}:{1}".format(phase, index),
-        "started_at": "2026-08-08T12:00:00+00:00",
-        "ended_at": "2026-08-08T12:00:01+00:00",
+        "started_at": started_at,
+        "ended_at": ended_at,
         "exit_status": exit_status,
     }
 
@@ -90,6 +119,56 @@ def _expected_commands(commands=None):
             ("closure_acceptance", "acceptance"),
         )
     return tuple((phase, _digest(command)) for phase, command in commands)
+
+
+class _ApprovalSignal:
+    """Test-only projection of the removed store-only approval authority.
+
+    Approval now lives in the CLI's live snapshot (T6L-F1); at the store seam
+    the canonical inputs are the exact-sequence bound verification and the
+    bound review set. Malformed, missing-target, or contradictory evidence
+    raises :class:`MalformedEvidence` instead of a weak "unverified" signal.
+    """
+
+    UNVERIFIED = "unverified"
+    APPROVED = "approved"
+    STALE = "stale"
+
+
+def _approval_signal(store, commit, expected_commands=None):
+    """Store-level canonical approximation of approval for legacy tests."""
+    if expected_commands is None:
+        expected_commands = _expected_commands()
+    verification = store.bound_verification(commit, expected_commands)
+    reviews = store.bound_reviews(commit)
+    current = store.current_commit()
+    if verification is None or not reviews:
+        return _ApprovalSignal.UNVERIFIED
+    if current == commit:
+        return _ApprovalSignal.APPROVED
+    if current is None:
+        return _ApprovalSignal.UNVERIFIED
+    return _ApprovalSignal.STALE
+
+
+def _single_verification_path(store, commit):
+    """The single verification attempt path for ``commit`` (legacy helper)."""
+    paths = store.verification_paths(commit)
+    if len(paths) != 1:
+        raise AssertionError(
+            "expected exactly one verification attempt at {0}, found {1}".format(
+                commit, len(paths)
+            )
+        )
+    return paths[0]
+
+
+def _write_verification(store, commit, record=None):
+    """Write a PASSED verification attempt with its own config identity."""
+    if record is None:
+        record = _verification_record(commit=commit)
+    digest = record.get("config_digest") or DEFAULT_CONFIG_DIGEST
+    return store.write_verification(commit, digest, record)
 
 
 class StoreTestCase(unittest.TestCase):
@@ -159,7 +238,7 @@ class AppendOnlyEventTests(StoreTestCase):
     def test_appending_does_not_rewrite_prior_bytes(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
-        store.write_verification(COMMIT_A, _verification_record())
+        _write_verification(store, COMMIT_A)
         first = store.events_path.read_bytes()
         store.write_review(COMMIT_A, "review-1", _review_record())
         store.record_commit(COMMIT_B, self.durable_file("tip-b"))
@@ -173,7 +252,7 @@ class AppendOnlyEventTests(StoreTestCase):
     def test_every_event_carries_the_required_keys(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
-        store.write_verification(COMMIT_A, _verification_record())
+        _write_verification(store, COMMIT_A)
         store.write_review(COMMIT_A, "review-1", _review_record())
         events = store.read_events()
         self.assertEqual({COMMIT_EVENT, VERIFICATION_EVENT, REVIEW_EVENT}, {e["event_type"] for e in events})
@@ -197,11 +276,11 @@ class AppendOnlyEventTests(StoreTestCase):
     def test_record_writes_append_evidence_events(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
-        store.write_verification(COMMIT_A, _verification_record())
+        _write_verification(store, COMMIT_A)
         store.write_review(COMMIT_A, "review-1", _review_record())
         events = store.read_events()
         self.assertEqual([COMMIT_EVENT, VERIFICATION_EVENT, REVIEW_EVENT], [e["event_type"] for e in events])
-        self.assertEqual(str(store.verification_path(COMMIT_A)), events[1]["evidence_path"])
+        self.assertEqual(str(_single_verification_path(store, COMMIT_A)), events[1]["evidence_path"])
         self.assertEqual(str(store.review_path(COMMIT_A, "review-1")), events[2]["evidence_path"])
         self.assertEqual(COMMIT_A, events[1]["commit"])
         self.assertEqual(COMMIT_A, events[2]["commit"])
@@ -229,13 +308,15 @@ class AppendOnlyEventTests(StoreTestCase):
 
 
 class AtomicRecordWriteTests(StoreTestCase):
-    def test_verification_lives_at_verification_commit_json(self):
+    def test_verification_lives_at_commit_config_attempt_path(self):
         store = RunStore(self.root, "proj", 42)
-        store.write_verification(COMMIT_A, _verification_record())
-        path = store.verification_path(COMMIT_A)
+        _write_verification(store, COMMIT_A)
+        path = _single_verification_path(store, COMMIT_A)
         self.assertTrue(path.is_file())
-        self.assertEqual("verification", path.parent.name)
-        self.assertEqual(COMMIT_A + ".json", path.name)
+        self.assertEqual("verification", path.parent.parent.parent.name)
+        self.assertEqual(COMMIT_A, path.parent.parent.name)
+        self.assertEqual(DEFAULT_CONFIG_DIGEST, path.parent.name)
+        self.assertRegex(path.name, r"^[0-9a-f]{64}\.json$")
         self.assertEqual(_verification_record(), json.loads(path.read_text()))
         self.assertEqual([path.name], [p.name for p in path.parent.iterdir()])
 
@@ -251,10 +332,10 @@ class AtomicRecordWriteTests(StoreTestCase):
 
     def test_atomic_write_leaves_no_temporary_files_behind(self):
         store = RunStore(self.root, "proj", 42)
-        store.write_verification(COMMIT_A, _verification_record())
+        _write_verification(store, COMMIT_A)
         store.write_review(COMMIT_A, "review-1", _review_record())
         leftovers = []
-        for directory in (store.base_dir, store.verification_path(COMMIT_A).parent, store.review_dir(COMMIT_A)):
+        for directory in (store.base_dir, store.verification_dir(COMMIT_A), store.review_dir(COMMIT_A)):
             leftovers.extend(str(p) for p in directory.glob("*.tmp*"))
             leftovers.extend(str(p) for p in directory.glob(".tmp*"))
         self.assertEqual([], leftovers)
@@ -262,11 +343,22 @@ class AtomicRecordWriteTests(StoreTestCase):
     def test_verification_is_never_silently_overwritten(self):
         store = RunStore(self.root, "proj", 42)
         record = _verification_record()
-        store.write_verification(COMMIT_A, record)
-        store.write_verification(COMMIT_A, record)
-        with self.assertRaises(EvidenceConflict):
-            store.write_verification(COMMIT_A, {"schema_version": 1, "commit": COMMIT_A, "ok": False})
-        self.assertEqual(record, store.read_verification(COMMIT_A))
+        _write_verification(store, COMMIT_A, record)
+        _write_verification(store, COMMIT_A, record)
+        attempt = _single_verification_path(store, COMMIT_A)
+        self.assertEqual(record, json.loads(attempt.read_text()))
+        verification_events = [
+            e for e in store.read_events() if e["event_type"] == VERIFICATION_EVENT
+        ]
+        self.assertEqual(1, len(verification_events))
+        # A different-byte attempt appends under the same config identity and
+        # never overwrites the original record bytes (T6L-F2 append-only).
+        _write_verification(
+            store, COMMIT_A,
+            _verification_record(started_at="2026-08-08T13:00:00+00:00"),
+        )
+        self.assertEqual(2, len(store.verification_paths(COMMIT_A)))
+        self.assertEqual(record, json.loads(attempt.read_text()))
 
 
 class ReviewIdCollisionTests(StoreTestCase):
@@ -341,27 +433,27 @@ class StaleApprovalTests(StoreTestCase):
     def test_newer_commit_event_invalidates_older_approval(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
-        store.write_verification(COMMIT_A, _verification_record())
+        _write_verification(store, COMMIT_A)
         store.write_review(COMMIT_A, "review-1", _review_record())
-        self.assertEqual(ApprovalState.APPROVED, store.approval_status(COMMIT_A))
+        self.assertEqual(_ApprovalSignal.APPROVED, _approval_signal(store, COMMIT_A))
         store.record_commit(COMMIT_B, self.durable_file("tip-b"))
         self.assertEqual(COMMIT_B, store.current_commit())
-        self.assertEqual(ApprovalState.STALE, store.approval_status(COMMIT_A))
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_B))
+        self.assertEqual(_ApprovalSignal.STALE, _approval_signal(store, COMMIT_A))
+        self.assertEqual(_ApprovalSignal.UNVERIFIED, _approval_signal(store, COMMIT_B))
 
     def test_approval_requires_both_verification_and_review(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
-        store.write_verification(COMMIT_A, _verification_record())
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        self.assertEqual(_ApprovalSignal.UNVERIFIED, _approval_signal(store, COMMIT_A))
+        _write_verification(store, COMMIT_A)
+        self.assertEqual(_ApprovalSignal.UNVERIFIED, _approval_signal(store, COMMIT_A))
         store.write_review(COMMIT_A, "review-1", _review_record())
-        self.assertEqual(ApprovalState.APPROVED, store.approval_status(COMMIT_A))
+        self.assertEqual(_ApprovalSignal.APPROVED, _approval_signal(store, COMMIT_A))
 
     def test_unknown_commit_without_any_evidence_is_unverified(self):
         store = RunStore(self.root, "proj", 42)
         self.assertIsNone(store.current_commit())
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        self.assertEqual(_ApprovalSignal.UNVERIFIED, _approval_signal(store, COMMIT_A))
 
 
 class MissingArtifactFailsClosedTests(StoreTestCase):
@@ -369,11 +461,12 @@ class MissingArtifactFailsClosedTests(StoreTestCase):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
         store.write_review(COMMIT_A, "review-1", _review_record())
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
-        store.write_verification(COMMIT_A, _verification_record())
-        self.assertEqual(ApprovalState.APPROVED, store.approval_status(COMMIT_A))
-        store.verification_path(COMMIT_A).unlink()
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        self.assertEqual(_ApprovalSignal.UNVERIFIED, _approval_signal(store, COMMIT_A))
+        _write_verification(store, COMMIT_A)
+        self.assertEqual(_ApprovalSignal.APPROVED, _approval_signal(store, COMMIT_A))
+        _single_verification_path(store, COMMIT_A).unlink()
+        with self.assertRaises(MalformedEvidence):
+            _approval_signal(store, COMMIT_A)
         self.assertFalse(store.verification_exists(COMMIT_A))
 
 
@@ -388,7 +481,7 @@ class MalformedDataFailsClosedTests(StoreTestCase):
         with self.assertRaises(MalformedEvidence):
             store.current_commit()
         with self.assertRaises(MalformedEvidence):
-            store.approval_status(COMMIT_A)
+            _approval_signal(store, COMMIT_A)
 
     def test_non_object_event_line_raises(self):
         store = RunStore(self.root, "proj", 42)
@@ -409,20 +502,24 @@ class MalformedDataFailsClosedTests(StoreTestCase):
     def test_malformed_verification_artifact_raises(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
-        store.write_verification(COMMIT_A, _verification_record())
-        store.verification_path(COMMIT_A).write_text("{broken")
+        _write_verification(store, COMMIT_A)
+        attempt = _single_verification_path(store, COMMIT_A)
+        attempt.write_text("{broken")
         with self.assertRaises(MalformedEvidence):
-            store.read_verification(COMMIT_A)
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+            store.read_verification(COMMIT_A, DEFAULT_CONFIG_DIGEST, attempt.stem)
+        with self.assertRaises(MalformedEvidence):
+            _approval_signal(store, COMMIT_A)
 
     def test_non_object_verification_artifact_raises(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
-        store.write_verification(COMMIT_A, _verification_record())
-        store.verification_path(COMMIT_A).write_text("[1, 2]\n")
+        _write_verification(store, COMMIT_A)
+        attempt = _single_verification_path(store, COMMIT_A)
+        attempt.write_text("[1, 2]\n")
         with self.assertRaises(MalformedEvidence):
-            store.read_verification(COMMIT_A)
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+            store.read_verification(COMMIT_A, DEFAULT_CONFIG_DIGEST, attempt.stem)
+        with self.assertRaises(MalformedEvidence):
+            _approval_signal(store, COMMIT_A)
 
     def test_malformed_review_artifact_raises(self):
         store = RunStore(self.root, "proj", 42)
@@ -431,12 +528,13 @@ class MalformedDataFailsClosedTests(StoreTestCase):
         store.review_path(COMMIT_A, "review-1").write_text("42")
         with self.assertRaises(MalformedEvidence):
             store.read_review(COMMIT_A, "review-1")
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        with self.assertRaises(MalformedEvidence):
+            _approval_signal(store, COMMIT_A)
 
     def test_contradictory_record_commits_are_rejected(self):
         store = RunStore(self.root, "proj", 42)
         with self.assertRaises(MalformedEvidence):
-            store.write_verification(COMMIT_A, _verification_record(COMMIT_B))
+            _write_verification(store, COMMIT_A, _verification_record(COMMIT_B))
         with self.assertRaises(MalformedEvidence):
             store.write_review(COMMIT_A, "review-1", _review_record(COMMIT_B))
 
@@ -447,7 +545,7 @@ class MalformedDataFailsClosedTests(StoreTestCase):
                 with self.assertRaises((StoreError, TypeError)):
                     store.record_commit(bad, self.durable_file("x"))
                 with self.assertRaises((StoreError, TypeError)):
-                    store.approval_status(bad)
+                    store.bound_verification(bad, _expected_commands())
 
 
 class BoundArtifactSeamTests(StoreTestCase):
@@ -461,13 +559,16 @@ class BoundArtifactSeamTests(StoreTestCase):
     def test_bound_verification_returns_event_bound_record(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip"))
-        store.write_verification(COMMIT_A, _verification_record())
+        _write_verification(store, COMMIT_A)
         self.assertEqual(_verification_record(), store.bound_verification(COMMIT_A, _expected_commands()))
 
     def test_orphan_verification_artifact_fails_closed(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip"))
-        self._write_artifact(store.verification_path(COMMIT_A), _verification_record())
+        self._write_artifact(
+            store.verification_dir(COMMIT_A) / "orphan-config" / "orphan.json",
+            _verification_record(),
+        )
         with self.assertRaises(MalformedEvidence):
             store.bound_verification(COMMIT_A, _expected_commands())
 
@@ -481,22 +582,26 @@ class BoundArtifactSeamTests(StoreTestCase):
             str(other),
             content_digest=_digest(b"durable evidence"),
         )
-        self._write_artifact(store.verification_path(COMMIT_A), _verification_record())
+        self._write_artifact(
+            store.verification_dir(COMMIT_A) / "orphan-config" / "orphan.json",
+            _verification_record(),
+        )
         with self.assertRaises(MalformedEvidence):
             store.bound_verification(COMMIT_A, _expected_commands())
 
-    def test_missing_artifact_never_returns_bytes(self):
+    def test_missing_artifact_fails_closed(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip"))
-        store.write_verification(COMMIT_A, _verification_record())
-        store.verification_path(COMMIT_A).unlink()
-        self.assertIsNone(store.bound_verification(COMMIT_A, _expected_commands()))
+        _write_verification(store, COMMIT_A)
+        _single_verification_path(store, COMMIT_A).unlink()
+        with self.assertRaises(MalformedEvidence):
+            store.bound_verification(COMMIT_A, _expected_commands())
 
     def test_symlink_replacement_fails_closed(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip"))
-        store.write_verification(COMMIT_A, _verification_record())
-        target = store.verification_path(COMMIT_A)
+        _write_verification(store, COMMIT_A)
+        target = _single_verification_path(store, COMMIT_A)
         decoy = self.root / "decoy.json"
         decoy.write_text(json.dumps(_verification_record()))
         target.unlink()
@@ -507,8 +612,8 @@ class BoundArtifactSeamTests(StoreTestCase):
     def test_replaced_record_with_contradictory_commit_fails_closed(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip"))
-        store.write_verification(COMMIT_A, _verification_record())
-        target = store.verification_path(COMMIT_A)
+        _write_verification(store, COMMIT_A)
+        target = _single_verification_path(store, COMMIT_A)
         replaced = dict(_verification_record(COMMIT_A), commit=COMMIT_B)
         target.write_text(_serialize(replaced).decode())
         with self.assertRaises(MalformedEvidence):
@@ -517,8 +622,8 @@ class BoundArtifactSeamTests(StoreTestCase):
     def test_failed_outcome_artifact_is_never_authority(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip"))
-        store.write_verification(COMMIT_A, _verification_record())
-        target = store.verification_path(COMMIT_A)
+        _write_verification(store, COMMIT_A)
+        target = _single_verification_path(store, COMMIT_A)
         failed = dict(_verification_record(), outcome="FAILED")
         target.write_text(_serialize(failed).decode())
         with self.assertRaises(MalformedEvidence):
@@ -537,8 +642,13 @@ class BoundArtifactSeamTests(StoreTestCase):
                 store = RunStore(root, "proj", 42)
                 store.record_commit(COMMIT_A, self.durable_file("tip"))
                 mutated = dict(_verification_record(), commands=commands)
-                self._write_artifact(store.verification_path(COMMIT_A), mutated)
-                store.write_verification(COMMIT_A, mutated)
+                mutated["config_digest"] = command_sequence_digest(
+                    tuple(
+                        (entry["phase"], entry.get("command_digest") or ("0" * 64))
+                        for entry in commands
+                    )
+                )
+                _write_verification(store, COMMIT_A, mutated)
                 if expected is None:
                     self.assertIsNone(
                         store.bound_verification(COMMIT_A, _expected_commands())
@@ -597,9 +707,9 @@ class ConcurrencyAndPermissionsTests(StoreTestCase):
 
     def test_record_files_are_created_0600(self):
         store = RunStore(self.root, "proj", 42)
-        store.write_verification(COMMIT_A, _verification_record())
+        _write_verification(store, COMMIT_A)
         store.write_review(COMMIT_A, "review-1", _review_record())
-        self.assertEqual(0o600, store.verification_path(COMMIT_A).stat().st_mode & 0o777)
+        self.assertEqual(0o600, _single_verification_path(store, COMMIT_A).stat().st_mode & 0o777)
         self.assertEqual(0o600, store.review_path(COMMIT_A, "review-1").stat().st_mode & 0o777)
 
     def test_concurrent_appends_are_not_corrupted(self):
@@ -790,7 +900,7 @@ class ReadEventsBindsEnvelopeTests(StoreTestCase):
         with self.assertRaises(MalformedEvidence):
             store.current_commit()
         with self.assertRaises(MalformedEvidence):
-            store.approval_status(COMMIT_A)
+            _approval_signal(store, COMMIT_A)
 
     def test_read_binds_valid_envelope_values(self):
         store = RunStore(self.root, "proj", 42)
@@ -807,34 +917,35 @@ class ReadEventsBindsEnvelopeTests(StoreTestCase):
 class TipObservedBeforeApprovalTests(StoreTestCase):
     def test_approval_requires_an_observed_pushed_tip(self):
         store = RunStore(self.root, "proj", 42)
-        store.write_verification(COMMIT_A, _verification_record())
+        _write_verification(store, COMMIT_A)
         store.write_review(COMMIT_A, "review-1", _review_record())
         self.assertIsNone(store.current_commit())
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        self.assertEqual(_ApprovalSignal.UNVERIFIED, _approval_signal(store, COMMIT_A))
 
     def test_approval_is_approved_once_the_tip_is_observed(self):
         store = RunStore(self.root, "proj", 42)
-        store.write_verification(COMMIT_A, _verification_record())
+        _write_verification(store, COMMIT_A)
         store.write_review(COMMIT_A, "review-1", _review_record())
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
-        self.assertEqual(ApprovalState.APPROVED, store.approval_status(COMMIT_A))
+        self.assertEqual(_ApprovalSignal.APPROVED, _approval_signal(store, COMMIT_A))
 
     def test_missing_current_tip_evidence_never_approves(self):
         store = RunStore(self.root, "proj", 42)
-        store.write_verification(COMMIT_A, _verification_record())
+        _write_verification(store, COMMIT_A)
         store.write_review(COMMIT_A, "review-1", _review_record())
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        self.assertIsNone(store.current_commit())
+        self.assertEqual(_ApprovalSignal.UNVERIFIED, _approval_signal(store, COMMIT_A))
+        self.assertEqual(_ApprovalSignal.UNVERIFIED, _approval_signal(store, COMMIT_B))
 
     def test_stale_requires_valid_artifacts_for_the_queried_commit(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
         store.record_commit(COMMIT_B, self.durable_file("tip-b"))
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
-        store.write_verification(COMMIT_A, _verification_record())
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        self.assertEqual(_ApprovalSignal.UNVERIFIED, _approval_signal(store, COMMIT_A))
+        _write_verification(store, COMMIT_A)
+        self.assertEqual(_ApprovalSignal.UNVERIFIED, _approval_signal(store, COMMIT_A))
         store.write_review(COMMIT_A, "review-1", _review_record())
-        self.assertEqual(ApprovalState.STALE, store.approval_status(COMMIT_A))
+        self.assertEqual(_ApprovalSignal.STALE, _approval_signal(store, COMMIT_A))
 
 
 class OrphanEvidenceFailsClosedTests(StoreTestCase):
@@ -846,9 +957,9 @@ class OrphanEvidenceFailsClosedTests(StoreTestCase):
         os.chmod(store.events_path, 0o400)
         try:
             with self.assertRaises(OSError):
-                store.write_verification(COMMIT_A, _verification_record())
-            self.assertFalse(store.verification_path(COMMIT_A).exists())
-            self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+                _write_verification(store, COMMIT_A)
+            self.assertEqual((), store.verification_paths(COMMIT_A))
+            self.assertEqual(_ApprovalSignal.UNVERIFIED, _approval_signal(store, COMMIT_A))
         finally:
             os.chmod(store.events_path, 0o600)
 
@@ -858,53 +969,65 @@ class OrphanEvidenceFailsClosedTests(StoreTestCase):
         os.chmod(store.events_path, 0o400)
         try:
             with self.assertRaises(OSError):
-                store.write_verification(COMMIT_A, _verification_record())
+                _write_verification(store, COMMIT_A)
         finally:
             os.chmod(store.events_path, 0o600)
-        store.write_verification(COMMIT_A, _verification_record())
+        _write_verification(store, COMMIT_A)
         store.write_review(COMMIT_A, "review-1", _review_record())
         self.assertEqual(
             [COMMIT_EVENT, VERIFICATION_EVENT, REVIEW_EVENT],
             [e["event_type"] for e in store.read_events()],
         )
-        self.assertEqual(ApprovalState.APPROVED, store.approval_status(COMMIT_A))
+        self.assertEqual(_ApprovalSignal.APPROVED, _approval_signal(store, COMMIT_A))
 
     def test_orphan_artifacts_without_matching_events_never_approve(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
-        self._write_artifact(store.verification_path(COMMIT_A), _verification_record())
+        self._write_artifact(
+            store.verification_dir(COMMIT_A) / "orphan-config" / "orphan.json",
+            _verification_record(),
+        )
         self._write_artifact(store.review_path(COMMIT_A, "review-1"), _review_record())
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        with self.assertRaises(MalformedEvidence):
+            _approval_signal(store, COMMIT_A)
 
     def test_failed_repair_append_leaves_an_orphan_that_cannot_approve(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
-        self._write_artifact(store.verification_path(COMMIT_A), _verification_record())
+        self._write_artifact(
+            store.verification_path(COMMIT_A, DEFAULT_CONFIG_DIGEST, "f" * 64),
+            _verification_record(),
+        )
         os.chmod(store.events_path, 0o400)
         try:
             with self.assertRaises(OSError):
-                store.write_verification(COMMIT_A, _verification_record())
-            self.assertTrue(store.verification_path(COMMIT_A).is_file())
-            self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+                _write_verification(store, COMMIT_A)
+            self.assertTrue(store.verification_paths(COMMIT_A))
+            with self.assertRaises(MalformedEvidence):
+                _approval_signal(store, COMMIT_A)
         finally:
             os.chmod(store.events_path, 0o600)
 
     def test_identical_retry_repairs_a_missing_event(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
-        self._write_artifact(store.verification_path(COMMIT_A), _verification_record())
-        store.write_verification(COMMIT_A, _verification_record())
+        attempt_id = hashlib.sha256(_serialize(_verification_record())).hexdigest()
+        self._write_artifact(
+            store.verification_path(COMMIT_A, DEFAULT_CONFIG_DIGEST, attempt_id),
+            _verification_record(),
+        )
+        _write_verification(store, COMMIT_A)
         self.assertEqual(
             [COMMIT_EVENT, VERIFICATION_EVENT], [e["event_type"] for e in store.read_events()]
         )
-        store.write_verification(COMMIT_A, _verification_record())
+        _write_verification(store, COMMIT_A)
         self.assertEqual(2, len(store.read_events()))
 
     def test_already_complete_identical_write_adds_no_duplicate_event(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
-        store.write_verification(COMMIT_A, _verification_record())
-        store.write_verification(COMMIT_A, _verification_record())
+        _write_verification(store, COMMIT_A)
+        _write_verification(store, COMMIT_A)
         self.assertEqual(
             [COMMIT_EVENT, VERIFICATION_EVENT], [e["event_type"] for e in store.read_events()]
         )
@@ -914,9 +1037,10 @@ class OrphanEvidenceFailsClosedTests(StoreTestCase):
         self.addCleanup(shutil.rmtree, session, ignore_errors=True)
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
-        os.symlink(session, store.verification_path(COMMIT_A).parent)
+        store.verification_dir(COMMIT_A).parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(session, store.verification_dir(COMMIT_A))
         with self.assertRaises(ForbiddenEvidencePath):
-            store.write_verification(COMMIT_A, _verification_record())
+            _write_verification(store, COMMIT_A)
         self.assertEqual([], list(session.iterdir()))
 
     def test_write_rejects_reviews_dir_symlinked_into_tmp_before_any_write(self):
@@ -932,7 +1056,10 @@ class OrphanEvidenceFailsClosedTests(StoreTestCase):
     def test_approval_requires_a_matching_verification_event_for_the_resolved_path(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
-        self._write_artifact(store.verification_path(COMMIT_A), _verification_record())
+        self._write_artifact(
+            store.verification_dir(COMMIT_A) / "orphan-config" / "orphan.json",
+            _verification_record(),
+        )
         self._write_artifact(store.review_path(COMMIT_A, "review-1"), _review_record())
         store.append_event(
             VERIFICATION_EVENT,
@@ -946,16 +1073,18 @@ class OrphanEvidenceFailsClosedTests(StoreTestCase):
             str(store.review_path(COMMIT_A, "review-1")),
             content_digest=_digest(_serialize(_review_record())),
         )
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        with self.assertRaises(MalformedEvidence):
+            _approval_signal(store, COMMIT_A)
 
     def test_approval_requires_a_matching_review_event(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
-        store.write_verification(COMMIT_A, _verification_record())
+        _write_verification(store, COMMIT_A)
         self._write_artifact(store.review_path(COMMIT_A, "review-1"), _review_record())
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        with self.assertRaises(MalformedEvidence):
+            _approval_signal(store, COMMIT_A)
         store.write_review(COMMIT_A, "review-1", _review_record())
-        self.assertEqual(ApprovalState.APPROVED, store.approval_status(COMMIT_A))
+        self.assertEqual(_ApprovalSignal.APPROVED, _approval_signal(store, COMMIT_A))
 
 
 class ConcurrentRecordWriteTests(StoreTestCase):
@@ -997,7 +1126,7 @@ class ConcurrentRecordWriteTests(StoreTestCase):
     def test_concurrent_identical_review_bytes_may_both_succeed_idempotently(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
-        store.write_verification(COMMIT_A, _verification_record())
+        _write_verification(store, COMMIT_A)
         barrier = threading.Barrier(2)
         outcomes = []
 
@@ -1017,30 +1146,38 @@ class ConcurrentRecordWriteTests(StoreTestCase):
         self.assertEqual({COMMIT_EVENT, VERIFICATION_EVENT, REVIEW_EVENT}, {e["event_type"] for e in events})
         for event in events:
             self.assertIn(event["event_type"], (COMMIT_EVENT, VERIFICATION_EVENT, REVIEW_EVENT))
-        self.assertEqual(ApprovalState.APPROVED, store.approval_status(COMMIT_A))
+        self.assertEqual(_ApprovalSignal.APPROVED, _approval_signal(store, COMMIT_A))
 
-    def test_concurrent_different_verification_bytes_cannot_both_succeed(self):
+    def test_concurrent_different_verification_bytes_coexist_as_attempts(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip-a"))
         original = _verification_record()
-        changed = dict(original, commands=[{"command": "pytest", "exit_code": 1}])
+        changed = dict(
+            original,
+            commands=[_command_entry("local_review_ready", "pytest", 1)],
+        )
         barrier = threading.Barrier(2)
         outcomes = []
 
         def worker(record):
             barrier.wait()
             try:
-                store.write_verification(COMMIT_A, record)
+                _write_verification(store, COMMIT_A, record)
                 outcomes.append("ok")
             except EvidenceConflict:
                 outcomes.append("conflict")
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             list(pool.map(worker, (original, changed)))
-        self.assertEqual(1, outcomes.count("ok"))
-        self.assertEqual(1, outcomes.count("conflict"))
-        stored = json.loads(store.verification_path(COMMIT_A).read_text())
-        self.assertIn(stored, (original, changed))
+        self.assertEqual(2, outcomes.count("ok"), outcomes)
+        self.assertEqual(0, outcomes.count("conflict"), outcomes)
+        stored = [
+            json.loads(path.read_text()) for path in store.verification_paths(COMMIT_A)
+        ]
+        self.assertEqual(
+            {_serialize(original), _serialize(changed)},
+            {_serialize(record) for record in stored},
+        )
 
     @unittest.skipUnless(hasattr(os, "fork"), "requires os.fork")
     def test_cross_process_different_review_bytes_cannot_both_succeed(self):
@@ -1092,7 +1229,7 @@ class ConfigExactSequenceBindingTests(StoreTestCase):
     def _green(self, commands=None):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip"))
-        store.write_verification(COMMIT_A, _new_verification_record(commands=commands))
+        _write_verification(store, COMMIT_A, _new_verification_record(commands=commands))
         return store
 
     def test_exact_current_sequence_is_green(self):
@@ -1103,7 +1240,7 @@ class ConfigExactSequenceBindingTests(StoreTestCase):
     def test_omitted_command_fails_closed(self):
         store = self._green(commands=(("local_review_ready", "typecheck"),))
         self.assertIsNone(store.bound_verification(COMMIT_A, _expected_commands()))
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        self.assertEqual(_ApprovalSignal.UNVERIFIED, _approval_signal(store, COMMIT_A))
 
     def test_extra_command_fails_closed(self):
         store = self._green(
@@ -1138,7 +1275,7 @@ class ConfigExactSequenceBindingTests(StoreTestCase):
         store.record_commit(COMMIT_A, self.durable_file("tip"))
         record = _new_verification_record()
         record["commands"][1]["exit_status"] = 1
-        store.write_verification(COMMIT_A, record)
+        _write_verification(store, COMMIT_A, record)
         with self.assertRaises(MalformedEvidence):
             store.bound_verification(COMMIT_A, _expected_commands())
 
@@ -1147,7 +1284,7 @@ class ConfigExactSequenceBindingTests(StoreTestCase):
         store.record_commit(COMMIT_A, self.durable_file("tip"))
         record = _new_verification_record()
         record["commands"][0]["exit_status"] = True
-        store.write_verification(COMMIT_A, record)
+        _write_verification(store, COMMIT_A, record)
         with self.assertRaises(MalformedEvidence):
             store.bound_verification(COMMIT_A, _expected_commands())
 
@@ -1174,12 +1311,14 @@ class ContentDigestBindingTests(StoreTestCase):
     def test_verification_event_carries_exact_lowercase_hex_digest(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip"))
-        store.write_verification(COMMIT_A, _new_verification_record())
+        _write_verification(store, COMMIT_A)
         event = store.read_events()[-1]
         digest = event["content_digest"]
         self.assertEqual(64, len(digest))
         self.assertRegex(digest, "^[0-9a-f]{64}$")
-        expected = hashlib.sha256(store.verification_path(COMMIT_A).read_bytes()).hexdigest()
+        expected = hashlib.sha256(
+            _single_verification_path(store, COMMIT_A).read_bytes()
+        ).hexdigest()
         self.assertEqual(expected, digest)
         self.assertEqual(COMMIT_A, event["commit"])
 
@@ -1198,13 +1337,14 @@ class ContentDigestBindingTests(StoreTestCase):
     def test_same_path_regular_file_verification_replacement_fails_closed(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip"))
-        store.write_verification(COMMIT_A, _new_verification_record())
+        _write_verification(store, COMMIT_A)
         replaced = _new_verification_record()
         replaced["commands"][0]["command_label"] = "local_review_ready:9"
-        store.verification_path(COMMIT_A).write_text(_serialize(replaced).decode())
+        _single_verification_path(store, COMMIT_A).write_text(_serialize(replaced).decode())
         with self.assertRaises(MalformedEvidence):
             store.bound_verification(COMMIT_A, _expected_commands())
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        with self.assertRaises(MalformedEvidence):
+            _approval_signal(store, COMMIT_A)
 
     def test_same_path_review_replacement_fails_closed(self):
         store = RunStore(self.root, "proj", 42)
@@ -1214,12 +1354,13 @@ class ContentDigestBindingTests(StoreTestCase):
         store.review_path(COMMIT_A, "r1").write_text(_serialize(replaced).decode())
         with self.assertRaises(MalformedEvidence):
             store.bound_reviews(COMMIT_A)
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        with self.assertRaises(MalformedEvidence):
+            _approval_signal(store, COMMIT_A)
 
     def test_legacy_path_only_verification_event_fails_closed(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip"))
-        store.write_verification(COMMIT_A, _new_verification_record())
+        _write_verification(store, COMMIT_A)
         events = list(store.read_events())
         events[-1].pop("content_digest")
         payload = "".join(json.dumps(event, sort_keys=True) + "\n" for event in events)
@@ -1227,12 +1368,12 @@ class ContentDigestBindingTests(StoreTestCase):
         with self.assertRaises(MalformedEvidence):
             store.bound_verification(COMMIT_A, _expected_commands())
         with self.assertRaises(MalformedEvidence):
-            store.approval_status(COMMIT_A)
+            _approval_signal(store, COMMIT_A)
 
     def test_malformed_digest_event_fails_closed(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip"))
-        store.write_verification(COMMIT_A, _new_verification_record())
+        _write_verification(store, COMMIT_A)
         events = list(store.read_events())
         events[-1]["content_digest"] = "NOT_HEX_DIGEST"
         payload = "".join(json.dumps(event, sort_keys=True) + "\n" for event in events)
@@ -1243,7 +1384,7 @@ class ContentDigestBindingTests(StoreTestCase):
     def test_wrong_digest_event_never_binds_authority(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip"))
-        store.write_verification(COMMIT_A, _new_verification_record())
+        _write_verification(store, COMMIT_A)
         events = list(store.read_events())
         events[-1] = {
             "schema_version": 1,
@@ -1252,26 +1393,27 @@ class ContentDigestBindingTests(StoreTestCase):
             "pr": 42,
             "commit": COMMIT_A,
             "event_type": VERIFICATION_EVENT,
-            "evidence_path": str(store.verification_path(COMMIT_A)),
+            "evidence_path": str(_single_verification_path(store, COMMIT_A)),
             "content_digest": _digest("forged bytes"),
         }
         payload = "".join(json.dumps(event, sort_keys=True) + "\n" for event in events)
         store.events_path.write_text(payload)
         with self.assertRaises(MalformedEvidence):
             store.bound_verification(COMMIT_A, _expected_commands())
-        self.assertEqual(ApprovalState.UNVERIFIED, store.approval_status(COMMIT_A))
+        with self.assertRaises(MalformedEvidence):
+            _approval_signal(store, COMMIT_A)
 
     def test_identical_retry_remains_idempotent_with_digests(self):
         store = RunStore(self.root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip"))
-        store.write_verification(COMMIT_A, _new_verification_record())
-        store.write_verification(COMMIT_A, _new_verification_record())
+        _write_verification(store, COMMIT_A)
+        _write_verification(store, COMMIT_A)
         store.write_review(COMMIT_A, "r1", _review_record())
         events = [e for e in store.read_events() if e["event_type"] == VERIFICATION_EVENT]
         self.assertEqual(1, len(events))
         record = store.bound_verification(COMMIT_A, _expected_commands())
         self.assertEqual("PASSED", record["outcome"])
-        self.assertEqual(ApprovalState.APPROVED, store.approval_status(COMMIT_A))
+        self.assertEqual(_ApprovalSignal.APPROVED, _approval_signal(store, COMMIT_A))
 
     def test_failed_verification_event_needs_no_digest_and_stays_readable(self):
         store = RunStore(self.root, "proj", 42)
@@ -1284,6 +1426,8 @@ class ContentDigestBindingTests(StoreTestCase):
                 "outcome": "FAILED",
                 "failed_command_digest": _digest("boom"),
                 "commands": [_command_entry("local_review_ready", "boom", 1, exit_status=9)],
+                "started_at": "2026-08-08T12:00:00+00:00",
+                "ended_at": "2026-08-08T12:00:01+00:00",
             },
         )
         event = store.read_events()[-1]
@@ -1291,6 +1435,490 @@ class ContentDigestBindingTests(StoreTestCase):
         self.assertNotIn("content_digest", event)
         self.assertEqual(_digest("boom"), event["failed_command_digest"])
 
+
+
+class NoParallelApprovalAuthorityTests(StoreTestCase):
+    """T6L-F1: no weak store-only approval authority remains on the surface."""
+
+    def test_approval_status_helper_is_removed(self):
+        self.assertFalse(hasattr(RunStore, "approval_status"))
+
+    def test_approval_state_enum_is_removed(self):
+        import pr_closure.store as store_module
+
+        self.assertFalse(hasattr(store_module, "ApprovalState"))
+
+    def test_approval_status_is_not_reachable_through_any_public_alias(self):
+        import pr_closure.store as store_module
+
+        public_names = {
+            name
+            for name in dir(store_module)
+            if not name.startswith("_") and "approval" in name.casefold()
+        }
+        self.assertEqual(set(), public_names)
+
+
+class SameTipReverificationStoreTests(StoreTestCase):
+    """T6L-F2: append-only attempt records with immutable config identity."""
+
+    def _store(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip"))
+        return store
+
+    def test_first_pass_lands_under_commit_and_config_digest(self):
+        store = self._store()
+        store.write_verification(COMMIT_A, DEFAULT_CONFIG_DIGEST, _verification_record())
+        paths = store.verification_paths(COMMIT_A)
+        self.assertEqual(1, len(paths))
+        self.assertEqual(DEFAULT_CONFIG_DIGEST, paths[0].parent.name)
+        self.assertEqual(COMMIT_A, paths[0].parent.parent.name)
+        record = store.bound_verification(COMMIT_A, _expected_commands())
+        self.assertEqual("PASSED", record["outcome"])
+        self.assertEqual(DEFAULT_CONFIG_DIGEST, record["config_digest"])
+
+    def test_same_config_rerun_coexists_as_a_distinct_attempt(self):
+        store = self._store()
+        store.write_verification(
+            COMMIT_A, DEFAULT_CONFIG_DIGEST,
+            _verification_record(started_at="2026-08-08T12:00:00+00:00"),
+        )
+        store.write_verification(
+            COMMIT_A, DEFAULT_CONFIG_DIGEST,
+            _verification_record(started_at="2026-08-08T13:00:00+00:00"),
+        )
+        self.assertEqual(2, len(store.verification_paths(COMMIT_A)))
+        events = [e for e in store.read_events() if e["event_type"] == VERIFICATION_EVENT]
+        self.assertEqual(2, len(events))
+        record = store.bound_verification(COMMIT_A, _expected_commands())
+        self.assertEqual("PASSED", record["outcome"])
+        self.assertEqual("2026-08-08T13:00:00+00:00", record["commands"][0]["started_at"])
+
+    def test_changed_config_rerun_coexists_under_a_new_identity(self):
+        store = self._store()
+        old_commands = DEFAULT_COMMANDS
+        new_commands = (
+            ("local_review_ready", "typecheck --strict"),
+            ("closure_acceptance", "acceptance"),
+        )
+        old_digest = _config_digest_of(old_commands)
+        new_digest = _config_digest_of(new_commands)
+        store.write_verification(
+            COMMIT_A, old_digest, _verification_record(config_digest=old_digest, commands=old_commands)
+        )
+        store.write_verification(
+            COMMIT_A, new_digest, _verification_record(config_digest=new_digest, commands=new_commands)
+        )
+        self.assertEqual(2, len(store.verification_paths(COMMIT_A)))
+        self.assertEqual(
+            old_digest,
+            store.bound_verification(COMMIT_A, _expected_commands(old_commands))["config_digest"],
+        )
+        self.assertEqual(
+            new_digest,
+            store.bound_verification(COMMIT_A, _expected_commands(new_commands))["config_digest"],
+        )
+
+    def test_later_failed_attempt_never_supersedes_an_earlier_pass(self):
+        store = self._store()
+        store.write_verification(COMMIT_A, DEFAULT_CONFIG_DIGEST, _verification_record())
+        store.append_event(
+            VERIFICATION_EVENT,
+            COMMIT_A,
+            str(store.events_path),
+            payload={
+                "outcome": "FAILED",
+                "started_at": "2026-08-08T14:00:00+00:00",
+                "ended_at": "2026-08-08T14:00:01+00:00",
+                "commands": [_command_entry("local_review_ready", "boom", 1, exit_status=9)],
+                "failed_command_digest": _digest("boom"),
+            },
+        )
+        record = store.bound_verification(COMMIT_A, _expected_commands())
+        self.assertEqual("PASSED", record["outcome"])
+
+    def test_failed_attempt_then_pass_returns_the_pass(self):
+        store = self._store()
+        store.append_event(
+            VERIFICATION_EVENT,
+            COMMIT_A,
+            str(store.events_path),
+            payload={
+                "outcome": "FAILED",
+                "started_at": "2026-08-08T14:00:00+00:00",
+                "ended_at": "2026-08-08T14:00:01+00:00",
+                "commands": [_command_entry("local_review_ready", "boom", 1, exit_status=9)],
+                "failed_command_digest": _digest("boom"),
+            },
+        )
+        store.write_verification(COMMIT_A, DEFAULT_CONFIG_DIGEST, _verification_record())
+        record = store.bound_verification(COMMIT_A, _expected_commands())
+        self.assertEqual("PASSED", record["outcome"])
+
+    def test_append_only_across_attempts_and_configs(self):
+        store = self._store()
+        store.write_verification(COMMIT_A, DEFAULT_CONFIG_DIGEST, _verification_record())
+        original = {
+            path: path.read_bytes() for path in store.verification_paths(COMMIT_A)
+        }
+        other_digest = _config_digest_of((("local_review_ready", "other"), ("closure_acceptance", "acceptance")))
+        store.write_verification(
+            COMMIT_A, DEFAULT_CONFIG_DIGEST,
+            _verification_record(started_at="2026-08-08T13:00:00+00:00"),
+        )
+        store.write_verification(
+            COMMIT_A, other_digest,
+            _verification_record(
+                config_digest=other_digest,
+                commands=(("local_review_ready", "other"), ("closure_acceptance", "acceptance")),
+            ),
+        )
+        for path, bytes_ in original.items():
+            self.assertEqual(bytes_, path.read_bytes(), path)
+
+
+class VerificationTreeShapeTests(StoreTestCase):
+    """T6L-F6: verification-tree enumeration is strict and fail-closed.
+
+    Every entry under ``verification/<commit>/`` must conform to the exact
+    ``<config-digest>/<attempt-id>.json`` grammar. Legacy flat files,
+    malformed config-directory names, non-directory entries where a config
+    directory is required, non-attempt children inside a valid config
+    directory, and nested/symlink shapes all raise :class:`MalformedEvidence`
+    instead of being silently skipped. Valid multiple config/attempt trees
+    remain accepted.
+    """
+
+    def _store(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip"))
+        return store
+
+    def test_direct_json_file_under_commit_dir_fails_closed(self):
+        store = self._store()
+        store.verification_dir(COMMIT_A).mkdir(parents=True, exist_ok=True)
+        (store.verification_dir(COMMIT_A) / "orphan.json").write_bytes(
+            _serialize(_verification_record())
+        )
+        with self.assertRaises(MalformedEvidence):
+            store.verification_paths(COMMIT_A)
+        with self.assertRaises(MalformedEvidence):
+            store.bound_verification(COMMIT_A, _expected_commands())
+
+    def test_non_directory_entry_where_config_dir_is_required_fails_closed(self):
+        store = self._store()
+        store.verification_dir(COMMIT_A).mkdir(parents=True, exist_ok=True)
+        (store.verification_dir(COMMIT_A) / ("a" * 64)).write_bytes(
+            _serialize(_verification_record())
+        )
+        with self.assertRaises(MalformedEvidence):
+            store.verification_paths(COMMIT_A)
+
+        store = self._store()
+        store.verification_dir(COMMIT_A).mkdir(parents=True, exist_ok=True)
+        session = Path(tempfile.mkdtemp(dir="/tmp"))
+        self.addCleanup(shutil.rmtree, session, ignore_errors=True)
+        os.symlink(session, store.verification_dir(COMMIT_A) / ("b" * 64))
+        with self.assertRaises(MalformedEvidence):
+            store.verification_paths(COMMIT_A)
+
+    def test_config_dir_name_must_be_exact_lowercase_64_hex(self):
+        for bad in (
+            "orphan-config",
+            "ABCDEF",
+            "a" * 63,
+            "a" * 65,
+            ("a" * 63) + "Z",
+            "a" * 64 + "-",
+        ):
+            with self.subTest(name=bad):
+                store = self._store()
+                (store.verification_dir(COMMIT_A) / bad).mkdir(parents=True, exist_ok=True)
+                with self.assertRaises(MalformedEvidence):
+                    store.verification_paths(COMMIT_A)
+
+    def test_non_attempt_child_inside_valid_config_dir_fails_closed(self):
+        for name in (
+            "notes.txt",
+            "attempt.json",
+            "orphan.json",
+            ("f" * 64) + ".txt",
+            ("f" * 64) + ".JSON",
+            ("f" * 64) + ".json.bak",
+        ):
+            with self.subTest(name=name):
+                store = self._store()
+                config_dir = store.verification_dir(COMMIT_A) / DEFAULT_CONFIG_DIGEST
+                config_dir.mkdir(parents=True, exist_ok=True)
+                (config_dir / name).write_bytes(_serialize(_verification_record()))
+                with self.assertRaises(MalformedEvidence):
+                    store.verification_paths(COMMIT_A)
+
+    def test_nested_directory_and_symlink_shape_under_valid_config_dir_fails_closed(self):
+        store = self._store()
+        config_dir = store.verification_dir(COMMIT_A) / DEFAULT_CONFIG_DIGEST
+        config_dir.mkdir(parents=True, exist_ok=True)
+        nested = config_dir / "nested"
+        nested.mkdir(exist_ok=True)
+        (nested / ("f" * 64 + ".json")).write_bytes(_serialize(_verification_record()))
+        with self.assertRaises(MalformedEvidence):
+            store.verification_paths(COMMIT_A)
+
+        store = self._store()
+        config_dir = store.verification_dir(COMMIT_A) / DEFAULT_CONFIG_DIGEST
+        config_dir.mkdir(parents=True, exist_ok=True)
+        decoy = self.root / "decoy.json"
+        decoy.write_bytes(_serialize(_verification_record()))
+        (config_dir / ("f" * 64 + ".json")).symlink_to(decoy)
+        with self.assertRaises(MalformedEvidence):
+            store.verification_paths(COMMIT_A)
+
+    def test_valid_multiple_configs_and_attempts_remain_accepted(self):
+        store = self._store()
+        old_commands = DEFAULT_COMMANDS
+        new_commands = (
+            ("local_review_ready", "typecheck --strict"),
+            ("closure_acceptance", "acceptance"),
+        )
+        old_digest = _config_digest_of(old_commands)
+        new_digest = _config_digest_of(new_commands)
+        store.write_verification(
+            COMMIT_A, old_digest,
+            _verification_record(config_digest=old_digest, commands=old_commands),
+        )
+        store.write_verification(
+            COMMIT_A, old_digest,
+            _verification_record(
+                config_digest=old_digest,
+                commands=old_commands,
+                started_at="2026-08-08T13:00:00+00:00",
+            ),
+        )
+        store.write_verification(
+            COMMIT_A, new_digest,
+            _verification_record(config_digest=new_digest, commands=new_commands),
+        )
+        paths = store.verification_paths(COMMIT_A)
+        self.assertEqual(3, len(paths))
+        self.assertEqual({old_digest, new_digest}, {p.parent.name for p in paths})
+        self.assertEqual(3, len({p.name for p in paths}))
+        self.assertEqual(
+            old_digest,
+            store.bound_verification(COMMIT_A, _expected_commands(old_commands))["config_digest"],
+        )
+        self.assertEqual(
+            new_digest,
+            store.bound_verification(COMMIT_A, _expected_commands(new_commands))["config_digest"],
+        )
+
+
+class PinnedArtifactReadTests(StoreTestCase):
+    """T6L-F4: descriptor-pinned no-follow reads with identity re-check."""
+
+    def _bound_store(self, record=None):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip"))
+        store.write_verification(COMMIT_A, DEFAULT_CONFIG_DIGEST, record or _verification_record())
+        paths = store.verification_paths(COMMIT_A)
+        self.assertEqual(1, len(paths))
+        return store, paths[0]
+
+    def _fd_count(self):
+        return len(os.listdir("/proc/self/fd"))
+
+    @unittest.skipUnless(os.path.isdir("/proc/self/fd"), "requires /proc/self/fd")
+    def test_every_descriptor_is_closed(self):
+        store, _ = self._bound_store()
+        before = self._fd_count()
+        for _ in range(25):
+            store.bound_verification(COMMIT_A, _expected_commands())
+        self.assertEqual(before, self._fd_count())
+
+    def test_same_path_swap_after_read_is_rejected(self):
+        store, target = self._bound_store()
+        decoy = self.root / "decoy.json"
+        decoy.write_bytes(_serialize(_verification_record(commit=COMMIT_B)))
+        original_lstat = os.lstat
+
+        def swapped(path):
+            if os.fspath(path) == os.fspath(target):
+                return original_lstat(os.fspath(decoy))
+            return original_lstat(path)
+
+        import unittest.mock as mock
+
+        with mock.patch("pr_closure.store.os.lstat", side_effect=swapped):
+            with self.assertRaises(MalformedEvidence):
+                store.bound_verification(COMMIT_A, _expected_commands())
+
+    def test_content_swap_during_read_is_rejected(self):
+        store, target = self._bound_store()
+        replacement = _serialize(_verification_record(commit=COMMIT_B))
+        original_read = os.read
+
+        class _SwapOnce:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, fd, size):
+                self.calls += 1
+                if self.calls == 1:
+                    return replacement
+                return b""
+
+        import unittest.mock as mock
+
+        with mock.patch("pr_closure.store.os.read", side_effect=_SwapOnce()):
+            with self.assertRaises(MalformedEvidence):
+                store.bound_verification(COMMIT_A, _expected_commands())
+
+    def test_symlink_target_is_rejected_by_no_follow_open(self):
+        store, target = self._bound_store()
+        decoy = self.root / "decoy-link.json"
+        decoy.write_bytes(_serialize(_verification_record()))
+        target.unlink()
+        os.symlink(decoy, target)
+        with self.assertRaises(MalformedEvidence):
+            store.bound_verification(COMMIT_A, _expected_commands())
+
+    def test_multi_link_regular_file_is_rejected(self):
+        store, target = self._bound_store()
+        hard = self.root / "hard.json"
+        os.link(target, hard)
+        try:
+            with self.assertRaises(MalformedEvidence):
+                store.bound_verification(COMMIT_A, _expected_commands())
+        finally:
+            os.unlink(hard)
+
+
+class EventArtifactRelationTests(StoreTestCase):
+    """T6L-F5: the complete event/artifact relation is validated both ways."""
+
+    def _approved(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip"))
+        store.write_verification(COMMIT_A, DEFAULT_CONFIG_DIGEST, _verification_record())
+        store.write_review(COMMIT_A, "r1", _review_record())
+        return store
+
+    def test_review_event_with_missing_target_fails_closed(self):
+        store = self._approved()
+        store.append_event(
+            REVIEW_EVENT,
+            COMMIT_A,
+            str(store.review_path(COMMIT_A, "ghost")),
+            content_digest=_digest(b"ghost bytes"),
+        )
+        with self.assertRaises(MalformedEvidence):
+            store.bound_reviews(COMMIT_A)
+
+    def test_verification_event_with_missing_target_fails_closed(self):
+        store = self._approved()
+        store.append_event(
+            VERIFICATION_EVENT,
+            COMMIT_A,
+            str(store.verification_path(COMMIT_A, DEFAULT_CONFIG_DIGEST, "f" * 64)),
+            content_digest=_digest(b"ghost bytes"),
+            config_digest=DEFAULT_CONFIG_DIGEST,
+        )
+        with self.assertRaises(MalformedEvidence):
+            store.bound_verification(COMMIT_A, _expected_commands())
+
+    def test_conflicting_digest_event_for_the_same_path_fails_closed(self):
+        store = self._approved()
+        target = store.verification_paths(COMMIT_A)[0]
+        store.append_event(
+            VERIFICATION_EVENT,
+            COMMIT_A,
+            str(target),
+            content_digest=_digest(b"conflicting bytes"),
+            config_digest=DEFAULT_CONFIG_DIGEST,
+        )
+        with self.assertRaises(MalformedEvidence):
+            store.bound_verification(COMMIT_A, _expected_commands())
+
+    def test_conflicting_review_event_for_the_same_path_fails_closed(self):
+        store = self._approved()
+        target = store.review_path(COMMIT_A, "r1")
+        store.append_event(
+            REVIEW_EVENT,
+            COMMIT_A,
+            str(target),
+            content_digest=_digest(b"conflicting review bytes"),
+        )
+        with self.assertRaises(MalformedEvidence):
+            store.bound_reviews(COMMIT_A)
+
+    def test_legacy_path_only_verification_event_fails_closed(self):
+        store = self._approved()
+        events = list(store.read_events())
+        verification = next(
+            e for e in events
+            if e["event_type"] == VERIFICATION_EVENT and "content_digest" in e
+        )
+        verification.pop("content_digest")
+        verification.pop("config_digest")
+        store.events_path.write_text(
+            "".join(json.dumps(e, sort_keys=True) + "\n" for e in events)
+        )
+        with self.assertRaises(MalformedEvidence):
+            store.bound_verification(COMMIT_A, _expected_commands())
+
+    def test_failed_verification_event_requires_strict_shape(self):
+        store = self._approved()
+        store.append_event(
+            VERIFICATION_EVENT,
+            COMMIT_A,
+            str(store.events_path),
+            payload={"outcome": "FAILED", "failed_command_digest": _digest("boom")},
+        )
+        with self.assertRaises(MalformedEvidence):
+            store.bound_verification(COMMIT_A, _expected_commands())
+
+    def test_failed_verification_event_must_bind_the_events_file(self):
+        store = self._approved()
+        store.append_event(
+            VERIFICATION_EVENT,
+            COMMIT_A,
+            self.durable_file("elsewhere"),
+            payload={
+                "outcome": "FAILED",
+                "commands": [_command_entry("local_review_ready", "boom", 1, exit_status=9)],
+                "failed_command_digest": _digest("boom"),
+            },
+        )
+        with self.assertRaises(MalformedEvidence):
+            store.bound_verification(COMMIT_A, _expected_commands())
+
+    def test_failed_verification_event_digest_must_name_a_command(self):
+        store = self._approved()
+        store.append_event(
+            VERIFICATION_EVENT,
+            COMMIT_A,
+            str(store.events_path),
+            payload={
+                "outcome": "FAILED",
+                "commands": [_command_entry("local_review_ready", "boom", 1, exit_status=9)],
+                "failed_command_digest": _digest("not-in-commands"),
+            },
+        )
+        with self.assertRaises(MalformedEvidence):
+            store.bound_verification(COMMIT_A, _expected_commands())
+
+    def test_valid_plus_conflicting_relation_still_fails_closed(self):
+        store = self._approved()
+        target = store.verification_paths(COMMIT_A)[0]
+        store.append_event(
+            VERIFICATION_EVENT,
+            COMMIT_A,
+            str(target),
+            content_digest=_digest(b"other bytes"),
+            config_digest=DEFAULT_CONFIG_DIGEST,
+        )
+        with self.assertRaises(MalformedEvidence):
+            store.bound_verification(COMMIT_A, _expected_commands())
 
 
 if __name__ == "__main__":

@@ -4,13 +4,14 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
-from enum import StrEnum
 from pathlib import Path
 from typing import Mapping, Optional, Tuple
 
-from pr_closure.contract import COMMIT_ID_PATTERN
+from pr_closure.contract import COMMIT_ID_PATTERN, command_sequence_digest
 
 
 class StoreError(ValueError):
@@ -33,12 +34,6 @@ class MalformedEvidence(StoreError):
     """Raised when an event or artifact cannot be parsed as authoritative evidence."""
 
 
-class ApprovalState(StrEnum):
-    APPROVED = "APPROVED"
-    STALE = "STALE"
-    UNVERIFIED = "UNVERIFIED"
-
-
 COMMIT_EVENT = "commit"
 VERIFICATION_EVENT = "verification"
 REVIEW_EVENT = "review"
@@ -55,7 +50,9 @@ _REQUIRED_EVENT_KEYS = (
     "evidence_path",
 )
 
-_RESERVED_EVENT_KEYS = frozenset(_REQUIRED_EVENT_KEYS + ("content_digest",))
+_RESERVED_EVENT_KEYS = frozenset(
+    _REQUIRED_EVENT_KEYS + ("content_digest", "config_digest")
+)
 
 # Event types the store vets as authoritative. Later tasks that add custom event
 # types must register them here so both write and read sides accept them.
@@ -127,6 +124,14 @@ def _require_digest(value) -> str:
     return value
 
 
+def _require_attempt_id(value) -> str:
+    if not isinstance(value, str) or _DIGEST_RE.fullmatch(value) is None:
+        raise MalformedEvidence(
+            "attempt_id must be a 64-character lowercase hexadecimal string"
+        )
+    return value
+
+
 def _require_review_id(value: str) -> str:
     return _require_component(value, "review_id")
 
@@ -177,8 +182,14 @@ class RunStore:
 
     Layout under ``root/project/pr``:
       events.jsonl                    append-only audit trail
-      verification/<commit>.json      atomic local-gate record
+      verification/<commit>/<config-digest>/<attempt-id>.json
+                                      append-only attempt records (T6L-F2)
       reviews/<commit>/<review-id>.json  atomic review records
+
+    Verification attempts are append-only: each attempt carries an immutable
+    config identity (the digest of the exact ordered command sequence) and
+    lives at its own attempt-id path, so multiple attempts and configurations
+    at the same commit coexist without overwriting one another.
     """
 
     def __init__(self, root, project, pr):
@@ -211,8 +222,57 @@ class RunStore:
     def events_path(self) -> Path:
         return self._base / "events.jsonl"
 
-    def verification_path(self, commit) -> Path:
-        return self._base / "verification" / f"{_require_commit(commit)}.json"
+    def verification_dir(self, commit) -> Path:
+        return self._base / "verification" / _require_commit(commit)
+
+    def verification_path(self, commit, config_digest, attempt_id) -> Path:
+        return (
+            self.verification_dir(commit)
+            / _require_digest(config_digest)
+            / f"{_require_attempt_id(attempt_id)}.json"
+        )
+
+    def verification_paths(self, commit) -> Tuple[Path, ...]:
+        """Every stored verification attempt for a commit, in stable order.
+
+        Enumerates the tree strictly: every entry under the commit directory
+        must conform to the exact ``<config-digest>/<attempt-id>.json``
+        grammar. A legacy flat file, a non-directory entry where a config
+        directory is required, a config-directory name that is not an exact
+        lowercase 64-hex digest, a direct child that is not an exact safe
+        attempt JSON filename, or a nested directory/symlink shape raises
+        :class:`MalformedEvidence` instead of being skipped (T6L-F6). Valid
+        multiple config/attempt trees remain accepted.
+        """
+        directory = self.verification_dir(commit)
+        if not directory.is_dir():
+            return ()
+        paths = []
+        for digest_dir in sorted(directory.iterdir()):
+            if _DIGEST_RE.fullmatch(digest_dir.name) is None:
+                raise MalformedEvidence(
+                    "verification config directory must be an exact lowercase "
+                    "64-hex digest: {0}".format(digest_dir)
+                )
+            if digest_dir.is_symlink() or not digest_dir.is_dir():
+                raise MalformedEvidence(
+                    "verification config directory must be a real directory: {0}".format(
+                        digest_dir
+                    )
+                )
+            for path in sorted(digest_dir.iterdir()):
+                if (
+                    path.is_symlink()
+                    or not path.is_file()
+                    or not path.name.endswith(".json")
+                    or _DIGEST_RE.fullmatch(path.stem) is None
+                ):
+                    raise MalformedEvidence(
+                        "verification attempt must be a direct <attempt-id>.json "
+                        "file: {0}".format(path)
+                    )
+                paths.append(path)
+        return tuple(paths)
 
     def review_dir(self, commit) -> Path:
         return self._base / "reviews" / _require_commit(commit)
@@ -229,13 +289,16 @@ class RunStore:
         evidence_path,
         payload: Optional[Mapping] = None,
         content_digest: Optional[str] = None,
+        config_digest: Optional[str] = None,
     ) -> dict:
         """Append one newline-delimited JSON event without touching prior bytes.
 
         Verification and review artifact events must bind the exact artifact
-        bytes through ``content_digest`` (C6D-F3); the only exception is a
-        FAILED verification event, which is itself the evidence and binds the
-        append-only events file. ``content_digest`` is envelope-owned and can
+        bytes through ``content_digest`` (C6D-F3); verification artifact
+        events additionally bind the immutable ``config_digest`` config
+        identity (T6L-F2). The only exception is a FAILED verification event,
+        which is itself the evidence and binds the append-only events file.
+        ``content_digest`` and ``config_digest`` are envelope-owned and can
         never be injected through ``payload``.
         """
         if not isinstance(event_type, str) or event_type not in KNOWN_EVENT_TYPES:
@@ -257,6 +320,12 @@ class RunStore:
                 )
         if content_digest is not None:
             content_digest = _require_digest(content_digest)
+        if config_digest is not None:
+            config_digest = _require_digest(config_digest)
+            if event_type != VERIFICATION_EVENT or is_failed_verification:
+                raise MalformedEvidence(
+                    "config_digest applies only to verification artifact events"
+                )
         event = {
             "schema_version": EVENT_SCHEMA_VERSION,
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
@@ -268,6 +337,8 @@ class RunStore:
         }
         if content_digest is not None:
             event["content_digest"] = content_digest
+        if config_digest is not None:
+            event["config_digest"] = config_digest
         if payload is not None:
             payload = _require_json_object(payload, "payload")
             reserved = sorted(key for key in payload if key in _RESERVED_EVENT_KEYS)
@@ -336,6 +407,13 @@ class RunStore:
                     _require_digest(digest)
                 except StoreError:
                     fail(f"malformed content_digest: {digest!r}")
+            if event_type == VERIFICATION_EVENT and not is_failed_verification:
+                config_digest = event.get("config_digest")
+                if (
+                    not isinstance(config_digest, str)
+                    or _DIGEST_RE.fullmatch(config_digest) is None
+                ):
+                    fail("verification artifact event must bind a config_digest")
         elif digest is not None:
             try:
                 _require_digest(digest)
@@ -397,28 +475,42 @@ class RunStore:
 
     # -- verification records ---------------------------------------------
 
-    def write_verification(self, commit, record: Mapping) -> Path:
-        """Atomically no-replace ``verification/<commit>.json`` plus its event.
+    def write_verification(self, commit, config_digest, record: Mapping) -> Path:
+        """Atomically no-replace one append-only verification attempt.
 
-        Different bytes never replace an existing record: the losing writer
-        raises ``EvidenceConflict`` and the original bytes survive. An
-        identical-byte retry repairs a missing event rather than early-returning.
+        The attempt is stored at
+        ``verification/<commit>/<config_digest>/<attempt-id>.json`` where the
+        attempt id is the SHA-256 of the exact record bytes (T6L-F2). Multiple
+        attempts and configurations at the same commit coexist; identical
+        bytes stay idempotent with a single event. Different bytes never
+        overwrite an existing path.
         """
         commit = _require_commit(commit)
-        target = self.verification_path(commit)
+        config_digest = _require_digest(config_digest)
         record = _require_json_object(record, "verification record")
         if "commit" in record and record["commit"] != commit:
             raise MalformedEvidence(
                 "verification record commit contradicts its store path"
             )
+        if record.get("config_digest") != config_digest:
+            raise MalformedEvidence(
+                "verification record config identity contradicts the store path"
+            )
         line = _serialize(record)
-        return self._commit_record(target, line, VERIFICATION_EVENT, commit)
+        attempt_id = hashlib.sha256(line).hexdigest()
+        target = self.verification_path(commit, config_digest, attempt_id)
+        return self._commit_record(
+            target, line, VERIFICATION_EVENT, commit, config_digest=config_digest
+        )
 
     def verification_exists(self, commit) -> bool:
-        return self.verification_path(commit).is_file()
+        return bool(self.verification_paths(commit))
 
-    def read_verification(self, commit) -> dict:
-        return _read_json_object(self.verification_path(commit), "verification record")
+    def read_verification(self, commit, config_digest, attempt_id) -> dict:
+        return _read_json_object(
+            self.verification_path(commit, config_digest, attempt_id),
+            "verification record",
+        )
 
     # -- review records ----------------------------------------------------
 
@@ -454,32 +546,252 @@ class RunStore:
     def read_reviews(self, commit) -> Tuple[dict, ...]:
         return tuple(self.read_review(commit, path.stem) for path in self.review_paths(commit))
 
-    # -- event-bound reads (C6C-F4) ---------------------------------------
+    # -- event/artifact relation (T6L-F5) ---------------------------------
 
     VERIFICATION_RECORD_PHASES = frozenset({"local_review_ready", "closure_acceptance"})
+
+    def validate_event_relations(self, commit) -> None:
+        """Validate the complete event/artifact relation for one commit.
+
+        Fails closed in both directions before any bound read derives
+        authority (T6L-F5): every relevant artifact must have exactly one
+        compatible binding (identical duplicates allowed; missing, conflicting,
+        or legacy path-only bindings rejected), and every artifact event must
+        point to an existing allowed target whose descriptor-pinned bytes
+        match the bound content digest and whose payload is compatible.
+        FAILED verification events are non-artifact attempt evidence with a
+        strict shape bound to the events file; they can neither create nor
+        supersede green authority.
+        """
+        commit = _require_commit(commit)
+        events = self.read_events()
+        commit_events = [event for event in events if event["commit"] == commit]
+
+        verification_by_path = {}
+        review_by_path = {}
+        for event in commit_events:
+            if event["event_type"] == VERIFICATION_EVENT:
+                if event.get("outcome") == "FAILED":
+                    self._require_failed_verification_event(event)
+                    continue
+                if event.get("content_digest") is None:
+                    raise MalformedEvidence(
+                        "verification artifact event must bind a content_digest"
+                    )
+                config_digest = event.get("config_digest")
+                if config_digest is None:
+                    raise MalformedEvidence(
+                        "verification artifact event must bind a config_digest"
+                    )
+                self._require_artifact_target(
+                    event, commit, "verification", config_digest=config_digest
+                )
+                verification_by_path.setdefault(event["evidence_path"], []).append(event)
+            elif event["event_type"] == REVIEW_EVENT:
+                if event.get("content_digest") is None:
+                    raise MalformedEvidence(
+                        "review artifact event must bind a content_digest"
+                    )
+                self._require_artifact_target(event, commit, "reviews")
+                review_by_path.setdefault(event["evidence_path"], []).append(event)
+
+        for path in self.verification_paths(commit):
+            self._read_bound_bytes(path, "verification record")
+            bindings = verification_by_path.get(_resolve(os.fspath(path)), ())
+            if not bindings:
+                raise MalformedEvidence(
+                    "verification artifact is not bound by any VERIFICATION_EVENT: {0}".format(
+                        path
+                    )
+                )
+            self._require_single_compatible_binding(bindings, path)
+        for path in self.review_paths(commit):
+            self._read_bound_bytes(path, "review record")
+            bindings = review_by_path.get(_resolve(os.fspath(path)), ())
+            if not bindings:
+                raise MalformedEvidence(
+                    "review artifact is not bound by any REVIEW_EVENT: {0}".format(path)
+                )
+            self._require_single_compatible_binding(bindings, path)
+
+    def _require_single_compatible_binding(self, bindings, path) -> None:
+        identities = {
+            (
+                event["event_type"],
+                _resolve(event["evidence_path"]),
+                event.get("content_digest"),
+                event.get("config_digest"),
+            )
+            for event in bindings
+        }
+        if len(identities) != 1:
+            raise MalformedEvidence(
+                "artifact has conflicting or duplicate incompatible bindings: {0}".format(
+                    path
+                )
+            )
+
+    def _require_artifact_target(
+        self, event, commit, kind, config_digest: Optional[str] = None
+    ) -> dict:
+        """Require an artifact event to point to an existing allowed target.
+
+        The target must live at the exact ``<kind>/<commit>[/<config_digest>]``
+        directory, be a direct JSON file, and its descriptor-pinned bytes must
+        hash to the bound content digest. The parsed record must be compatible
+        with the event: same commit, and for verification artifacts the same
+        config identity, outcome PASSED, and a commands sequence whose own
+        identity matches.
+        """
+        path = event["evidence_path"]
+        resolved = _resolve(path)
+        base = _resolve(os.fspath(self._base))
+        expected_dir = os.path.join(base, kind, commit)
+        if config_digest is not None:
+            expected_dir = os.path.join(expected_dir, config_digest)
+        if not (resolved == expected_dir or resolved.startswith(expected_dir + os.sep)):
+            raise MalformedEvidence(
+                "{0} artifact event target is not an allowed {1} path: {2}".format(
+                    kind, kind, path
+                )
+            )
+        rel = os.path.relpath(resolved, expected_dir)
+        if not rel.endswith(".json") or os.sep in rel or rel in (".", ".."):
+            raise MalformedEvidence(
+                "{0} artifact event target must be a direct JSON file: {1}".format(
+                    kind, path
+                )
+            )
+        target = Path(resolved)
+        raw, digest = self._read_bound_bytes(target, f"{kind} record")
+        if digest != event.get("content_digest"):
+            raise MalformedEvidence(
+                "{0} artifact event content_digest does not match the target bytes: {1}".format(
+                    kind, path
+                )
+            )
+        record = _parse_json_bytes(raw, target, f"{kind} record")
+        commit_field = "commit" if kind == "verification" else "reviewed_commit"
+        if record.get(commit_field) != commit:
+            raise MalformedEvidence(
+                "{0} record commit contradicts the bound event commit: {1}".format(
+                    kind, path
+                )
+            )
+        if kind == "verification":
+            if record.get("config_digest") != config_digest:
+                raise MalformedEvidence(
+                    "verification record config identity contradicts the bound event: {0}".format(
+                        path
+                    )
+                )
+            if record.get("outcome") != "PASSED":
+                raise MalformedEvidence(
+                    "verification artifact must declare outcome PASSED: {0}".format(path)
+                )
+            sequence = self._require_command_sequence(record, target)
+            if command_sequence_digest(sequence) != config_digest:
+                raise MalformedEvidence(
+                    "verification record commands contradict its config identity: {0}".format(
+                        path
+                    )
+                )
+        return record
+
+    def _require_failed_verification_event(self, event) -> None:
+        """Strict shape for FAILED verification attempt events (T6L-F5).
+
+        A FAILED event is non-artifact attempt evidence bound to the
+        append-only events file. It must carry a non-empty commands array of
+        structurally valid attempt entries and a ``failed_command_digest``
+        naming one of them. It can never create or supersede green authority.
+        """
+        if event.get("outcome") != "FAILED":
+            raise MalformedEvidence("FAILED verification event must declare outcome FAILED")
+        if _resolve(event["evidence_path"]) != _resolve(os.fspath(self.events_path)):
+            raise MalformedEvidence(
+                "FAILED verification event must bind the append-only events file"
+            )
+        commands = event.get("commands")
+        if not isinstance(commands, list) or not commands:
+            raise MalformedEvidence(
+                "FAILED verification event must carry a non-empty commands array"
+            )
+        digests = []
+        for index, command in enumerate(commands, start=1):
+            if not isinstance(command, dict):
+                raise MalformedEvidence(
+                    "FAILED verification event commands must be objects"
+                )
+            phase = command.get("phase")
+            if not isinstance(phase, str) or phase not in self.VERIFICATION_RECORD_PHASES:
+                raise MalformedEvidence(
+                    "FAILED verification event command declares unknown phase {0!r}".format(
+                        phase
+                    )
+                )
+            digest = command.get("command_digest")
+            if not isinstance(digest, str) or _DIGEST_RE.fullmatch(digest) is None:
+                raise MalformedEvidence(
+                    "FAILED verification event command must carry a valid command_digest"
+                )
+            label = command.get("command_label")
+            if not isinstance(label, str) or not label.strip():
+                raise MalformedEvidence(
+                    "FAILED verification event command must carry a command_label"
+                )
+            for key in ("started_at", "ended_at"):
+                stamp = command.get(key)
+                if not isinstance(stamp, str) or not stamp.strip():
+                    raise MalformedEvidence(
+                        "FAILED verification event command must carry {0}".format(key)
+                    )
+            status = command.get("exit_status")
+            if not isinstance(status, int) or isinstance(status, bool):
+                raise MalformedEvidence(
+                    "FAILED verification event command must carry an integer exit_status"
+                )
+            digests.append(digest)
+        failed_digest = event.get("failed_command_digest")
+        if (
+            not isinstance(failed_digest, str)
+            or _DIGEST_RE.fullmatch(failed_digest) is None
+        ):
+            raise MalformedEvidence(
+                "FAILED verification event must carry a valid failed_command_digest"
+            )
+        if failed_digest not in digests:
+            raise MalformedEvidence(
+                "FAILED verification event failed_command_digest must name a command"
+            )
+
+    # -- event-bound reads (C6C-F4, T6L-F4) -------------------------------
+
+    _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
     def bound_verification(
         self, commit, expected_commands: Optional[Tuple[Tuple[str, str], ...]] = None
     ) -> Optional[dict]:
-        """Return the event-bound PASSED verification record, or None.
+        """Return the event-bound PASSED verification record for the exact
+        expected ordered command sequence, or None.
 
-        Authority is derived from the exact artifact bytes whose SHA-256 digest
-        a ``VERIFICATION_EVENT`` binds to the queried commit: the bytes are
-        read once, hashed, matched against the event, and parsed from that same
-        buffer (no check-then-read race). An artifact with no matching
-        digest-event, a legacy path-only event, a same-path regular-file
-        replacement with different bytes, a non-PASSED outcome, or a record
-        with a malformed command entry fails closed with
-        :class:`MalformedEvidence`. A missing artifact never yields bytes.
+        Authority is derived from descriptor-pinned artifact bytes whose
+        SHA-256 digest and config identity a ``VERIFICATION_EVENT`` binds to
+        the queried commit. The complete event/artifact relation is validated
+        before selection (T6L-F5); a same-path swap during the read window, a
+        symlink or multi-link entry, an orphan artifact, a missing or
+        conflicting event target, a legacy path-only event, or an incompatible
+        payload fails closed with :class:`MalformedEvidence`.
 
-        ``expected_commands`` is the exact ordered ``(phase, command_digest)``
-        sequence the current config requires (C6D-F2). When provided, the
-        record must match it exactly; a truncated, reordered, duplicated,
-        substituted, or old-config sequence returns None (non-green/stale)
-        instead of approval. When omitted, only the structural checks apply
-        (both phases present, exact integer zero statuses, valid digests).
+        Passing evidence is selected only for the current exact ordered
+        command sequence (C6D-F2): a changed config identity makes old
+        attempts non-selecting without erasing them, and a later FAILED
+        attempt never supersedes a valid earlier pass (T6L-F2). When several
+        passes share the expected identity, the most recent attempt is
+        returned.
         """
         commit = _require_commit(commit)
+        expected = None
         if expected_commands is not None:
             expected_commands = tuple(expected_commands)
             for phase, digest in expected_commands:
@@ -488,39 +800,109 @@ class RunStore:
                         "expected command sequence carries unknown phase {0!r}".format(phase)
                     )
                 _require_digest(digest)
-        target = self.verification_path(commit)
-        if not target.is_file():
-            return None
+            expected = command_sequence_digest(expected_commands)
+        self.validate_event_relations(commit)
         events = self.read_events()
-        raw, digest = self._read_bound_bytes(target, "verification record")
-        if not self._has_matching_event(
-            events, VERIFICATION_EVENT, commit, target, content_digest=digest
-        ):
-            raise MalformedEvidence(
-                "verification artifact bytes are not bound by any VERIFICATION_EVENT: {0}".format(
-                    target
-                )
-            )
-        record = _parse_json_bytes(raw, target, "verification record")
-        if record.get("commit") != commit:
-            raise MalformedEvidence(
-                "verification record commit contradicts its queried commit: {0}".format(target)
-            )
-        if record.get("outcome") != "PASSED":
-            raise MalformedEvidence(
-                "verification artifact must declare outcome PASSED: {0}".format(target)
-            )
-        sequence = self._require_command_sequence(record, target)
-        if expected_commands is not None:
-            if sequence != expected_commands:
-                return None
-        else:
-            phases = {phase for phase, _ in sequence}
-            if not all(phase in phases for phase in self.VERIFICATION_RECORD_PHASES):
+        best = None
+        best_timestamp = None
+        for path in self.verification_paths(commit):
+            raw, digest = self._read_bound_bytes(path, "verification record")
+            record = _parse_json_bytes(raw, path, "verification record")
+            sequence = self._require_command_sequence(record, path)
+            if expected is not None:
+                if record.get("config_digest") != expected or sequence != expected_commands:
+                    continue
+            else:
+                phases = {phase for phase, _ in sequence}
+                if not all(phase in phases for phase in self.VERIFICATION_RECORD_PHASES):
+                    raise MalformedEvidence(
+                        "PASSED verification record must prove both gate phases: {0}".format(
+                            path
+                        )
+                    )
+            timestamp = None
+            for event in events:
+                if (
+                    event["event_type"] == VERIFICATION_EVENT
+                    and event["commit"] == commit
+                    and _resolve(event["evidence_path"]) == _resolve(os.fspath(path))
+                    and event.get("content_digest") == digest
+                ):
+                    timestamp = event["timestamp"]
+                    break
+            if best is None or (
+                timestamp is not None
+                and (best_timestamp is None or timestamp > best_timestamp)
+            ):
+                best = record
+                best_timestamp = timestamp
+        return best
+
+    def bound_reviews(self, commit) -> Tuple[Tuple[str, dict], ...]:
+        """Return every event-bound review record as ``(review_id, record)``.
+
+        Authority is derived from descriptor-pinned artifact bytes whose
+        SHA-256 digest a ``REVIEW_EVENT`` binds to the queried commit. The
+        complete event/artifact relation is validated first (T6L-F5): any
+        orphan artifact, missing or conflicting event target, legacy path-only
+        event, same-path replacement with different bytes, or symlink fails
+        closed with :class:`MalformedEvidence`.
+        """
+        commit = _require_commit(commit)
+        self.validate_event_relations(commit)
+        bound = []
+        for path in self.review_paths(commit):
+            raw, _digest = self._read_bound_bytes(path, "review record")
+            bound.append((path.stem, _parse_json_bytes(raw, path, "review record")))
+        return tuple(bound)
+
+    def _read_bound_bytes(self, target: Path, label: str) -> Tuple[bytes, str]:
+        """Descriptor-pinned no-follow read of one artifact (T6L-F4).
+
+        Opens with ``O_NOFOLLOW``, requires a single-link regular file, reads
+        and hashes one byte buffer from the descriptor, then compares the
+        descriptor identity with the current directory entry before accepting.
+        A same-path swap during the window, a symlink, or a multi-link entry
+        raises :class:`MalformedEvidence`. Every descriptor is closed on all
+        paths.
+        """
+        path = os.fspath(target)
+        try:
+            fd = os.open(path, os.O_RDONLY | self._O_NOFOLLOW)
+        except OSError as error:
+            raise MalformedEvidence(f"cannot open {label}: {target}: {error}") from error
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise MalformedEvidence(f"{label} is not a regular file: {target}")
+            if opened.st_nlink != 1:
                 raise MalformedEvidence(
-                    "PASSED verification record must prove both gate phases: {0}".format(target)
+                    f"{label} must be a single-link regular file: {target}"
                 )
-        return record
+            chunks = []
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+            try:
+                entry = os.lstat(path)
+            except OSError as error:
+                raise MalformedEvidence(
+                    f"cannot re-stat {label}: {target}: {error}"
+                ) from error
+            if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+                raise MalformedEvidence(
+                    f"{label} directory entry changed identity: {target}"
+                )
+            if (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino):
+                raise MalformedEvidence(
+                    f"{label} path changed identity during read: {target}"
+                )
+        finally:
+            os.close(fd)
+        return raw, hashlib.sha256(raw).hexdigest()
 
     def _require_command_sequence(
         self, record: dict, target: Path
@@ -580,95 +962,6 @@ class RunStore:
             sequence.append((phase, digest))
         return tuple(sequence)
 
-    def bound_reviews(self, commit) -> Tuple[Tuple[str, dict], ...]:
-        """Return every event-bound review record as ``(review_id, record)``.
-
-        Authority is derived from the exact artifact bytes whose SHA-256 digest
-        a ``REVIEW_EVENT`` binds to the queried commit. Any present artifact
-        without a matching digest-event (including a same-path regular-file
-        replacement with different bytes, a symlink that changes the resolved
-        path, or a legacy path-only event) is orphan/conflicting evidence and
-        fails closed.
-        """
-        commit = _require_commit(commit)
-        events = self.read_events()
-        bound = []
-        for path in self.review_paths(commit):
-            raw, digest = self._read_bound_bytes(path, "review record")
-            if not self._has_matching_event(
-                events, REVIEW_EVENT, commit, path, content_digest=digest
-            ):
-                raise MalformedEvidence(
-                    "review artifact bytes are not bound by any REVIEW_EVENT: {0}".format(path)
-                )
-            bound.append((path.stem, _parse_json_bytes(raw, path, "review record")))
-        return tuple(bound)
-
-    def _read_bound_bytes(self, target: Path, label: str) -> Tuple[bytes, str]:
-        """Read artifact bytes once and hash them for event binding.
-
-        Returns ``(raw, sha256_hex)`` from one read so authority is always
-        derived from the exact bytes whose digest was checked.
-        """
-        try:
-            raw = target.read_bytes()
-        except OSError as error:
-            raise MalformedEvidence(f"cannot read {label}: {target}: {error}") from error
-        return raw, hashlib.sha256(raw).hexdigest()
-
-    # -- derivation --------------------------------------------------------
-
-    def approval_status(self, commit) -> ApprovalState:
-        """Derive durable-approval status for one commit, failing closed.
-
-        APPROVED only when an observed current COMMIT_EVENT equals ``commit``,
-        a valid VERIFICATION_EVENT binds the queried commit to the resolved
-        verification artifact path, and at least one valid REVIEW_EVENT binds it
-        to a resolved review artifact path, with both artifacts present and
-        parseable. A file with no matching event is orphaned evidence and never
-        approves. A newer commit event downgrades any older approval to STALE.
-        A missing current-tip event, a missing artifact, or malformed data
-        derives UNVERIFIED or raises rather than passing.
-        """
-        commit = _require_commit(commit)
-        events = self.read_events()
-
-        tip = None
-        for event in events:
-            if event["event_type"] == COMMIT_EVENT:
-                tip = event["commit"]
-
-        verification = self.verification_path(commit)
-        verification_ok = False
-        if verification.is_file():
-            raw, digest = self._read_bound_bytes(verification, "verification record")
-            if not self._has_matching_event(
-                events, VERIFICATION_EVENT, commit, verification, content_digest=digest
-            ):
-                return ApprovalState.UNVERIFIED
-            record = _parse_json_bytes(raw, verification, "verification record")
-            self._require_command_sequence(record, verification)
-            verification_ok = True
-
-        review_ok = False
-        for path in self.review_paths(commit):
-            raw, digest = self._read_bound_bytes(path, "review record")
-            if not self._has_matching_event(
-                events, REVIEW_EVENT, commit, path, content_digest=digest
-            ):
-                continue
-            _parse_json_bytes(raw, path, "review record")
-            review_ok = True
-            break
-
-        if not verification_ok or not review_ok:
-            return ApprovalState.UNVERIFIED
-        if tip is None:
-            return ApprovalState.UNVERIFIED
-        if tip != commit:
-            return ApprovalState.STALE
-        return ApprovalState.APPROVED
-
     def _has_matching_event(
         self,
         events,
@@ -676,13 +969,15 @@ class RunStore:
         commit,
         target: Path,
         content_digest: Optional[str] = None,
+        config_digest: Optional[str] = None,
     ) -> bool:
         """Whether an event of ``event_type`` binds ``commit`` to the resolved
         artifact path ``target`` currently resolves to.
 
         When ``content_digest`` is given, the event must also bind those exact
         artifact bytes (C6D-F3): a same-path replacement with different bytes
-        or a legacy path-only event never matches.
+        or a legacy path-only event never matches. Verification artifact
+        events additionally match the immutable ``config_digest`` identity.
         """
         resolved = _resolve(os.fspath(target))
         return any(
@@ -690,47 +985,54 @@ class RunStore:
             and event["commit"] == commit
             and event["evidence_path"] == resolved
             and (content_digest is None or event.get("content_digest") == content_digest)
+            and (config_digest is None or event.get("config_digest") == config_digest)
             for event in events
         )
 
     # -- atomic record commit ---------------------------------------------
 
-    def _commit_record(self, target: Path, line: bytes, event_type, commit) -> Path:
+    def _commit_record(
+        self, target: Path, line: bytes, event_type, commit, config_digest: Optional[str] = None
+    ) -> Path:
         """Commit a record artifact and its evidence event as one transaction.
 
         The target is re-resolved against the durable-path rules before any
         mutation, so a swapped or symlinked verification/reviews directory
         cannot create the artifact under a forbidden area and fail only after
         the fact. The artifact is created with an atomic no-replace primitive;
-        exactly one different-byte writer wins, and losers compare the committed
-        bytes and raise ``EvidenceConflict``. The event is appended only after
-        the artifact exists and binds the exact artifact bytes through their
-        SHA-256 content digest (C6D-F3); if the append fails, the artifact
-        created by this call is rolled back. An identical-byte retry repairs a
-        missing event instead of taking an early return, while an
-        already-complete write stays idempotent without a duplicate event.
+        exactly one different-byte writer wins, and losers compare the
+        committed bytes and raise ``EvidenceConflict``. The event is appended
+        only after the artifact exists and binds the exact artifact bytes
+        through their SHA-256 content digest (C6D-F3); if the append fails,
+        the artifact created by this call is rolled back. An identical-byte
+        retry repairs a missing event instead of taking an early return, while
+        an already-complete write stays idempotent without a duplicate event.
         """
         _require_durable(os.fspath(target), "record path")
         created = self._atomic_create(target, line)
         if not created:
-            try:
-                existing = target.read_bytes()
-            except OSError as error:
-                raise MalformedEvidence(
-                    f"cannot read existing record: {target}: {error}"
-                ) from error
+            existing = self._read_existing_for_compare(target)
             if existing != line:
                 raise EvidenceConflict(
                     f"record already exists with different bytes: {target}"
                 )
         content_digest = hashlib.sha256(line).hexdigest()
         if self._has_matching_event(
-            self.read_events(), event_type, commit, target, content_digest=content_digest
+            self.read_events(),
+            event_type,
+            commit,
+            target,
+            content_digest=content_digest,
+            config_digest=config_digest,
         ):
             return target
         try:
             self.append_event(
-                event_type, commit, os.fspath(target), content_digest=content_digest
+                event_type,
+                commit,
+                os.fspath(target),
+                content_digest=content_digest,
+                config_digest=config_digest,
             )
         except BaseException:
             if created:
@@ -740,6 +1042,28 @@ class RunStore:
                     pass
             raise
         return target
+
+    def _read_existing_for_compare(self, target: Path) -> bytes:
+        """Descriptor-pinned read of a just-created record for byte compare.
+
+        The winning writer creates the target through ``os.link`` and removes
+        its temporary link right after; a loser can open the target inside
+        that tiny window and observe ``st_nlink == 2``. Retry briefly so a
+        transient multi-link window never masks a legitimately created record;
+        a persistent violation (symlink, hard-link swap, or multi-link entry)
+        still fails closed with :class:`MalformedEvidence`.
+        """
+        last_error = None
+        for attempt in range(5):
+            try:
+                existing, _ = self._read_bound_bytes(target, "existing record")
+                return existing
+            except MalformedEvidence as error:
+                last_error = error
+                if attempt == 4:
+                    break
+                time.sleep(0.002)
+        raise last_error
 
     def _atomic_create(self, target: Path, line: bytes) -> bool:
         """Create ``target`` with ``line`` using an atomic no-replace primitive.
@@ -766,6 +1090,14 @@ class RunStore:
                 if target.exists():
                     return False
                 raise
+            # Drop the temporary link before the directory fsync so a
+            # concurrent loser never observes a multi-link entry for a
+            # legitimately created single-link record (T6L-F4).
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            temp_name = None
             try:
                 dir_fd = os.open(os.fspath(target.parent), os.O_RDONLY)
                 try:

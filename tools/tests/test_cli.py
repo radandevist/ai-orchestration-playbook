@@ -159,9 +159,9 @@ def main():
     with open(os.environ["FAKE_ADAPTER_LOG"], "a") as handle:
         handle.write(json.dumps(sys.argv) + "\n")
     mode = sys.argv[sys.argv.index("--mode") + 1]
+    if os.environ.get("FAKE_ADAPTER_STDERR"):
+        sys.stderr.write(os.environ["FAKE_ADAPTER_STDERR"])
     if os.environ.get("FAKE_ADAPTER_EXIT"):
-        if os.environ.get("FAKE_ADAPTER_STDERR"):
-            sys.stderr.write(os.environ["FAKE_ADAPTER_STDERR"])
         sys.exit(int(os.environ["FAKE_ADAPTER_EXIT"]))
     if os.environ.get("FAKE_ADAPTER_SLEEP"):
         import time
@@ -324,7 +324,20 @@ class CliTestCase(unittest.TestCase):
             return handle.read()
 
     def verification_path(self, commit):
-        return os.path.join(self.state_dir, PROJECT, str(PR), "verification", commit + ".json")
+        """The single verification attempt path for ``commit`` under the
+        append-only ``verification/<commit>/<config-digest>/<attempt>.json``
+        layout (T6L-F2), or a non-existent candidate when none exists."""
+        base = os.path.join(self.state_dir, PROJECT, str(PR), "verification", commit)
+        if not os.path.isdir(base):
+            return os.path.join(base, "no-attempt.json")
+        paths = sorted(
+            os.path.join(dirpath, name)
+            for dirpath, dirnames, filenames in os.walk(base)
+            for name in filenames
+        )
+        if len(paths) == 1:
+            return paths[0]
+        return os.path.join(base, "no-attempt.json")
 
     def adapter_env(self, output=None, exit_code=None, stderr=None, sleep=None):
         env = {
@@ -627,7 +640,7 @@ class RecordVerificationTests(CliTestCase):
         self.assertEqual(1, len(verification_events))
         self.assertEqual(
             hashlib.sha256(
-                open(self.verification_path(COMMIT_A), "rb").read()
+                Path(self.verification_path(COMMIT_A)).read_bytes()
             ).hexdigest(),
             verification_events[0]["content_digest"],
         )
@@ -1043,7 +1056,7 @@ class EventBoundArtifactTests(CliTestCase):
 
     def test_orphan_verification_artifact_fails_closed(self):
         config = self.prepare_commit_only()
-        path = self.verification_path(COMMIT_A)
+        path = os.path.join(os.path.dirname(self.verification_path(COMMIT_A)), "orphan-config", "orphan.json")
         os.makedirs(os.path.dirname(path))
         with open(path, "w") as handle:
             json.dump({"schema_version": 1, "outcome": "PASSED", "commit": COMMIT_A}, handle)
@@ -1291,7 +1304,7 @@ class SyncCommandTests(CliTestCase):
         proc = self.run_cli(*args, extra_env=self.adapter_env())
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertIn("state=", proc.stdout)
-        self.assertIn('"applied": false', proc.stdout)
+        self.assertIn("projection dry-run: changes=0", proc.stdout)
         self.assertEqual([], [line for line in proc.stderr.splitlines() if line])
         calls = self.adapter_calls()
         self.assertEqual(1, len(calls))
@@ -1302,7 +1315,7 @@ class SyncCommandTests(CliTestCase):
         args.append("--apply")
         proc = self.run_cli(*args, extra_env=self.adapter_env())
         self.assertEqual(0, proc.returncode, proc.stderr)
-        self.assertIn('"applied": true', proc.stdout)
+        self.assertIn("projection applied: changes=0", proc.stdout)
         calls = self.adapter_calls()
         self.assertEqual("apply", calls[0][calls[0].index("--mode") + 1])
 
@@ -1394,7 +1407,10 @@ class SyncCommandTests(CliTestCase):
 
     def test_sync_adapter_malformed_output_fails_closed(self):
         config, args = self.prepare_projection()
-        proc = self.run_cli(*args, extra_env=self.adapter_env(output={"not": "a protocol"}))
+        proc = self.run_cli(
+            *args,
+            extra_env=self.adapter_env(output={"applied": False, "changes": []}),
+        )
         self.assertEqual(5, proc.returncode)
         self.assertIn("schema_version", proc.stderr)
 
@@ -1722,14 +1738,19 @@ class ShellBoundaryTests(CliTestCase):
 
 
 class ProjectionRedactionTests(CliTestCase):
-    def test_sync_dry_run_redacts_secrets_in_projection_display(self):
+    def test_sync_dry_run_never_displays_change_summaries(self):
         self.set_git()
         self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
         config = self.write_config(overrides={"tracking_projection": "trello:publyapp"})
         output = {
             "schema_version": 1,
             "applied": False,
-            "changes": ["update card GH_TOKEN: ghp_PROJSECRET; --token ab12"],
+            "changes": [
+                {
+                    "type": "list_update",
+                    "summary": "update card GH_TOKEN: ghp_PROJSECRET; --token ab12",
+                }
+            ],
         }
         proc = self.run_cli(
             "sync", "--config", config, "--pr", str(PR),
@@ -1737,6 +1758,7 @@ class ProjectionRedactionTests(CliTestCase):
             extra_env=self.adapter_env(output=output),
         )
         self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("projection dry-run: changes=1", proc.stdout)
         self.assertNotIn("ghp_PROJSECRET", proc.stdout)
         self.assertNotIn("ab12", proc.stdout)
         self.assertNotIn("ghp_PROJSECRET", proc.stderr)
@@ -1921,6 +1943,515 @@ class SecretCommandNeverPersistsTests(CliTestCase):
         blob = self._state_bytes()
         self.assertNotIn(b"hunter2", blob)
         self.assertNotIn(b"sesame", blob)
+
+
+class SameTipReverificationCliTests(CliTestCase):
+    """T6L-F2 end-to-end: attempts and config identities at one commit coexist
+    without requiring an unrelated or no-op commit."""
+
+    def verification_paths(self, commit=COMMIT_A):
+        base = os.path.join(self.state_dir, PROJECT, str(PR), "verification", commit)
+        if not os.path.isdir(base):
+            return []
+        return sorted(
+            os.path.join(dirpath, name)
+            for dirpath, dirnames, filenames in os.walk(base)
+            for name in filenames
+        )
+
+    def artifact_bytes(self, commit=COMMIT_A):
+        return {
+            path: Path(path).read_bytes()
+            for path in self.verification_paths(commit)
+        }
+
+    def read_verification_events(self):
+        return [e for e in self.read_events() if e["event_type"] == "verification"]
+
+    def test_first_pass_records_one_attempt_at_the_commit(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config()
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        paths = self.verification_paths()
+        self.assertEqual(1, len(paths))
+        record = json.loads(Path(paths[0]).read_text())
+        self.assertEqual(COMMIT_A, record["commit"])
+        self.assertEqual("PASSED", record["outcome"])
+        self.assertIn(record["config_digest"], paths[0])
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("state: REVIEW_READY", proc.stdout)
+
+    def test_same_config_rerun_coexists_and_stays_green(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config()
+        first = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, first.returncode, first.stderr)
+        original = self.artifact_bytes()
+        second = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, second.returncode, second.stderr)
+        self.assertEqual(2, len(self.verification_paths()))
+        self.assertEqual(2, len(self.read_verification_events()))
+        for path, bytes_ in original.items():
+            self.assertEqual(bytes_, Path(path).read_bytes())
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("state: REVIEW_READY", proc.stdout)
+
+    def test_changed_config_rerun_needs_no_unrelated_commit(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config_a = self.write_config()
+        first = self.run_cli("record-verification", "--config", config_a, "--pr", str(PR))
+        self.assertEqual(0, first.returncode, first.stderr)
+        original = self.artifact_bytes()
+        self.assertEqual(1, len(original))
+        config_b = self.write_config(
+            overrides={"closure_acceptance_commands": ["true # stricter"]}
+        )
+        second = self.run_cli("record-verification", "--config", config_b, "--pr", str(PR))
+        self.assertEqual(0, second.returncode, second.stderr)
+        paths = self.verification_paths()
+        self.assertEqual(2, len(paths))
+        digests = {
+            json.loads(Path(path).read_text())["config_digest"] for path in paths
+        }
+        self.assertEqual(2, len(digests))
+        for path, bytes_ in original.items():
+            self.assertEqual(bytes_, Path(path).read_bytes(), path)
+        # New config is green; old config evidence remains selectable as well.
+        proc = self.run_cli("status", "--config", config_b, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("state: REVIEW_READY", proc.stdout)
+        proc = self.run_cli("status", "--config", config_a, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("state: REVIEW_READY", proc.stdout)
+
+    def test_failed_then_pass_keeps_failed_event_and_recovers(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        command = "test -e " + self.marker + " && exit 0; touch " + self.marker + "; exit 1"
+        config = self.write_config(overrides={"local_review_ready_commands": [command]})
+        failed = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(5, failed.returncode)
+        self.assertEqual(0, len(self.verification_paths()))
+        self.assertEqual(1, len(self.read_verification_events()))
+        self.assertEqual("FAILED", self.read_verification_events()[0]["outcome"])
+        passed = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, passed.returncode, passed.stderr)
+        self.assertEqual(1, len(self.verification_paths()))
+        events = self.read_verification_events()
+        self.assertIn("FAILED", {e.get("outcome") for e in events})
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("state: REVIEW_READY", proc.stdout)
+
+    def test_pass_then_fail_never_erases_the_valid_pass(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        command = "test ! -e " + self.marker + " && touch " + self.marker
+        config = self.write_config(overrides={"local_review_ready_commands": [command]})
+        passed = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, passed.returncode, passed.stderr)
+        original = self.artifact_bytes()
+        self.assertEqual(1, len(original))
+        failed = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(5, failed.returncode)
+        events = self.read_verification_events()
+        self.assertIn("FAILED", {e.get("outcome") for e in events})
+        for path, bytes_ in original.items():
+            self.assertEqual(bytes_, Path(path).read_bytes(), path)
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("state: REVIEW_READY", proc.stdout)
+
+    def test_two_config_identities_at_one_commit_both_selectable(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config_a = self.write_config()
+        first = self.run_cli("record-verification", "--config", config_a, "--pr", str(PR))
+        self.assertEqual(0, first.returncode, first.stderr)
+        config_b = self.write_config(
+            overrides={"local_review_ready_commands": ["true # variant"]}
+        )
+        second = self.run_cli("record-verification", "--config", config_b, "--pr", str(PR))
+        self.assertEqual(0, second.returncode, second.stderr)
+        self.assertEqual(2, len(self.verification_paths()))
+        for config in (config_a, config_b):
+            proc = self.run_cli("status", "--config", config, "--pr", str(PR))
+            self.assertEqual(0, proc.returncode, proc.stderr)
+            self.assertIn("state: REVIEW_READY", proc.stdout)
+
+
+class LiveReviewBindingTests(CliTestCase):
+    """T6L-F3: every durable review consumed by status is re-bound to the live
+    repository, PR number, head branch, and head commit on every read."""
+
+    def _foreign_record(self, **overrides):
+        record = {
+            "schema_version": 1,
+            "repository": REPOSITORY,
+            "pr_number": PR,
+            "reviewed_branch": BRANCH,
+            "reviewed_commit": COMMIT_A,
+            "base_commit": "b" * 40,
+            "implementer_family": "deepseek",
+            "reviewer_family": "claude",
+            "local_evidence": ["tests:tools/tests/test_cli.py"],
+            "ci_evidence": ["ci:pr-check/run-1"],
+            "verdict": "APPROVED",
+            "findings": [],
+            "intentionally_not_findings": [],
+        }
+        record.update(overrides)
+        return record
+
+    def test_foreign_repository_fails_closed_on_read(self):
+        config = self.prepare_approved()
+        store = RunStore(self.state_dir, PROJECT, PR)
+        store.write_review(COMMIT_A, "foreign", self._foreign_record(repository="evil/repo"))
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR))
+        self.assertEqual(3, proc.returncode)
+        self.assertIn("repository", proc.stderr)
+
+    def test_foreign_pr_number_fails_closed_on_read(self):
+        config = self.prepare_approved()
+        store = RunStore(self.state_dir, PROJECT, PR)
+        store.write_review(COMMIT_A, "foreign", self._foreign_record(pr_number=999))
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR))
+        self.assertEqual(3, proc.returncode)
+        self.assertIn("pr_number", proc.stderr)
+
+    def test_foreign_head_branch_fails_closed_on_read(self):
+        config = self.prepare_approved()
+        store = RunStore(self.state_dir, PROJECT, PR)
+        store.write_review(COMMIT_A, "foreign", self._foreign_record(reviewed_branch="evil/branch"))
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR))
+        self.assertEqual(3, proc.returncode)
+        self.assertIn("reviewed_branch", proc.stderr)
+
+    def test_foreign_head_commit_fails_closed_on_read(self):
+        self.set_git(local=COMMIT_B, remote=COMMIT_B)
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config()
+        store = RunStore(self.state_dir, PROJECT, PR)
+        store.record_commit(COMMIT_B, str(store.events_path))
+        store.write_review(COMMIT_B, "foreign", self._foreign_record(reviewed_commit=COMMIT_B))
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR))
+        self.assertEqual(3, proc.returncode)
+        self.assertIn("reviewed_commit", proc.stderr)
+
+
+class IntermediateStateProjectionTests(CliTestCase):
+    """Preserved non-finding: sync --apply must project valid intermediate
+    states (e.g. LOCAL_VERIFY); it refuses adapter invocation only when a
+    required source is unavailable, malformed, or contradictory."""
+
+    def test_valid_intermediate_state_can_be_applied(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        store = RunStore(self.state_dir, PROJECT, PR)
+        store.record_commit(COMMIT_A, str(store.events_path))
+        config = self.write_config(overrides={"tracking_projection": "trello:publyapp"})
+        proc = self.run_cli(
+            "sync", "--config", config, "--pr", str(PR), "--apply",
+            "--projection-adapter", os.path.join(self.bin_dir, "adapter"),
+            extra_env=self.adapter_env(),
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        calls = self.adapter_calls()
+        self.assertEqual(1, len(calls))
+        argv = calls[0]
+        self.assertEqual("LOCAL_VERIFY", argv[argv.index("--state") + 1])
+        self.assertEqual("apply", argv[argv.index("--mode") + 1])
+        self.assertIn("state=LOCAL_VERIFY", proc.stdout)
+
+
+class ProjectionResultContractTests(CliTestCase):
+    """T6L-F7: version-1 projection results are strict and bounded."""
+
+    def test_adapter_result_rejects_unknown_keys(self):
+        from pr_closure.cli import ProjectionFailure, _parse_adapter_result
+
+        with self.assertRaises(ProjectionFailure):
+            _parse_adapter_result(
+                '{"schema_version": 1, "applied": false, "changes": [], "secret": "leaked"}',
+                "dry-run",
+            )
+
+    def test_adapter_result_rejects_scalar_change_elements(self):
+        from pr_closure.cli import ProjectionFailure, _parse_adapter_result
+
+        with self.assertRaises(ProjectionFailure):
+            _parse_adapter_result(
+                '{"schema_version": 1, "applied": false, "changes": ["x"]}',
+                "dry-run",
+            )
+
+    def test_adapter_result_rejects_unknown_change_keys(self):
+        from pr_closure.cli import ProjectionFailure, _parse_adapter_result
+
+        with self.assertRaises(ProjectionFailure):
+            _parse_adapter_result(
+                '{"schema_version": 1, "applied": false, "changes": ['
+                '{"type": "list_update", "summary": "ok", "rogue": 1}]}',
+                "dry-run",
+            )
+
+    def test_adapter_result_rejects_unknown_change_type(self):
+        from pr_closure.cli import ProjectionFailure, _parse_adapter_result
+
+        with self.assertRaises(ProjectionFailure):
+            _parse_adapter_result(
+                '{"schema_version": 1, "applied": false, "changes": '
+                '[{"type": "bogus", "summary": "x"}]}',
+                "dry-run",
+            )
+
+    def test_adapter_result_rejects_excessive_change_count(self):
+        from pr_closure.cli import PROJECTION_MAX_CHANGES, ProjectionFailure, _parse_adapter_result
+
+        changes = [
+            {"type": "list_update", "summary": "c{0}".format(i)}
+            for i in range(PROJECTION_MAX_CHANGES + 1)
+        ]
+        with self.assertRaises(ProjectionFailure):
+            _parse_adapter_result(
+                json.dumps({"schema_version": 1, "applied": False, "changes": changes}),
+                "dry-run",
+            )
+
+    def test_adapter_result_rejects_excessive_summary_length(self):
+        from pr_closure.cli import (
+            PROJECTION_CHANGE_SUMMARY_MAX,
+            ProjectionFailure,
+            _parse_adapter_result,
+        )
+
+        with self.assertRaises(ProjectionFailure):
+            _parse_adapter_result(
+                json.dumps({
+                    "schema_version": 1,
+                    "applied": False,
+                    "changes": [
+                        {"type": "list_update", "summary": "s" * (PROJECTION_CHANGE_SUMMARY_MAX + 1)}
+                    ],
+                }),
+                "dry-run",
+            )
+
+    def test_adapter_result_rejects_non_string_summary(self):
+        from pr_closure.cli import ProjectionFailure, _parse_adapter_result
+
+        with self.assertRaises(ProjectionFailure):
+            _parse_adapter_result(
+                '{"schema_version": 1, "applied": false, "changes": '
+                '[{"type": "list_update", "summary": 42}]}',
+                "dry-run",
+            )
+
+    def test_adapter_result_accepts_bounded_change_records(self):
+        from pr_closure.cli import _parse_adapter_result
+
+        data = _parse_adapter_result(
+            '{"schema_version": 1, "applied": false, "changes": '
+            '[{"type": "card_update", "summary": "moved card"}]}',
+            "dry-run",
+        )
+        self.assertEqual(1, len(data["changes"]))
+
+
+class ConfiguredCommandOutputNeverEmittedTests(CliTestCase):
+    """T6L-F8: configured command stdout/stderr never reaches CLI streams or
+    durable bytes, regardless of secret carriers."""
+
+    SECRETS = (
+        "bare-secret-xyz",
+        "token all-alpha-secret-1",
+        "password all-alpha-secret-2",
+    )
+
+    def _state_bytes(self):
+        chunks = []
+        for dirpath, dirnames, filenames in os.walk(self.state_dir):
+            for name in filenames:
+                path = os.path.join(dirpath, name)
+                with open(path, "rb") as handle:
+                    chunks.append(handle.read())
+        return b"".join(chunks)
+
+    def test_failing_commands_never_emit_output_to_any_stream(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config(
+            overrides={
+                "local_review_ready_commands": [
+                    "printf '%s\n' 'token all-alpha-secret-1' >&2; "
+                    "printf '%s\n' 'password all-alpha-secret-2' >&1; "
+                    "printf '%s\n' 'bare-secret-xyz' >&2; exit 9"
+                ],
+                "closure_acceptance_commands": ["true"],
+            }
+        )
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(5, proc.returncode)
+        combined = proc.stdout + proc.stderr
+        for secret in self.SECRETS:
+            self.assertNotIn(secret, combined)
+        blob = self._state_bytes()
+        for secret in self.SECRETS:
+            self.assertNotIn(secret.encode(), blob)
+        failed = [e for e in self.read_events() if e["event_type"] == "verification"]
+        self.assertEqual(1, len(failed))
+        self.assertNotIn("bare-secret-xyz", json.dumps(failed[0]))
+
+    def test_successful_commands_never_emit_output_to_any_stream(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config(
+            overrides={
+                "local_review_ready_commands": [
+                    "printf '%s\n' 'token all-alpha-secret-1' >&2; "
+                    "printf '%s\n' 'bare-secret-xyz'"
+                ],
+                "closure_acceptance_commands": [
+                    "printf '%s\n' 'password all-alpha-secret-2' >&2"
+                ],
+            }
+        )
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        combined = proc.stdout + proc.stderr
+        for secret in self.SECRETS:
+            self.assertNotIn(secret, combined)
+        blob = self._state_bytes()
+        for secret in self.SECRETS:
+            self.assertNotIn(secret.encode(), blob)
+
+    def test_verification_failure_diagnostics_carry_only_safe_fields(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config(
+            overrides={
+                "local_review_ready_commands": ["echo 'should-not-appear'; exit 7"],
+                "closure_acceptance_commands": ["true"],
+            }
+        )
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(5, proc.returncode)
+        self.assertNotIn("should-not-appear", proc.stderr)
+        self.assertIn("local_review_ready:1", proc.stderr)
+
+
+class NulCommandConfigTests(CliTestCase):
+    """T6L-F9: NUL command strings are rejected at config validation and the
+    subprocess ValueError path is mapped to the typed CLI contract."""
+
+    def test_nul_command_config_exits_two_without_traceback(self):
+        self.set_git()
+        self.set_gh()
+        config = self.write_config(
+            overrides={"local_review_ready_commands": ["echo \x00 boom"]}
+        )
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(2, proc.returncode)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertNotIn("ValueError", proc.stderr)
+
+    def test_nul_command_config_writes_no_state(self):
+        self.set_git()
+        self.set_gh()
+        config = self.write_config(
+            overrides={"closure_acceptance_commands": ["echo \x00 boom"]}
+        )
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(2, proc.returncode)
+        self.assertFalse(os.path.exists(self.state_dir))
+
+    def test_subprocess_valueerror_is_mapped_to_typed_failure(self):
+        from pr_closure.cli import VerificationFailure, _run_shell_command
+
+        with self.assertRaises(VerificationFailure):
+            _run_shell_command("echo \x00 boom", cwd=self.pr_worktree)
+
+
+class AdapterBoundedOutputTests(CliTestCase):
+    """T6L-F7: adapter stdout/stderr are bounded while reading; the process is
+    terminated and reaped on overflow or timeout; secrets are never echoed."""
+
+    def _write_adapter(self, name, body):
+        path = os.path.join(self.bin_dir, name)
+        with open(path, "w") as handle:
+            handle.write(body)
+        os.chmod(path, stat.S_IRWXU)
+        return path
+
+    def test_excessive_adapter_stdout_fails_closed(self):
+        from pr_closure.cli import ProjectionFailure, _invoke_adapter
+
+        adapter = self._write_adapter(
+            "huge-out", "#!/usr/bin/env python3\nimport sys\n"
+            "sys.stdout.write('x' * 2_000_000)\n"
+        )
+        with self.assertRaises(ProjectionFailure):
+            _invoke_adapter((adapter, "--mode", "dry-run"), timeout=5)
+
+    def test_excessive_adapter_stderr_on_failure_is_bounded_and_redacted(self):
+        from pr_closure.cli import ProjectionFailure, _invoke_adapter
+
+        adapter = self._write_adapter(
+            "huge-err",
+            "#!/usr/bin/env python3\nimport sys\n"
+            "sys.stderr.write('token ab12 ' + 'z' * 2_000_000)\n"
+            "sys.exit(9)\n",
+        )
+        with self.assertRaises(ProjectionFailure):
+            _invoke_adapter((adapter, "--mode", "apply"), timeout=5)
+
+    def test_timeout_process_is_reaped(self):
+        from pr_closure.cli import ProjectionFailure, _invoke_adapter
+
+        pid_marker = os.path.join(self.root, "adapter.pid")
+        adapter = self._write_adapter(
+            "pid-sleeper",
+            "#!/usr/bin/env python3\nimport os, time\n"
+            "open({0!r}, 'w').write(str(os.getpid()))\ntime.sleep(30)\n".format(pid_marker),
+        )
+        with self.assertRaises(ProjectionFailure):
+            _invoke_adapter((adapter, "--mode", "dry-run"), timeout=0.2)
+        with open(pid_marker) as handle:
+            pid = int(handle.read().strip())
+        import errno
+
+        try:
+            os.waitpid(pid, os.WNOHANG)
+            reaped = False
+        except ChildProcessError:
+            reaped = True
+        self.assertTrue(reaped, "adapter process was not reaped after timeout")
+
+    def test_adapter_secret_output_is_never_echoed(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config(overrides={"tracking_projection": "trello:publyapp"})
+        args = [
+            "sync", "--config", config, "--pr", str(PR),
+            "--projection-adapter", os.path.join(self.bin_dir, "adapter"),
+        ]
+        output = {
+            "schema_version": 1,
+            "applied": False,
+            "changes": [{"type": "list_update", "summary": "secret token all-alpha-leak"}],
+        }
+        proc = self.run_cli(
+            *args,
+            extra_env=self.adapter_env(output=output, stderr="token all-alpha-leak on stderr"),
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertNotIn("all-alpha-leak", proc.stdout + proc.stderr)
 
 
 if __name__ == "__main__":

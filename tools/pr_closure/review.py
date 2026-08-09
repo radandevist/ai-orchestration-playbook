@@ -150,3 +150,30 @@ def _apply_mandatory_blocks_and_verdict(
         verdict = declared_verdict
 
     return promoted, verdict
+
+
+def require_live_binding(record, repository, pr_number, head_branch, head_commit) -> None:
+    """Bind a validated review to the live PR facts (T6L-F3).
+
+    One shared authority contract used by ``import-review`` writes and every
+    status read: the durable review must match the configured repository, the
+    requested pull request number, the live head branch, and the live head
+    commit. Foreign repository/PR/branch/commit artifacts fail closed even
+    when schema-valid and digest-bound.
+    """
+    if record.repository != repository:
+        raise ReviewValidationError(
+            "review repository does not bind to the configured repository"
+        )
+    if record.pr_number != pr_number:
+        raise ReviewValidationError(
+            "review pr_number does not bind to the requested pull request"
+        )
+    if record.reviewed_branch != head_branch:
+        raise ReviewValidationError(
+            "review reviewed_branch does not bind to the pull request head branch"
+        )
+    if record.reviewed_commit != head_commit:
+        raise ReviewValidationError(
+            "review reviewed_commit does not bind to the pull request head commit"
+        )
