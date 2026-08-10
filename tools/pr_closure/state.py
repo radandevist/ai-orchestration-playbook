@@ -76,7 +76,10 @@ def derive_state(snapshot, now) -> StateDecision:
 
     if snapshot.executor_deaths >= 2:
         return _decision(ClosureState.STALLED, ("repeated executor deaths",))
-    if _stagnated(snapshot, now):
+    if (
+        review_verdict not in (Verdict.APPROVED, Verdict.APPROVED_WITH_FOLLOW_UPS)
+        and _stagnated(snapshot, now)
+    ):
         return _decision(ClosureState.STALLED, ("no progress within stagnation budget",))
 
     if snapshot.fixing_lane_active and snapshot.blocking_findings:

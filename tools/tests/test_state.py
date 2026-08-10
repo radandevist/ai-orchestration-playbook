@@ -146,6 +146,30 @@ class StateDerivationTests(unittest.TestCase):
         decision = derive_state(snap, NOW)
         self.assertEqual(ClosureState.STALLED, decision.state)
 
+    def test_approved_pr_does_not_stall_while_awaiting_owner_merge(self):
+        snap = replace(
+            approved_snapshot(),
+            stagnation_budget_minutes=120,
+            last_progress_at=NOW - timedelta(minutes=121),
+        )
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.APPROVED, decision.state)
+        self.assertEqual(("report_ready", "await_owner_merge"), decision.allowed_actions)
+
+    def test_approved_with_follow_ups_does_not_stall_while_awaiting_owner_merge(self):
+        snap = replace(
+            review_ready(),
+            review_verdict=Verdict.APPROVED_WITH_FOLLOW_UPS,
+            review_commit=COMMIT_A,
+            follow_up_findings=("F-1",),
+            follow_ups_complete=True,
+            stagnation_budget_minutes=120,
+            last_progress_at=NOW - timedelta(minutes=121),
+        )
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.APPROVED_WITH_FOLLOW_UPS, decision.state)
+        self.assertEqual(("report_ready", "await_owner_merge"), decision.allowed_actions)
+
 
 class AdversarialPrecedenceTests(unittest.TestCase):
     def test_contradictory_evidence_beats_red_ci(self):
