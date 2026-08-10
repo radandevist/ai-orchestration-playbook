@@ -903,6 +903,11 @@ class CheckRollupTests(TempDirTestCase):
                 result = parse_check(check_run("lint", status))
                 self.assertEqual(CheckOutcome.PENDING, result.outcome)
 
+    def test_check_run_pending_accepts_github_empty_conclusion(self):
+        result = parse_check(check_run("lint", "IN_PROGRESS", ""))
+        self.assertEqual(CheckOutcome.PENDING, result.outcome)
+        self.assertIsNone(result.conclusion)
+
     def test_check_run_skipped(self):
         result = parse_check(check_run("lint", "COMPLETED", "SKIPPED"))
         self.assertEqual(CheckOutcome.SKIPPED, result.outcome)

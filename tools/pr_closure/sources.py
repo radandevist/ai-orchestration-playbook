@@ -672,6 +672,12 @@ def parse_check(node, argv=()) -> CheckResult:
             "unsupported check status {0!r} for: {1}".format(status, _describe_command(argv))
         )
     conclusion = node.get("conclusion")
+    # `gh pr view --json statusCheckRollup` serializes an unfinished check's
+    # absent conclusion as "" rather than null. Preserve fail-closed handling
+    # for completed checks, but normalize that transport quirk while the check
+    # is still pending.
+    if conclusion == "" and status != "COMPLETED":
+        conclusion = None
     if conclusion is not None and (
         not isinstance(conclusion, str) or conclusion not in CHECK_CONCLUSIONS
     ):
