@@ -10,7 +10,7 @@ from enum import StrEnum
 from typing import Callable, Mapping, Optional, Sequence, Tuple
 
 from pr_closure.contract import COMMIT_ID_PATTERN, REPOSITORY_PATTERN
-from pr_closure.model import CiState
+from pr_closure.model import CiState, MergeableState
 
 _COMMIT_ID_RE = re.compile(COMMIT_ID_PATTERN)
 _REPOSITORY_RE = re.compile(REPOSITORY_PATTERN)
@@ -516,7 +516,7 @@ class WorktreeResolver:
 # ---------------------------------------------------------------------------
 
 PR_JSON_FIELDS = (
-    "number,headRefName,headRefOid,isDraft,state,mergeStateStatus,"
+    "number,headRefName,headRefOid,isDraft,state,mergeStateStatus,mergeable,"
     "statusCheckRollup,url,baseRefName"
 )
 _REQUIRED_PR_KEYS = (
@@ -526,6 +526,7 @@ _REQUIRED_PR_KEYS = (
     "isDraft",
     "state",
     "mergeStateStatus",
+    "mergeable",
     "statusCheckRollup",
     "url",
     "baseRefName",
@@ -575,6 +576,7 @@ class PullRequestFacts:
     is_draft: bool
     state: str
     merge_state_status: str
+    mergeable: MergeableState
     url: str
     checks: Tuple[CheckResult, ...]
 
@@ -809,6 +811,13 @@ class GitHubSource:
                 "unsupported PR state {0!r} for: {1}".format(state, _describe_command(argv))
             )
         merge_state_status = _require_non_empty_str(data["mergeStateStatus"], "mergeStateStatus", argv)
+        mergeable_value = _require_non_empty_str(data["mergeable"], "mergeable", argv)
+        try:
+            mergeable = MergeableState(mergeable_value)
+        except ValueError as error:
+            raise SourceMalformed(
+                "unsupported mergeable value {0!r} for: {1}".format(mergeable_value, _describe_command(argv))
+            ) from error
         url = _require_pr_url(data["url"], self._repository, self._pr_number, argv)
         rollup = data["statusCheckRollup"]
         if not isinstance(rollup, list):
@@ -825,6 +834,7 @@ class GitHubSource:
             is_draft=is_draft,
             state=state,
             merge_state_status=merge_state_status,
+            mergeable=mergeable,
             url=url,
             checks=checks,
         )

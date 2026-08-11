@@ -11,6 +11,7 @@ from pr_closure.model import (
     ClosureState,
     Contradiction,
     Evidence,
+    MergeableState,
     StateDecision,
     Verdict,
 )
@@ -54,7 +55,17 @@ def derive_state(snapshot, now) -> StateDecision:
     review_verdict = snapshot.review_verdict
     if review_verdict is not None and not isinstance(review_verdict, Verdict):
         review_verdict = Verdict(review_verdict)
+    mergeable = (
+        snapshot.mergeable
+        if isinstance(snapshot.mergeable, MergeableState)
+        else MergeableState(snapshot.mergeable)
+    ) if snapshot.mergeable is not None else None
 
+    if mergeable is MergeableState.CONFLICTING:
+        return _decision(
+            ClosureState.NEEDS_RESOLUTION,
+            ("mergeability is CONFLICTING; resolve merge conflicts before advancing",),
+        )
     if snapshot.merge_state_status == "CONFLICTING":
         return _decision(
             ClosureState.NEEDS_RESOLUTION,
@@ -266,6 +277,7 @@ def _validate(snapshot, now) -> None:
         ("checked_out_branch", snapshot.checked_out_branch),
         ("pr_state", snapshot.pr_state),
         ("repeated_root_cause", snapshot.repeated_root_cause),
+        ("mergeable", snapshot.mergeable),
         ("merge_state_status", snapshot.merge_state_status),
     ):
         if value is not None and not isinstance(value, str):
@@ -291,6 +303,8 @@ def _validate(snapshot, now) -> None:
     ):
         if not isinstance(value, bool):
             raise TypeError(f"{name} must be a bool")
+    if snapshot.mergeable is not None and not isinstance(snapshot.mergeable, MergeableState):
+        MergeableState(snapshot.mergeable)
 
     for name, value in (
         ("blocking_findings", snapshot.blocking_findings),

@@ -127,6 +127,7 @@ def main():
         data.setdefault("isDraft", False)
         data.setdefault("state", "OPEN")
         data.setdefault("mergeStateStatus", "CLEAN")
+        data.setdefault("mergeable", "MERGEABLE")
         data.setdefault("url", "https://github.com/{0}/pull/{1}".format(repository, number))
         data.setdefault("statusCheckRollup", [])
         sys.stdout.write(json.dumps(data))
@@ -663,6 +664,25 @@ class StatusCommandTests(CliTestCase):
         self.assertIn("state: NEEDS_RESOLUTION", proc.stdout)
         self.assertIn("resolve_merge_conflict", proc.stdout)
 
+    def test_status_is_blocked_when_mergeable_is_conflicting(self):
+        self.set_git()
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            mergeStateStatus="DIRTY",
+            mergeable="CONFLICTING",
+        )
+        config = self.write_config()
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        review = self.write_review(commit=COMMIT_A)
+        proc = self.run_cli("import-review", "--config", config, "--pr", str(PR), "--review", review)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("state: NEEDS_RESOLUTION", proc.stdout)
+        self.assertIn("resolve_merge_conflict", proc.stdout)
+
     def test_unknown_merge_state_does_not_block_approval(self):
         self.set_git()
         self.set_gh(
@@ -679,6 +699,18 @@ class StatusCommandTests(CliTestCase):
         proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertEqual("APPROVED", json.loads(proc.stdout)["state"])
+
+    def test_unknown_mergeable_causes_source_malformed(self):
+        self.set_git()
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            mergeable="MYSTERY",
+        )
+        config = self.write_config()
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR))
+        self.assertEqual(3, proc.returncode)
+        self.assertIn("unsupported mergeable", proc.stderr)
 
 
 class ImportReviewTests(CliTestCase):
@@ -1550,6 +1582,26 @@ class CheckTransitionTests(CliTestCase):
         self.assertIn("allowed=no", proc.stdout)
         self.assertIn("denied", proc.stderr)
 
+    def test_mergeable_conflict_denies_transition_to_approved(self):
+        self.set_git()
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            mergeStateStatus="DIRTY",
+            mergeable="CONFLICTING",
+        )
+        config = self.write_config()
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        review = self.write_review(commit=COMMIT_A)
+        proc = self.run_cli("import-review", "--config", config, "--pr", str(PR), "--review", review)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        proc = self.run_cli("check-transition", "--config", config, "--pr", str(PR), "--to", "APPROVED")
+        self.assertEqual(4, proc.returncode)
+        self.assertIn("state=NEEDS_RESOLUTION", proc.stdout)
+        self.assertIn("target=APPROVED", proc.stdout)
+        self.assertIn("allowed=no", proc.stdout)
+
     def test_terminal_state_target_succeeds(self):
         config = self.prepare_approved(verdict="APPROVED")
         proc = self.run_cli("check-transition", "--config", config, "--pr", str(PR), "--to", "APPROVED")
@@ -1780,7 +1832,7 @@ class SyncCommandTests(CliTestCase):
             "UNVERIFIED", "CI_RED", "CI_INFRA_RETRY", "FIXING", "LOCAL_VERIFY",
             "REVIEW_READY", "REVIEWING", "CHANGES_REQUIRED", "DESIGN_RESET",
             "FOLLOW_UP_FILING", "APPROVED_WITH_FOLLOW_UPS", "APPROVED",
-            "NEEDS_OWNER", "STALLED",
+            "NEEDS_RESOLUTION", "NEEDS_OWNER", "STALLED",
         })
 
     def _plant_verification_root(self, kind):

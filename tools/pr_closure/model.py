@@ -27,6 +27,12 @@ class Verdict(StrEnum):
     INCONCLUSIVE = "INCONCLUSIVE"
 
 
+class MergeableState(StrEnum):
+    MERGEABLE = "MERGEABLE"
+    CONFLICTING = "CONFLICTING"
+    UNKNOWN = "UNKNOWN"
+
+
 class ClosureState(StrEnum):
     CI_RED = "CI_RED"
     CI_INFRA_RETRY = "CI_INFRA_RETRY"
@@ -190,6 +196,7 @@ class ClosureSnapshot:
     distinct_repair_strategies: int = 0
     executor_deaths: int = 0
     owner_decision_required: bool = False
+    mergeable: Optional[MergeableState] = None
     merge_state_status: Optional[str] = None
     infra_retry_budget: int = 0
     infra_retries_used: int = 0

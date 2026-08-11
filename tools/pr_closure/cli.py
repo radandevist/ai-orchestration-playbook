@@ -435,6 +435,7 @@ def _status_snapshot(config, pr_number):
         checked_out_branch=facts.checked_out_branch,
         pr_state=pr.state,
         pr_is_draft=pr.is_draft,
+        mergeable=pr.mergeable,
         merge_state_status=pr.merge_state_status,
         worktree_clean=facts.worktree_clean,
         local_verification=local_verification,
@@ -484,6 +485,8 @@ def cmd_status(config, args) -> int:
             "review_verdict": (
                 snapshot.review_verdict.value if snapshot.review_verdict is not None else None
             ),
+            "mergeable": snapshot.mergeable.value if snapshot.mergeable is not None else None,
+            "merge_state_status": snapshot.merge_state_status,
         }
         sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
     else:
@@ -500,6 +503,8 @@ def cmd_status(config, args) -> int:
                     "worktree_clean: {0}".format(_yesno(snapshot.worktree_clean)),
                     "local_verification: {0}".format(_yesno(snapshot.local_verification)),
                     "durable_tip: {0}".format(snapshot.durable_tip or "(none)"),
+                    "mergeable: {0}".format(snapshot.mergeable.value if snapshot.mergeable else "(none)"),
+                    "merge_state_status: {0}".format(snapshot.merge_state_status or "(none)"),
                     "review_verdict: {0}".format(
                         snapshot.review_verdict.value if snapshot.review_verdict else "(none)"
                     ),

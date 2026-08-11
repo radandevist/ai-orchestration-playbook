@@ -9,6 +9,7 @@ from pr_closure.model import (
     ClosureState,
     Contradiction,
     Evidence,
+    MergeableState,
     StateDecision,
     Verdict,
 )
@@ -66,6 +67,16 @@ class StateDerivationTests(unittest.TestCase):
 
     def test_conflict_state_reaches_resolution_gate(self):
         snap = replace(review_ready(), merge_state_status="CONFLICTING")
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.NEEDS_RESOLUTION, decision.state)
+        self.assertIn("resolve_merge_conflict", decision.allowed_actions)
+
+    def test_mergeable_conflict_reaches_resolution_gate(self):
+        snap = replace(
+            review_ready(),
+            mergeable=MergeableState.CONFLICTING,
+            merge_state_status="DIRTY",
+        )
         decision = derive_state(snap, NOW)
         self.assertEqual(ClosureState.NEEDS_RESOLUTION, decision.state)
         self.assertIn("resolve_merge_conflict", decision.allowed_actions)
@@ -346,6 +357,11 @@ class AdversarialPrecedenceTests(unittest.TestCase):
 class FailClosedValidationTests(unittest.TestCase):
     def test_malformed_enum_raises(self):
         snap = replace(review_ready(), ci_state="NOT_A_STATE")
+        with self.assertRaises(ValueError):
+            derive_state(snap, NOW)
+
+    def test_unknown_mergeable_enum_raises(self):
+        snap = replace(review_ready(), mergeable="MAYBE")
         with self.assertRaises(ValueError):
             derive_state(snap, NOW)
 

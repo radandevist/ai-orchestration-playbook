@@ -106,6 +106,7 @@ When the human explicitly optimizes for latency, you may batch several low-risk 
 | `LOCAL_VERIFY` | Work is pushed but the adapter's required local evidence is incomplete or stale. | Run the missing gate, one heavy command at a time. |
 | `REVIEW_READY` | CI and local gates are green at the pushed tip. | Dispatch an independent adversarial review. |
 | `REVIEWING` | One reviewer owns the exact pushed tip. | Wait for a structured verdict; do not edit the reviewed worktree. |
+| `NEEDS_RESOLUTION` | GitHub reports mergeability problems (`mergeable=CONFLICTING`) and changes must be rebased/resolved before other progress. | Resolve merge conflicts, re-run the required gates, and re-check state. |
 | `CHANGES_REQUIRED` | The review contains at least one blocking finding. | Create one fix packet accounting for every blocker. |
 | `DESIGN_RESET` | The same root-cause class survived two attempted repair strategies. | Replace the mechanism or proof strategy, then verify and re-review. |
 | `FOLLOW_UP_FILING` | No blockers remain, but follow-up findings lack issue IDs. | File and verify the issues. |

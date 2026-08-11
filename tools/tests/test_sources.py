@@ -36,7 +36,7 @@ COMMIT_B = "b" * 40
 COMMIT_C = "c" * 40
 NOW = datetime(2026, 8, 8, 12, 0, 0)
 
-PR_JSON_FIELDS = "number,headRefName,headRefOid,isDraft,state,mergeStateStatus,statusCheckRollup,url,baseRefName"
+PR_JSON_FIELDS = "number,headRefName,headRefOid,isDraft,state,mergeStateStatus,mergeable,statusCheckRollup,url,baseRefName"
 GH_BASE = {
     "number": 42,
     "headRefName": "feature/close",
@@ -45,6 +45,7 @@ GH_BASE = {
     "isDraft": False,
     "state": "OPEN",
     "mergeStateStatus": "CLEAN",
+    "mergeable": "MERGEABLE",
     "url": "https://github.com/owner/repo/pull/42",
     "statusCheckRollup": [],
 }
@@ -238,14 +239,15 @@ class MalformedOutputTests(TempDirTestCase):
         for key in (
             "number",
             "headRefName",
-            "headRefOid",
-            "isDraft",
-            "state",
-            "mergeStateStatus",
-            "statusCheckRollup",
-            "url",
-            "baseRefName",
-        ):
+        "headRefOid",
+        "isDraft",
+        "state",
+        "mergeStateStatus",
+        "mergeable",
+        "statusCheckRollup",
+        "url",
+        "baseRefName",
+    ):
             with self.subTest(key=key):
                 data = dict(GH_BASE)
                 del data[key]
@@ -477,6 +479,7 @@ class GitHeadTests(TempDirTestCase):
             is_draft=False,
             state="OPEN",
             merge_state_status="CLEAN",
+            mergeable="MERGEABLE",
             url="https://github.com/owner/repo/pull/42",
             checks=(CheckResult("check_run", "ci", "COMPLETED", "SUCCESS", CheckOutcome.PASSING, None),),
         )
@@ -547,11 +550,28 @@ class GitHubPrTests(TempDirTestCase):
         self.assertFalse(pr.is_draft)
         self.assertEqual("OPEN", pr.state)
         self.assertEqual("CLEAN", pr.merge_state_status)
+        self.assertEqual("MERGEABLE", pr.mergeable)
         self.assertEqual("https://github.com/owner/repo/pull/42", pr.url)
 
     def test_merge_state_status_is_required_and_non_empty(self):
         runner = RecordingRunner({
             "gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response(mergeStateStatus="")
+        })
+        source = GitHubSource("owner/repo", 42, runner=runner)
+        with self.assertRaises(SourceMalformed):
+            source.read_pr()
+
+    def test_mergeable_is_required_and_non_empty(self):
+        runner = RecordingRunner({
+            "gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response(mergeable="")
+        })
+        source = GitHubSource("owner/repo", 42, runner=runner)
+        with self.assertRaises(SourceMalformed):
+            source.read_pr()
+
+    def test_unknown_mergeable_state_is_source_malformed(self):
+        runner = RecordingRunner({
+            "gh pr view 42 --repo owner/repo --json " + PR_JSON_FIELDS: gh_response(mergeable="MAYBE")
         })
         source = GitHubSource("owner/repo", 42, runner=runner)
         with self.assertRaises(SourceMalformed):
@@ -911,6 +931,7 @@ class CheckRollupTests(TempDirTestCase):
             repository="owner/repo", number=42, head_branch="f", base_ref_name="develop",
             head_oid=COMMIT_A, is_draft=False, state="OPEN", url="u",
             merge_state_status="CLEAN",
+            mergeable="MERGEABLE",
             checks=(parse_check(check_run("lint", "COMPLETED", "SUCCESS")),),
         )
         self.assertEqual(CheckOutcome.PASSING, pr.checks[0].outcome)
