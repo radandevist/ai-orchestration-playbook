@@ -39,6 +39,7 @@ class ClosureState(StrEnum):
     FOLLOW_UP_FILING = "FOLLOW_UP_FILING"
     APPROVED_WITH_FOLLOW_UPS = "APPROVED_WITH_FOLLOW_UPS"
     APPROVED = "APPROVED"
+    NEEDS_RESOLUTION = "NEEDS_RESOLUTION"
     NEEDS_OWNER = "NEEDS_OWNER"
     STALLED = "STALLED"
     UNVERIFIED = "UNVERIFIED"
@@ -189,6 +190,7 @@ class ClosureSnapshot:
     distinct_repair_strategies: int = 0
     executor_deaths: int = 0
     owner_decision_required: bool = False
+    merge_state_status: Optional[str] = None
     infra_retry_budget: int = 0
     infra_retries_used: int = 0
     stagnation_budget_minutes: int = 0

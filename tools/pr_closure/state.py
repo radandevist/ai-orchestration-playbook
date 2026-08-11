@@ -16,6 +16,7 @@ from pr_closure.model import (
 )
 
 ALLOWED_ACTIONS: Mapping[ClosureState, Tuple[str, ...]] = {
+    ClosureState.NEEDS_RESOLUTION: ("resolve_merge_conflict",),
     ClosureState.CI_RED: ("implement_or_verify_fix",),
     ClosureState.CI_INFRA_RETRY: ("rerun_failed_job",),
     ClosureState.FIXING: ("commit", "push", "verify"),
@@ -53,6 +54,12 @@ def derive_state(snapshot, now) -> StateDecision:
     review_verdict = snapshot.review_verdict
     if review_verdict is not None and not isinstance(review_verdict, Verdict):
         review_verdict = Verdict(review_verdict)
+
+    if snapshot.merge_state_status == "CONFLICTING":
+        return _decision(
+            ClosureState.NEEDS_RESOLUTION,
+            ("merge state is CONFLICTING; resolve merge conflicts before advancing",),
+        )
 
     missing = _missing_evidence(snapshot, ci_state, review_verdict)
     contradictions = _contradictions(snapshot)
@@ -259,6 +266,7 @@ def _validate(snapshot, now) -> None:
         ("checked_out_branch", snapshot.checked_out_branch),
         ("pr_state", snapshot.pr_state),
         ("repeated_root_cause", snapshot.repeated_root_cause),
+        ("merge_state_status", snapshot.merge_state_status),
     ):
         if value is not None and not isinstance(value, str):
             raise TypeError(f"{name} must be a str or None")

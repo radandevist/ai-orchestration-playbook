@@ -515,13 +515,17 @@ class WorktreeResolver:
 # GitHub PR reading
 # ---------------------------------------------------------------------------
 
-PR_JSON_FIELDS = "number,headRefName,headRefOid,isDraft,state,statusCheckRollup,url,baseRefName"
+PR_JSON_FIELDS = (
+    "number,headRefName,headRefOid,isDraft,state,mergeStateStatus,"
+    "statusCheckRollup,url,baseRefName"
+)
 _REQUIRED_PR_KEYS = (
     "number",
     "headRefName",
     "headRefOid",
     "isDraft",
     "state",
+    "mergeStateStatus",
     "statusCheckRollup",
     "url",
     "baseRefName",
@@ -570,6 +574,7 @@ class PullRequestFacts:
     head_oid: str
     is_draft: bool
     state: str
+    merge_state_status: str
     url: str
     checks: Tuple[CheckResult, ...]
 
@@ -803,6 +808,7 @@ class GitHubSource:
             raise SourceMalformed(
                 "unsupported PR state {0!r} for: {1}".format(state, _describe_command(argv))
             )
+        merge_state_status = _require_non_empty_str(data["mergeStateStatus"], "mergeStateStatus", argv)
         url = _require_pr_url(data["url"], self._repository, self._pr_number, argv)
         rollup = data["statusCheckRollup"]
         if not isinstance(rollup, list):
@@ -818,6 +824,7 @@ class GitHubSource:
             head_oid=head_oid,
             is_draft=is_draft,
             state=state,
+            merge_state_status=merge_state_status,
             url=url,
             checks=checks,
         )

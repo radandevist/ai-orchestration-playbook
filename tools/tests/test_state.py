@@ -64,6 +64,17 @@ class StateDerivationTests(unittest.TestCase):
         self.assertEqual(("branch CI failure",), decision.reasons)
         self.assertEqual(ALLOWED_ACTIONS[ClosureState.CI_RED], decision.allowed_actions)
 
+    def test_conflict_state_reaches_resolution_gate(self):
+        snap = replace(review_ready(), merge_state_status="CONFLICTING")
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.NEEDS_RESOLUTION, decision.state)
+        self.assertIn("resolve_merge_conflict", decision.allowed_actions)
+
+    def test_unknown_merge_state_does_not_block_approved_tip(self):
+        snap = replace(approved_snapshot(), merge_state_status="UNKNOWN")
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.APPROVED, decision.state)
+
     def test_infra_failure_enters_bounded_retry(self):
         snap = replace(
             review_ready(),
@@ -303,6 +314,7 @@ class AdversarialPrecedenceTests(unittest.TestCase):
 
     def test_all_states_and_actions_are_deterministic_tuples(self):
         expected_states = {
+            "NEEDS_RESOLUTION",
             "CI_RED",
             "CI_INFRA_RETRY",
             "FIXING",

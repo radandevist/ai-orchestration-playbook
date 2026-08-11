@@ -435,6 +435,7 @@ def _status_snapshot(config, pr_number):
         checked_out_branch=facts.checked_out_branch,
         pr_state=pr.state,
         pr_is_draft=pr.is_draft,
+        merge_state_status=pr.merge_state_status,
         worktree_clean=facts.worktree_clean,
         local_verification=local_verification,
         ci_state=ci.ci_state,

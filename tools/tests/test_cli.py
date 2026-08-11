@@ -126,6 +126,7 @@ def main():
         data.setdefault("headRefOid", "a" * 40)
         data.setdefault("isDraft", False)
         data.setdefault("state", "OPEN")
+        data.setdefault("mergeStateStatus", "CLEAN")
         data.setdefault("url", "https://github.com/{0}/pull/{1}".format(repository, number))
         data.setdefault("statusCheckRollup", [])
         sys.stdout.write(json.dumps(data))
@@ -588,7 +589,7 @@ class StatusCommandTests(CliTestCase):
         self.assertIn(payload["state"], {
             "UNVERIFIED", "CI_RED", "CI_INFRA_RETRY", "FIXING", "LOCAL_VERIFY",
             "REVIEW_READY", "REVIEWING", "CHANGES_REQUIRED", "DESIGN_RESET",
-            "FOLLOW_UP_FILING", "APPROVED_WITH_FOLLOW_UPS", "APPROVED",
+            "FOLLOW_UP_FILING", "APPROVED_WITH_FOLLOW_UPS", "APPROVED", "NEEDS_RESOLUTION",
             "NEEDS_OWNER", "STALLED",
         })
         self.assertEqual([], [line for line in proc.stderr.splitlines() if line])
@@ -648,6 +649,36 @@ class StatusCommandTests(CliTestCase):
         proc = self.run_cli("status", "--config", config, "--pr", str(PR))
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertIn("state: UNVERIFIED", proc.stdout)
+
+    def test_status_is_blocked_for_merge_conflicts(self):
+        self.set_git()
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            mergeStateStatus="CONFLICTING",
+        )
+        config = self.write_config()
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("state: NEEDS_RESOLUTION", proc.stdout)
+        self.assertIn("resolve_merge_conflict", proc.stdout)
+
+    def test_unknown_merge_state_does_not_block_approval(self):
+        self.set_git()
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            mergeStateStatus="UNKNOWN",
+        )
+        config = self.write_config()
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        review = self.write_review(commit=COMMIT_A)
+        proc = self.run_cli("import-review", "--config", config, "--pr", str(PR), "--review", review)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual("APPROVED", json.loads(proc.stdout)["state"])
 
 
 class ImportReviewTests(CliTestCase):
