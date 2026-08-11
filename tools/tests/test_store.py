@@ -10,8 +10,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from pr_closure.contract import command_sequence_digest, legacy_command_sequence_digest
+from pr_closure.model import ClosureState
 from pr_closure.store import (
     COMMIT_EVENT,
+    REPAIR_STRATEGY_EVENT,
+    REVIEW_DISPATCH_EVENT,
     REVIEW_EVENT,
     VERIFICATION_EVENT,
     EvidenceConflict,
@@ -302,18 +305,121 @@ class AppendOnlyEventTests(StoreTestCase):
             self.durable_file("config"),
             payload={"stagnation_budget_minutes": 240, "infra_retry_budget": 1},
         )
-        store.append_event(
-            "REPAIR_STRATEGY",
-            COMMIT_A,
-            self.durable_file("repair"),
-            payload={"root_cause": "missing-invariant", "strategy": "syntax-patch-1"},
-        )
         events = store.read_events()
         self.assertEqual(240, events[0]["stagnation_budget_minutes"])
         self.assertEqual(1, events[0]["infra_retry_budget"])
-        self.assertEqual("REPAIR_STRATEGY", events[1]["event_type"])
-        self.assertEqual("missing-invariant", events[1]["root_cause"])
-        self.assertEqual("syntax-patch-1", events[1]["strategy"])
+
+    def test_generic_append_cannot_mint_lifecycle_events(self):
+        cases = (
+            (
+                REVIEW_DISPATCH_EVENT,
+                {"lane_id": "review-a"},
+            ),
+            (
+                REPAIR_STRATEGY_EVENT,
+                {
+                    "root_cause": "missing-invariant",
+                    "strategy": "structural-guard",
+                    "lane_id": "fix-a",
+                },
+            ),
+        )
+        for index, (event_type, payload) in enumerate(cases, start=1):
+            with self.subTest(event_type=event_type):
+                store = RunStore(self.root, "proj", 40 + index)
+                with self.assertRaises(StoreError):
+                    store.append_event(
+                        event_type,
+                        COMMIT_A,
+                        str(store.events_path),
+                        payload=payload,
+                    )
+                self.assertFalse(store.events_path.exists())
+
+    def test_typed_lifecycle_writers_preserve_valid_flow(self):
+        store = RunStore(self.root, "proj", 42)
+
+        store.record_review_dispatch(
+            COMMIT_A,
+            lane_id="review-a",
+            current_state=ClosureState.REVIEW_READY,
+        )
+        store.record_repair_strategy(
+            COMMIT_A,
+            root_cause="missing-invariant",
+            strategy="structural-guard",
+            lane_id="fix-a",
+            current_state=ClosureState.CHANGES_REQUIRED,
+        )
+
+        events = store.read_events()
+        self.assertEqual(
+            [REVIEW_DISPATCH_EVENT, REPAIR_STRATEGY_EVENT],
+            [event["event_type"] for event in events],
+        )
+
+    def test_lifecycle_writers_reject_conflicting_source_states(self):
+        store = RunStore(self.root, "proj", 42)
+
+        with self.assertRaises(StoreError):
+            store.record_review_dispatch(
+                COMMIT_A,
+                lane_id="review-a",
+                current_state=ClosureState.CHANGES_REQUIRED,
+            )
+        with self.assertRaises(StoreError):
+            store.record_repair_strategy(
+                COMMIT_A,
+                root_cause="missing-invariant",
+                strategy="structural-guard",
+                lane_id="fix-a",
+                current_state=ClosureState.DESIGN_RESET,
+            )
+
+        self.assertFalse(store.events_path.exists())
+
+    def test_repair_writer_rejects_third_strategy_even_with_forged_source_state(self):
+        store = RunStore(self.root, "proj", 42)
+        for commit, strategy, lane_id in (
+            (COMMIT_A, "structural-guard", "fix-a"),
+            (COMMIT_B, "boundary-validation", "fix-b"),
+        ):
+            store.record_repair_strategy(
+                commit,
+                root_cause="missing-invariant",
+                strategy=strategy,
+                lane_id=lane_id,
+                current_state=ClosureState.CHANGES_REQUIRED,
+            )
+
+        with self.assertRaises(StoreError):
+            store.record_repair_strategy(
+                COMMIT_C,
+                root_cause="missing-invariant",
+                strategy="third-instance-patch",
+                lane_id="fix-c",
+                current_state=ClosureState.CHANGES_REQUIRED,
+            )
+
+        self.assertEqual(2, len(store.read_events()))
+
+    def test_legacy_lifecycle_events_remain_readable(self):
+        store = RunStore(self.root, "proj", 42)
+        store.events_path.parent.mkdir(parents=True)
+        legacy = {
+            "schema_version": 1,
+            "timestamp": "2026-08-08T12:00:00+00:00",
+            "project": "proj",
+            "pr": 42,
+            "commit": COMMIT_A,
+            "event_type": REPAIR_STRATEGY_EVENT,
+            "evidence_path": self.durable_file("legacy-repair"),
+            "root_cause": "missing-invariant",
+            "strategy": "legacy-instance-patch",
+        }
+        store.events_path.write_text(json.dumps(legacy, sort_keys=True) + "\n")
+
+        self.assertEqual((legacy,), store.read_events())
 
 
 class AtomicRecordWriteTests(StoreTestCase):
@@ -827,7 +933,7 @@ class PayloadCannotOverrideEnvelopeTests(StoreTestCase):
             with self.subTest(key=key):
                 with self.assertRaises(MalformedEvidence):
                     store.append_event(
-                        "REPAIR_STRATEGY",
+                        "STAGNATION_CONFIG",
                         COMMIT_A,
                         self.durable_file("tip"),
                         payload={key: "hijacked"},
@@ -841,13 +947,13 @@ class PayloadCannotOverrideEnvelopeTests(StoreTestCase):
             ("project", "proj"),
             ("pr", 42),
             ("schema_version", 1),
-            ("event_type", "REPAIR_STRATEGY"),
+            ("event_type", "STAGNATION_CONFIG"),
         )
         for key, value in identical:
             with self.subTest(key=key):
                 with self.assertRaises(MalformedEvidence):
                     store.append_event(
-                        "REPAIR_STRATEGY",
+                        "STAGNATION_CONFIG",
                         COMMIT_A,
                         self.durable_file("tip"),
                         payload={key: value},
@@ -863,13 +969,13 @@ class PayloadCannotOverrideEnvelopeTests(StoreTestCase):
     def test_payload_with_no_reserved_keys_is_preserved(self):
         store = RunStore(self.root, "proj", 42)
         store.append_event(
-            "REPAIR_STRATEGY",
+            "STAGNATION_CONFIG",
             COMMIT_A,
             self.durable_file("tip"),
             payload={"root_cause": "x"},
         )
         event = store.read_events()[0]
-        self.assertEqual("REPAIR_STRATEGY", event["event_type"])
+        self.assertEqual("STAGNATION_CONFIG", event["event_type"])
         self.assertEqual(COMMIT_A, event["commit"])
         self.assertEqual("proj", event["project"])
         self.assertEqual(42, event["pr"])

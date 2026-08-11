@@ -284,6 +284,19 @@ class AdversarialPrecedenceTests(unittest.TestCase):
         decision = derive_state(snap, NOW)
         self.assertEqual(ClosureState.DESIGN_RESET, decision.state)
 
+    def test_design_reset_precedes_a_later_fixing_lane(self):
+        snap = replace(
+            review_ready(),
+            fixing_lane_active=True,
+            blocking_findings=("F-1",),
+            review_verdict=Verdict.CHANGES_REQUIRED,
+            review_commit=COMMIT_A,
+            repeated_root_cause="missing-invariant",
+            distinct_repair_strategies=2,
+        )
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.DESIGN_RESET, decision.state)
+
     def test_blocker_precedes_follow_up_filing(self):
         snap = replace(
             review_ready(),

@@ -15,7 +15,7 @@ from unittest import mock
 
 from pr_closure.cli import ProjectionFailure, _invoke_adapter
 from pr_closure.lease import HeavyJobLease
-from pr_closure.store import RunStore
+from pr_closure.store import REPAIR_STRATEGY_EVENT, RunStore, StoreError
 
 COMMIT_A = "a" * 40
 COMMIT_B = "b" * 40
@@ -1800,8 +1800,11 @@ class LifecycleCommandTests(CliTestCase):
 
     def test_repair_strategy_drives_fixing_from_current_blocker(self):
         config = self.prepare_tip()
+        self.assertEqual("REVIEW_READY", self.status_state(config))
         self.dispatch_review(config, "review-a")
+        self.assertEqual("REVIEWING", self.status_state(config))
         self.import_blocking_review(config, COMMIT_A, "review-a")
+        self.assertEqual("CHANGES_REQUIRED", self.status_state(config))
 
         self.record_repair(config, "structural-guard", "fix-a")
 
@@ -1836,6 +1839,21 @@ class LifecycleCommandTests(CliTestCase):
         )
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertIn("allowed=yes", proc.stdout)
+
+        store = RunStore(self.state_dir, PROJECT, PR)
+        with self.assertRaises(StoreError):
+            store.append_event(
+                REPAIR_STRATEGY_EVENT,
+                COMMIT_C,
+                str(store.events_path),
+                payload={
+                    "root_cause": self.ROOT_CAUSE,
+                    "strategy": "third-instance-patch",
+                    "lane_id": "fix-c",
+                },
+            )
+        self.assertEqual("DESIGN_RESET", self.status_state(config))
+
 
 class SyncCommandTests(CliTestCase):
 

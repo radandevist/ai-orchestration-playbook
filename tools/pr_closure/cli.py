@@ -736,11 +736,10 @@ def cmd_record_review_dispatch(config, args) -> int:
         )
         return EXIT_TRANSITION_DENIED
     store = RunStore(config.closure_state_dir, config.project, args.pr)
-    store.append_event(
-        REVIEW_DISPATCH_EVENT,
+    store.record_review_dispatch(
         snapshot.local_commit,
-        str(store.events_path),
-        payload={"lane_id": lane_id},
+        lane_id=lane_id,
+        current_state=decision.state,
     )
     return EXIT_OK
 
@@ -762,15 +761,12 @@ def cmd_record_repair_strategy(config, args) -> int:
             "root-cause must name a current blocking review finding"
         )
     store = RunStore(config.closure_state_dir, config.project, args.pr)
-    store.append_event(
-        REPAIR_STRATEGY_EVENT,
+    store.record_repair_strategy(
         snapshot.local_commit,
-        str(store.events_path),
-        payload={
-            "root_cause": root_cause,
-            "strategy": strategy,
-            "lane_id": lane_id,
-        },
+        root_cause=root_cause,
+        strategy=strategy,
+        lane_id=lane_id,
+        current_state=decision.state,
     )
     return EXIT_OK
 

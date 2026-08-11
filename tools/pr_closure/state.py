@@ -105,6 +105,16 @@ def derive_state(snapshot, now) -> StateDecision:
     ):
         return _decision(ClosureState.STALLED, ("no progress within stagnation budget",))
 
+    design_reset = (
+        snapshot.repeated_root_cause is not None
+        and snapshot.distinct_repair_strategies >= 2
+    )
+    if design_reset and snapshot.fixing_lane_active and snapshot.blocking_findings:
+        return _decision(
+            ClosureState.DESIGN_RESET,
+            ("repeated root cause survived two repair strategies",),
+        )
+
     if snapshot.fixing_lane_active and snapshot.blocking_findings:
         return _decision(ClosureState.FIXING, ("fix packet owns blocking findings",))
 
@@ -121,7 +131,7 @@ def derive_state(snapshot, now) -> StateDecision:
     if snapshot.review_owned and review_verdict is None and ci_state is CiState.PASSING:
         return _decision(ClosureState.REVIEWING, ("independent review in progress",))
 
-    if snapshot.repeated_root_cause is not None and snapshot.distinct_repair_strategies >= 2:
+    if design_reset:
         return _decision(
             ClosureState.DESIGN_RESET,
             ("repeated root cause survived two repair strategies",),

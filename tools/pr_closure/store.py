@@ -16,6 +16,7 @@ from pr_closure.contract import (
     command_sequence_digest,
     legacy_command_sequence_digest,
 )
+from pr_closure.model import ClosureState
 
 
 class StoreError(ValueError):
@@ -38,11 +39,19 @@ class MalformedEvidence(StoreError):
     """Raised when an event or artifact cannot be parsed as authoritative evidence."""
 
 
+class LifecycleTransitionError(StoreError):
+    """Raised when a lifecycle writer is used outside its required source state."""
+
+
 COMMIT_EVENT = "commit"
 VERIFICATION_EVENT = "verification"
 REVIEW_EVENT = "review"
 REPAIR_STRATEGY_EVENT = "REPAIR_STRATEGY"
 REVIEW_DISPATCH_EVENT = "REVIEW_DISPATCH"
+
+LIFECYCLE_EVENT_TYPES = frozenset(
+    (REPAIR_STRATEGY_EVENT, REVIEW_DISPATCH_EVENT)
+)
 
 EVENT_SCHEMA_VERSION = 1
 
@@ -160,6 +169,14 @@ def _require_durable(path, label: str = "evidence path") -> str:
 def _require_json_object(value, label: str) -> dict:
     if not isinstance(value, dict):
         raise MalformedEvidence(f"{label} must be a JSON object")
+    return value
+
+
+def _require_lifecycle_text(value, label: str) -> str:
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise MalformedEvidence(
+            f"{label} must be a non-empty string without surrounding whitespace"
+        )
     return value
 
 
@@ -342,6 +359,9 @@ class RunStore:
     ) -> dict:
         """Append one newline-delimited JSON event without touching prior bytes.
 
+        Lifecycle events are deliberately excluded from this generic seam.
+        Callers must use the state-checked lifecycle writers instead.
+
         Verification and review artifact events must bind the exact artifact
         bytes through ``content_digest`` (C6D-F3); verification artifact
         events additionally bind the immutable ``config_digest`` config
@@ -350,6 +370,30 @@ class RunStore:
         ``content_digest`` and ``config_digest`` are envelope-owned and can
         never be injected through ``payload``.
         """
+        if event_type in LIFECYCLE_EVENT_TYPES:
+            raise LifecycleTransitionError(
+                "{0} must be recorded through its state-checked lifecycle writer".format(
+                    event_type
+                )
+            )
+        return self._append_event(
+            event_type,
+            commit,
+            evidence_path,
+            payload=payload,
+            content_digest=content_digest,
+            config_digest=config_digest,
+        )
+
+    def _append_event(
+        self,
+        event_type,
+        commit,
+        evidence_path,
+        payload: Optional[Mapping] = None,
+        content_digest: Optional[str] = None,
+        config_digest: Optional[str] = None,
+    ) -> dict:
         if not isinstance(event_type, str) or event_type not in KNOWN_EVENT_TYPES:
             raise MalformedEvidence(
                 f"unknown event_type: {event_type!r}; known types: "
@@ -404,6 +448,99 @@ class RunStore:
     def record_commit(self, commit, evidence_path, payload: Optional[Mapping] = None) -> dict:
         """Record a newly observed pushed commit as the current tip."""
         return self.append_event(COMMIT_EVENT, commit, evidence_path, payload)
+
+    def record_review_dispatch(
+        self,
+        commit,
+        *,
+        lane_id: str,
+        current_state: ClosureState,
+    ) -> dict:
+        """Record review ownership from the exact REVIEW_READY source state."""
+        self._require_lifecycle_source_state(
+            REVIEW_DISPATCH_EVENT,
+            current_state,
+            ClosureState.REVIEW_READY,
+        )
+        lane_id = _require_lifecycle_text(lane_id, "lane_id")
+        return self._append_event(
+            REVIEW_DISPATCH_EVENT,
+            commit,
+            str(self.events_path),
+            payload={"lane_id": lane_id},
+        )
+
+    def record_repair_strategy(
+        self,
+        commit,
+        *,
+        root_cause: str,
+        strategy: str,
+        lane_id: str,
+        current_state: ClosureState,
+    ) -> dict:
+        """Record a repair lane without allowing the design-reset latch to reopen."""
+        self._require_lifecycle_source_state(
+            REPAIR_STRATEGY_EVENT,
+            current_state,
+            ClosureState.CHANGES_REQUIRED,
+        )
+        root_cause = _require_lifecycle_text(root_cause, "root_cause")
+        strategy = _require_lifecycle_text(strategy, "strategy")
+        lane_id = _require_lifecycle_text(lane_id, "lane_id")
+
+        prior_strategies = set()
+        for event in self.read_events():
+            if event["event_type"] != REPAIR_STRATEGY_EVENT:
+                continue
+            prior_root_cause = _require_lifecycle_text(
+                event.get("root_cause"),
+                "stored REPAIR_STRATEGY root_cause",
+            )
+            if prior_root_cause != root_cause:
+                continue
+            prior_strategies.add(
+                _require_lifecycle_text(
+                    event.get("strategy"),
+                    "stored REPAIR_STRATEGY strategy",
+                )
+            )
+        if len(prior_strategies) >= 2:
+            raise LifecycleTransitionError(
+                "REPAIR_STRATEGY denied: DESIGN_RESET is terminal for root cause {0!r}".format(
+                    root_cause
+                )
+            )
+
+        return self._append_event(
+            REPAIR_STRATEGY_EVENT,
+            commit,
+            str(self.events_path),
+            payload={
+                "root_cause": root_cause,
+                "strategy": strategy,
+                "lane_id": lane_id,
+            },
+        )
+
+    @staticmethod
+    def _require_lifecycle_source_state(
+        event_type: str,
+        current_state: ClosureState,
+        required_state: ClosureState,
+    ) -> None:
+        if not isinstance(current_state, ClosureState):
+            raise LifecycleTransitionError(
+                "{0} current_state must be a ClosureState".format(event_type)
+            )
+        if current_state is not required_state:
+            raise LifecycleTransitionError(
+                "{0} denied: current state {1} is not {2}".format(
+                    event_type,
+                    current_state.value,
+                    required_state.value,
+                )
+            )
 
     def _require_event_envelope(self, event: dict, number: int, path: Path) -> None:
         def fail(detail: str) -> None:
