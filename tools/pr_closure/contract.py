@@ -267,6 +267,20 @@ def command_digest(command: str) -> str:
     return hashlib.sha256(command.encode("utf-8")).hexdigest()
 
 
+def legacy_command_sequence_digest(sequence) -> str:
+    """Legacy SHA-256 identity of an ordered ``(phase, command_digest)`` list.
+
+    This is the pre-timeout binding format retained for explicit
+    compatibility checks when reading historical verification artifacts that did
+    not persist ``verification_command_timeout_seconds``.
+    """
+    payload = json.dumps(
+        [[phase, digest] for phase, digest in sequence],
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def command_sequence_digest(sequence, verification_command_timeout_seconds: int = 300) -> str:
     """SHA-256 identity of an exact ordered command identity sequence.
 

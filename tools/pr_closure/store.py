@@ -11,7 +11,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping, Optional, Tuple
 
-from pr_closure.contract import COMMIT_ID_PATTERN, command_sequence_digest
+from pr_closure.contract import (
+    COMMIT_ID_PATTERN,
+    command_sequence_digest,
+    legacy_command_sequence_digest,
+)
 
 
 class StoreError(ValueError):
@@ -732,7 +736,15 @@ class RunStore:
                     "verification artifact must declare outcome PASSED: {0}".format(path)
                 )
             sequence = self._require_command_sequence(record, target)
-            configured_timeout = record.get("verification_command_timeout_seconds", 300)
+            if "verification_command_timeout_seconds" not in record:
+                if config_digest != legacy_command_sequence_digest(sequence):
+                    raise MalformedEvidence(
+                        "verification record commands contradict its config identity: {0}".format(
+                            path
+                        )
+                    )
+                return record
+            configured_timeout = record["verification_command_timeout_seconds"]
             if isinstance(configured_timeout, bool) or not isinstance(
                 configured_timeout, int
             ):
@@ -745,7 +757,6 @@ class RunStore:
                 )
             if (
                 command_sequence_digest(sequence, configured_timeout) != config_digest
-                and command_sequence_digest(sequence) != config_digest
             ):
                 raise MalformedEvidence(
                     "verification record commands contradict its config identity: {0}".format(

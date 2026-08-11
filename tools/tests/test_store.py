@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from pr_closure.contract import command_sequence_digest
+from pr_closure.contract import command_sequence_digest, legacy_command_sequence_digest
 from pr_closure.store import (
     COMMIT_EVENT,
     REVIEW_EVENT,
@@ -51,6 +51,7 @@ def _verification_record(
         "commit": commit,
         "config_digest": config_digest,
         "completed_at": started_at,
+        "verification_command_timeout_seconds": 300,
         "outcome": "PASSED",
         "commands": [
             _command_entry(phase, command, index, started_at=started_at, ended_at=ended_at)
@@ -589,6 +590,27 @@ class BoundArtifactSeamTests(StoreTestCase):
         store.record_commit(COMMIT_A, self.durable_file("tip"))
         _write_verification(store, COMMIT_A)
         self.assertEqual(_verification_record(), store.bound_verification(COMMIT_A, _expected_commands()))
+
+    def test_legacy_verification_without_timeout_is_not_selected_for_new_timeout(self):
+        store = RunStore(self.root, "proj", 42)
+        commands = _expected_commands()
+        store.record_commit(COMMIT_A, self.durable_file("tip"))
+        legacy_digest = legacy_command_sequence_digest(commands)
+        legacy_record = dict(_verification_record(config_digest=legacy_digest))
+        legacy_record.pop("verification_command_timeout_seconds", None)
+        store.write_verification(COMMIT_A, legacy_digest, legacy_record)
+        self.assertIsNone(store.bound_verification(COMMIT_A, commands, expected_verification_command_timeout_seconds=5))
+
+    def test_new_verification_without_timeout_is_rejected_as_malformed(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip"))
+        commands = _expected_commands()
+        new_digest = command_sequence_digest(commands, verification_command_timeout_seconds=5)
+        new_record = dict(_verification_record(config_digest=new_digest))
+        new_record.pop("verification_command_timeout_seconds", None)
+        store.write_verification(COMMIT_A, new_digest, new_record)
+        with self.assertRaises(MalformedEvidence):
+            store.bound_verification(COMMIT_A, commands, expected_verification_command_timeout_seconds=5)
 
     def test_orphan_verification_artifact_fails_closed(self):
         store = RunStore(self.root, "proj", 42)
