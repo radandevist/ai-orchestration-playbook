@@ -90,6 +90,9 @@ PROJECTION_CHANGE_TYPES = frozenset(
     {"list_update", "card_update", "card_create", "card_move", "card_archive"}
 )
 
+_TERMINATE_PROCESS_SIGNAL = getattr(signal, "SIGTERM", signal.SIGINT)
+_KILL_PROCESS_SIGNAL = getattr(signal, "SIGKILL", _TERMINATE_PROCESS_SIGNAL)
+
 # GitHub issue states that prove a filed follow-up is still live.
 ACCEPTABLE_ISSUE_STATES = frozenset({"OPEN", "SCHEDULED"})
 
@@ -138,7 +141,7 @@ def _read_config(path: str) -> Mapping:
     return data
 
 
-def _run_shell_command(command: str, cwd: str, timeout_seconds: int = 60) -> dict:
+def _run_shell_command(command: str, cwd: str, timeout_seconds: int) -> dict:
     """Run one configured shell command string in the resolved PR worktree.
 
     The command is always passed as exactly one ``sh -c`` argv element and
@@ -174,7 +177,7 @@ def _run_shell_command(command: str, cwd: str, timeout_seconds: int = 60) -> dic
         proc.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         timed_out = True
-        _terminate_process_group(proc, signal.SIGTERM)
+        _terminate_process_group(proc, _TERMINATE_PROCESS_SIGNAL)
         _reap_process(proc)
     ended = datetime.now(timezone.utc)
     result = {
@@ -183,6 +186,8 @@ def _run_shell_command(command: str, cwd: str, timeout_seconds: int = 60) -> dic
         "exit_status": proc.returncode,
     }
     if timed_out:
+        if proc.returncode is None:
+            proc.returncode = -1
         result["timed_out"] = True
         result["failure_reason"] = "timeout"
     return result
@@ -322,7 +327,11 @@ def _status_snapshot(config, pr_number):
         for command in getattr(config, attr)
     )
     local_verification = None
-    verification = store.bound_verification(facts.local_commit, expected_commands)
+    verification = store.bound_verification(
+        facts.local_commit,
+        expected_commands,
+        config.verification_command_timeout_seconds,
+    )
     if verification is not None:
         local_verification = True
     elif any(
@@ -542,7 +551,10 @@ def cmd_record_verification(config, args) -> int:
     expected_commands = tuple(
         (phase, command_digest(command)) for phase, command in commands
     )
-    config_digest = command_sequence_digest(expected_commands)
+    config_digest = command_sequence_digest(
+        expected_commands,
+        config.verification_command_timeout_seconds,
+    )
     store, git, facts = _bind_verification_target(config, args.pr)
     commit = facts.local_commit
     worktree = facts.worktree_path
@@ -585,6 +597,7 @@ def cmd_record_verification(config, args) -> int:
                 "commit": commit,
                 "config_digest": config_digest,
                 "outcome": "PASSED",
+                "verification_command_timeout_seconds": config.verification_command_timeout_seconds,
                 "started_at": runs[0]["started_at"],
                 "ended_at": runs[-1]["ended_at"],
                 "commands": runs,
@@ -677,7 +690,7 @@ def _require_projection_adapter(path):
     return path
 
 
-def _terminate_process_group(proc, signal_to_send=signal.SIGKILL) -> None:
+def _terminate_process_group(proc, signal_to_send=None) -> None:
     """Kill the adapter/verification child process group, with a per-platform fallback.
 
     The adapter starts as a session leader (``start_new_session=True``), so
@@ -686,6 +699,8 @@ def _terminate_process_group(proc, signal_to_send=signal.SIGKILL) -> None:
     bounded read loop. Platforms without process groups fall back to killing
     only the direct child.
     """
+    if signal_to_send is None:
+        signal_to_send = _KILL_PROCESS_SIGNAL
     if os.name == "posix":
         try:
             os.killpg(proc.pid, signal_to_send)
@@ -703,11 +718,12 @@ def _reap_process(proc) -> None:
     try:
         proc.wait(timeout=5)
     except (subprocess.TimeoutExpired, TimeoutError):
-        _terminate_process_group(proc, signal.SIGKILL)
-        try:
-            proc.wait(timeout=5)
-        except (subprocess.TimeoutExpired, TimeoutError):
-            pass
+        pass
+    _terminate_process_group(proc, _KILL_PROCESS_SIGNAL)
+    try:
+        proc.wait(timeout=5)
+    except (subprocess.TimeoutExpired, TimeoutError):
+        pass
 
 
 def _invoke_adapter(argv, timeout):

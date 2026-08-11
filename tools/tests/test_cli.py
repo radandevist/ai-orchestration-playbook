@@ -237,12 +237,18 @@ while True:
 
 _TIMEOUT_CHILD_SCRIPT = r'''#!/usr/bin/env python3
 import os
+import signal
 import subprocess
 import sys
 import time
 
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
 child = subprocess.Popen(
-    [sys.executable, "-c", "import time; time.sleep(120)"],
+    [
+        sys.executable,
+        "-c",
+        "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); import time; time.sleep(120)",
+    ],
 )
 with open(os.environ["ADAPTER_PIDFILE"], "w") as handle:
     handle.write(str(child.pid))
@@ -865,8 +871,9 @@ class RecordVerificationTests(CliTestCase):
     @staticmethod
     def _process_exists(pid: int) -> bool:
         try:
-            os.kill(pid, 0)
-            return True
+            with open("/proc/{0}/stat".format(pid), "r", encoding="utf-8") as handle:
+                state = handle.read().split()[2]
+            return state != "Z"
         except OSError:
             return False
 
@@ -2656,6 +2663,38 @@ class SameTipReverificationCliTests(CliTestCase):
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertIn("state: REVIEW_READY", proc.stdout)
 
+    def test_timeout_variation_changes_verification_identity(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config_short = self.write_config(
+            overrides={"verification_command_timeout_seconds": 1}
+        )
+        short = self.run_cli(
+            "record-verification", "--config", config_short, "--pr", str(PR)
+        )
+        self.assertEqual(0, short.returncode, short.stderr)
+        config_long = self.write_config(
+            overrides={"verification_command_timeout_seconds": 2}
+        )
+        before = self.run_cli(
+            "status", "--config", config_long, "--pr", str(PR), "--json"
+        )
+        self.assertEqual(0, before.returncode, before.stderr)
+        self.assertFalse(json.loads(before.stdout)["local_verification"])
+        long_pass = self.run_cli(
+            "record-verification", "--config", config_long, "--pr", str(PR)
+        )
+        self.assertEqual(0, long_pass.returncode, long_pass.stderr)
+        after = self.run_cli("status", "--config", config_long, "--pr", str(PR), "--json")
+        self.assertEqual(0, after.returncode, after.stderr)
+        self.assertTrue(json.loads(after.stdout)["local_verification"])
+        paths = self.verification_paths()
+        self.assertEqual(2, len(paths))
+        digests = {
+            json.loads(Path(path).read_text())["config_digest"] for path in paths
+        }
+        self.assertEqual(2, len(digests))
+
     def test_failed_then_pass_keeps_failed_event_and_recovers(self):
         self.set_git()
         self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
@@ -3021,7 +3060,13 @@ class NulCommandConfigTests(CliTestCase):
         from pr_closure.cli import VerificationFailure, _run_shell_command
 
         with self.assertRaises(VerificationFailure):
-            _run_shell_command("echo \x00 boom", cwd=self.pr_worktree)
+            _run_shell_command("echo \x00 boom", cwd=self.pr_worktree, timeout_seconds=1)
+
+    def test_run_shell_command_requires_explicit_timeout(self):
+        from pr_closure.cli import _run_shell_command
+
+        with self.assertRaises(TypeError):
+            _run_shell_command("true", cwd=self.pr_worktree)
 
 
 class AdapterBoundedOutputTests(CliTestCase):

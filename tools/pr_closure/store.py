@@ -732,7 +732,21 @@ class RunStore:
                     "verification artifact must declare outcome PASSED: {0}".format(path)
                 )
             sequence = self._require_command_sequence(record, target)
-            if command_sequence_digest(sequence) != config_digest:
+            configured_timeout = record.get("verification_command_timeout_seconds", 300)
+            if isinstance(configured_timeout, bool) or not isinstance(
+                configured_timeout, int
+            ):
+                raise MalformedEvidence(
+                    "verification record missing or invalid timeout: {0}".format(path)
+                )
+            if configured_timeout < 1:
+                raise MalformedEvidence(
+                    "verification record timeout must be positive: {0}".format(path)
+                )
+            if (
+                command_sequence_digest(sequence, configured_timeout) != config_digest
+                and command_sequence_digest(sequence) != config_digest
+            ):
                 raise MalformedEvidence(
                     "verification record commands contradict its config identity: {0}".format(
                         path
@@ -812,7 +826,10 @@ class RunStore:
     _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
     def bound_verification(
-        self, commit, expected_commands: Optional[Tuple[Tuple[str, str], ...]] = None
+        self,
+        commit,
+        expected_commands: Optional[Tuple[Tuple[str, str], ...]] = None,
+        expected_verification_command_timeout_seconds: int = 300,
     ) -> Optional[dict]:
         """Return the event-bound PASSED verification record for the exact
         expected ordered command sequence, or None.
@@ -842,7 +859,9 @@ class RunStore:
                         "expected command sequence carries unknown phase {0!r}".format(phase)
                     )
                 _require_digest(digest)
-            expected = command_sequence_digest(expected_commands)
+            expected = command_sequence_digest(
+                expected_commands, expected_verification_command_timeout_seconds
+            )
         self.validate_event_relations(commit)
         events = self.read_events()
         best = None

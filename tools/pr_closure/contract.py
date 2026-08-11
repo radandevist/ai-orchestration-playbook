@@ -267,16 +267,21 @@ def command_digest(command: str) -> str:
     return hashlib.sha256(command.encode("utf-8")).hexdigest()
 
 
-def command_sequence_digest(sequence) -> str:
-    """SHA-256 identity of an exact ordered ``(phase, command_digest)`` sequence.
+def command_sequence_digest(sequence, verification_command_timeout_seconds: int = 300) -> str:
+    """SHA-256 identity of an exact ordered command identity sequence.
 
-    This is the immutable config identity that verification attempts bind
-    (T6L-F2): a changed ordered command sequence yields a new identity, so
-    attempts for different configurations coexist at the same commit and a
-    stale identity can never be selected as current passing evidence.
+    The digest binds both the ordered command sequence and the configured
+    verification timeout (T6L-F2): a changed command sequence or timeout yields
+    a new identity, so attempts for different configurations coexist at the
+    same commit and a stale identity can never be selected as current passing
+    evidence.
     """
     payload = json.dumps(
-        [[phase, digest] for phase, digest in sequence], sort_keys=True
+        {
+            "verification_command_timeout_seconds": verification_command_timeout_seconds,
+            "commands": [[phase, digest] for phase, digest in sequence],
+        },
+        sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 

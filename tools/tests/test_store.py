@@ -190,6 +190,14 @@ class StoreTestCase(unittest.TestCase):
         path.write_bytes(_serialize(record))
 
 
+class CommandSequenceDigestTests(StoreTestCase):
+    def test_command_sequence_digest_includes_verification_timeout(self):
+        commands = _expected_commands()
+        slow = command_sequence_digest(commands, verification_command_timeout_seconds=3)
+        fast = command_sequence_digest(commands, verification_command_timeout_seconds=4)
+        self.assertNotEqual(slow, fast)
+
+
 class RunStorePathTests(StoreTestCase):
     def test_rejects_escaped_project_components(self):
         for bad in ("../etc", "a/b", "a\\b", "..", ".", "", "/abs", "x\x00", " proj"):
