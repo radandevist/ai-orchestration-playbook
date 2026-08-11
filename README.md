@@ -200,6 +200,20 @@ For `trello:*` mappings, a successful adapter result must include
 the required detailed sections (`Objectif`, `État actuel`, `Périmètre / ce qui change`, `Liens`, and
 observable `Comment tester` steps). It is projection-completeness metadata, never approval evidence.
 
+Lifecycle ownership is durable rather than inferred from chat or a board. After
+`check-transition --to REVIEW_READY`, record the exact review lane; after a blocking review, record
+the named root cause and distinct repair strategy owned by the fix lane:
+
+```bash
+pr-closure record-review-dispatch --config /absolute/project-closure.json \
+  --pr 123 --lane-id review-123-a
+pr-closure record-repair-strategy --config /absolute/project-closure.json \
+  --pr 123 --root-cause missing-invariant --strategy structural-guard --lane-id fix-123-a
+```
+
+The first event derives `REVIEWING`; the second derives `FIXING`. A later blocking review that finds
+the same root cause after two distinct recorded strategies derives `DESIGN_RESET`.
+
 ### One-time import of legacy verdicts
 
 Reviews written before the gate are free-form and never count as approval on their own. Transcribe

@@ -149,6 +149,9 @@ When the human explicitly optimizes for latency, you may batch several low-risk 
 ```bash
 pr-closure status --config <project-closure.json> --pr <N>
 pr-closure check-transition --config <project-closure.json> --pr <N> --to <STATE>
+pr-closure record-review-dispatch --config <project-closure.json> --pr <N> --lane-id <ID>
+pr-closure record-repair-strategy --config <project-closure.json> --pr <N> \
+  --root-cause <ROOT> --strategy <STRATEGY> --lane-id <ID>
 # tracking projection — dry-run (default) and apply forms:
 pr-closure sync --config <project-closure.json> --pr <N> \
   --projection-adapter /absolute/non-symlink/executable

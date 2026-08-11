@@ -39,6 +39,8 @@ def review_ready():
         checked_out_branch="feature/close",
         pr_state="OPEN",
         pr_is_draft=False,
+        mergeable=MergeableState.MERGEABLE,
+        merge_state_status="CLEAN",
     )
 
 
@@ -82,9 +84,25 @@ class StateDerivationTests(unittest.TestCase):
         self.assertIn("resolve_merge_conflict", decision.allowed_actions)
 
     def test_unknown_merge_state_does_not_block_approved_tip(self):
-        snap = replace(approved_snapshot(), merge_state_status="UNKNOWN")
+        snap = replace(
+            approved_snapshot(),
+            mergeable=MergeableState.MERGEABLE,
+            merge_state_status="UNKNOWN",
+        )
         decision = derive_state(snap, NOW)
         self.assertEqual(ClosureState.APPROVED, decision.state)
+
+    def test_unknown_mergeability_pair_is_unverified(self):
+        snap = replace(
+            approved_snapshot(),
+            mergeable=MergeableState.UNKNOWN,
+            merge_state_status="UNKNOWN",
+        )
+
+        decision = derive_state(snap, NOW)
+
+        self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+        self.assertEqual(("mergeability evidence is unknown",), decision.reasons)
 
     def test_infra_failure_enters_bounded_retry(self):
         snap = replace(

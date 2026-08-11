@@ -591,6 +591,17 @@ class BoundArtifactSeamTests(StoreTestCase):
         _write_verification(store, COMMIT_A)
         self.assertEqual(_verification_record(), store.bound_verification(COMMIT_A, _expected_commands()))
 
+    def test_passed_record_rejects_timed_out_command_even_with_zero_exit(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip"))
+        record = _verification_record()
+        record["commands"][0]["timed_out"] = True
+        record["commands"][0]["failure_reason"] = "timeout"
+        _write_verification(store, COMMIT_A, record)
+
+        with self.assertRaisesRegex(MalformedEvidence, "timed out"):
+            store.bound_verification(COMMIT_A, _expected_commands())
+
     def test_legacy_verification_without_timeout_is_not_selected_for_new_timeout(self):
         store = RunStore(self.root, "proj", 42)
         commands = _expected_commands()

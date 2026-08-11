@@ -43,6 +43,7 @@
 - **ci_rerun_cmd:** `<bounded rerun command for proven infrastructure failures, or none>`
 - **local_review_ready_commands:** `<the minimum local gate(s) before an adversarial review may start — exact closure_config key>`
 - **closure_acceptance_commands:** `<the full gate(s) required for approval — exact closure_config key>`
+- **verification_command_timeout_seconds:** `<positive per-command timeout shared by both verification phases — exact closure_config key>`
 - **closure_state_dir:** `<durable absolute project run directory — never /tmp or a session-owned folder — exact closure_config key>`
 - **ci_required_checks:** `<optional exact GitHub check names that are authoritative for CI closure; absent or empty keeps strict all-rollup behavior — exact closure_config key>`
 - **review_schema:** `<supported review-record schema version, currently 1>`
@@ -60,7 +61,7 @@
 The machine-readable `closure_config` carries the mechanically enforced subset with its exact key
 names — `schema_version`, `project`, `repository`, `repo_path`, `default_branch`,
 `closure_state_dir`, `local_review_ready_commands`, `closure_acceptance_commands`,
-`ci_required_checks`,
+`verification_command_timeout_seconds`, `ci_required_checks`,
 `infra_retry_budget`, `stagnation_budget_minutes`, `heavy_job_limit`, `tracking_projection` (see
 `tools/schemas/project-closure-v1.json`). The fields above are the declarative project bindings the
 harness resolves against; the gate itself reads only the `closure_config` JSON.

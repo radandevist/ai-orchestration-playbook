@@ -71,6 +71,11 @@ def derive_state(snapshot, now) -> StateDecision:
             ClosureState.NEEDS_RESOLUTION,
             ("merge state is CONFLICTING; resolve merge conflicts before advancing",),
         )
+    if mergeable is MergeableState.UNKNOWN:
+        return _decision(
+            ClosureState.UNVERIFIED,
+            ("mergeability evidence is unknown",),
+        )
 
     missing = _missing_evidence(snapshot, ci_state, review_verdict)
     contradictions = _contradictions(snapshot)
@@ -308,6 +313,7 @@ def _validate(snapshot, now) -> None:
 
     for name, value in (
         ("blocking_findings", snapshot.blocking_findings),
+        ("blocking_root_causes", snapshot.blocking_root_causes),
         ("follow_up_findings", snapshot.follow_up_findings),
     ):
         if not isinstance(value, tuple) or not all(isinstance(item, str) for item in value):

@@ -190,6 +190,7 @@ class ClosureSnapshot:
     review_owned: bool = False
     review_verdict: Optional[Verdict] = None
     blocking_findings: Tuple[str, ...] = ()
+    blocking_root_causes: Tuple[str, ...] = ()
     follow_up_findings: Tuple[str, ...] = ()
     follow_ups_complete: Optional[bool] = None
     repeated_root_cause: Optional[str] = None
@@ -207,6 +208,7 @@ class ClosureSnapshot:
         object.__setattr__(self, "evidence_available", frozenset(self.evidence_available))
         object.__setattr__(self, "contradictions", frozenset(self.contradictions))
         object.__setattr__(self, "blocking_findings", _as_tuple(self.blocking_findings))
+        object.__setattr__(self, "blocking_root_causes", _as_tuple(self.blocking_root_causes))
         object.__setattr__(self, "follow_up_findings", _as_tuple(self.follow_up_findings))
 
 

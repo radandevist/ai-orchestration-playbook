@@ -62,6 +62,9 @@ from pr_closure.sources import (
 from pr_closure.state import derive_state
 from pr_closure.store import (
     COMMIT_EVENT,
+    REPAIR_STRATEGY_EVENT,
+    REVIEW_DISPATCH_EVENT,
+    REVIEW_EVENT,
     VERIFICATION_EVENT,
     EvidenceConflict,
     ForbiddenEvidencePath,
@@ -268,6 +271,23 @@ def _require_blank_free(value, label: str) -> str:
     return value
 
 
+def _require_exact_text(value, label: str) -> str:
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise CliInputError(
+            "{0} must be a non-empty string without surrounding whitespace".format(label)
+        )
+    return value
+
+
+def _require_lifecycle_event_text(event, key: str) -> str:
+    value = event.get(key)
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise SourceMalformed(
+            "durable {0} event carries invalid {1}".format(event["event_type"], key)
+        )
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Snapshot assembly shared by status, check-transition, and sync
 # ---------------------------------------------------------------------------
@@ -370,6 +390,7 @@ def _status_snapshot(config, pr_number):
     review_verdict = None
     review_commit = None
     blocking_findings = set()
+    blocking_root_causes = set()
     follow_up_findings = set()
     follow_up_issue_numbers = set()
     verdicts = set()
@@ -394,6 +415,7 @@ def _status_snapshot(config, pr_number):
         for finding in record.findings:
             if finding.disposition is Disposition.BLOCKS_PR:
                 blocking_findings.add(finding.id)
+                blocking_root_causes.add(finding.root_cause)
             elif finding.disposition is Disposition.FOLLOW_UP_ISSUE:
                 follow_up_findings.add(finding.id)
                 if finding.follow_up_issue is not None:
@@ -402,6 +424,47 @@ def _status_snapshot(config, pr_number):
         raise SourceMalformed("durable review records disagree on the verdict")
     if verdicts:
         review_verdict = verdicts.pop()
+
+    latest_review_index = -1
+    latest_review_dispatch_index = -1
+    repair_events = []
+    for index, event in enumerate(events):
+        if event["event_type"] == REVIEW_EVENT and event["commit"] == facts.local_commit:
+            latest_review_index = index
+        elif event["event_type"] == REVIEW_DISPATCH_EVENT:
+            _require_lifecycle_event_text(event, "lane_id")
+            if event["commit"] == facts.local_commit:
+                latest_review_dispatch_index = index
+        elif event["event_type"] == REPAIR_STRATEGY_EVENT:
+            root_cause = _require_lifecycle_event_text(event, "root_cause")
+            strategy = _require_lifecycle_event_text(event, "strategy")
+            _require_lifecycle_event_text(event, "lane_id")
+            repair_events.append((index, event["commit"], root_cause, strategy))
+
+    review_owned = latest_review_dispatch_index > latest_review_index
+    if review_owned and review_commit is None:
+        review_commit = facts.local_commit
+
+    strategies_before_review = {}
+    fixing_lane_active = False
+    for index, commit, root_cause, strategy in repair_events:
+        if root_cause not in blocking_root_causes:
+            continue
+        if index < latest_review_index:
+            strategies_before_review.setdefault(root_cause, set()).add(strategy)
+        elif index > latest_review_index and commit == facts.local_commit:
+            fixing_lane_active = True
+
+    repeated_roots = sorted(
+        root_cause
+        for root_cause, strategies in strategies_before_review.items()
+        if len(strategies) >= 2
+    )
+    repeated_root_cause = repeated_roots[0] if repeated_roots else None
+    distinct_repair_strategies = max(
+        (len(strategies) for strategies in strategies_before_review.values()),
+        default=0,
+    )
 
     follow_ups_complete = None
     if follow_up_issue_numbers:
@@ -445,11 +508,15 @@ def _status_snapshot(config, pr_number):
         worktree_clean=facts.worktree_clean,
         local_verification=local_verification,
         ci_state=ci.ci_state,
-        review_owned=False,
+        fixing_lane_active=fixing_lane_active,
+        review_owned=review_owned,
         review_verdict=review_verdict,
         blocking_findings=tuple(sorted(blocking_findings)),
+        blocking_root_causes=tuple(sorted(blocking_root_causes)),
         follow_up_findings=tuple(sorted(follow_up_findings)),
         follow_ups_complete=follow_ups_complete,
+        repeated_root_cause=repeated_root_cause,
+        distinct_repair_strategies=distinct_repair_strategies,
         infra_retry_budget=config.infra_retry_budget,
         infra_retries_used=len(infra_events),
         stagnation_budget_minutes=config.stagnation_budget_minutes,
@@ -588,7 +655,7 @@ def cmd_record_verification(config, args) -> int:
             run["command_digest"] = command_digest(command)
             run["command_label"] = "{0}:{1}".format(phase, index)
             runs.append(run)
-            if run["exit_status"] != 0:
+            if run.get("timed_out") is True or run["exit_status"] != 0:
                 failed = run
                 break
         if failed is None:
@@ -653,6 +720,56 @@ def cmd_record_infra_failure(config, args) -> int:
         payload={
             "failed_job": failed_job,
             "test_steps_not_started": list(steps),
+        },
+    )
+    return EXIT_OK
+
+
+def cmd_record_review_dispatch(config, args) -> int:
+    lane_id = _require_exact_text(args.lane_id, "lane-id")
+    snapshot, decision = _status_snapshot(config, args.pr)
+    if decision.state is not ClosureState.REVIEW_READY:
+        _err(
+            "review dispatch denied: current state {0} is not REVIEW_READY".format(
+                decision.state.value
+            )
+        )
+        return EXIT_TRANSITION_DENIED
+    store = RunStore(config.closure_state_dir, config.project, args.pr)
+    store.append_event(
+        REVIEW_DISPATCH_EVENT,
+        snapshot.local_commit,
+        str(store.events_path),
+        payload={"lane_id": lane_id},
+    )
+    return EXIT_OK
+
+
+def cmd_record_repair_strategy(config, args) -> int:
+    root_cause = _require_exact_text(args.root_cause, "root-cause")
+    strategy = _require_exact_text(args.strategy, "strategy")
+    lane_id = _require_exact_text(args.lane_id, "lane-id")
+    snapshot, decision = _status_snapshot(config, args.pr)
+    if decision.state is not ClosureState.CHANGES_REQUIRED:
+        _err(
+            "repair strategy denied: current state {0} is not CHANGES_REQUIRED".format(
+                decision.state.value
+            )
+        )
+        return EXIT_TRANSITION_DENIED
+    if root_cause not in snapshot.blocking_root_causes:
+        raise CliInputError(
+            "root-cause must name a current blocking review finding"
+        )
+    store = RunStore(config.closure_state_dir, config.project, args.pr)
+    store.append_event(
+        REPAIR_STRATEGY_EVENT,
+        snapshot.local_commit,
+        str(store.events_path),
+        payload={
+            "root_cause": root_cause,
+            "strategy": strategy,
+            "lane_id": lane_id,
         },
     )
     return EXIT_OK
@@ -1013,6 +1130,26 @@ def _build_parser() -> argparse.ArgumentParser:
         "--test-steps-not-started", required=True, nargs="+", metavar="STEP"
     )
     record_infra.set_defaults(func=cmd_record_infra_failure)
+
+    record_review_dispatch = sub.add_parser(
+        "record-review-dispatch",
+        help="record durable ownership of the exact review-ready tip",
+    )
+    record_review_dispatch.add_argument("--config", required=True, metavar="FILE")
+    record_review_dispatch.add_argument("--pr", required=True, type=int, metavar="N")
+    record_review_dispatch.add_argument("--lane-id", required=True, metavar="ID")
+    record_review_dispatch.set_defaults(func=cmd_record_review_dispatch)
+
+    record_repair = sub.add_parser(
+        "record-repair-strategy",
+        help="record a fix lane and strategy for a current blocking root cause",
+    )
+    record_repair.add_argument("--config", required=True, metavar="FILE")
+    record_repair.add_argument("--pr", required=True, type=int, metavar="N")
+    record_repair.add_argument("--root-cause", required=True, metavar="ROOT")
+    record_repair.add_argument("--strategy", required=True, metavar="STRATEGY")
+    record_repair.add_argument("--lane-id", required=True, metavar="ID")
+    record_repair.set_defaults(func=cmd_record_repair_strategy)
 
     check_transition = sub.add_parser(
         "check-transition", help="derive state and require an exact closure state target"

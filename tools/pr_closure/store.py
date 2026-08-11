@@ -41,6 +41,8 @@ class MalformedEvidence(StoreError):
 COMMIT_EVENT = "commit"
 VERIFICATION_EVENT = "verification"
 REVIEW_EVENT = "review"
+REPAIR_STRATEGY_EVENT = "REPAIR_STRATEGY"
+REVIEW_DISPATCH_EVENT = "REVIEW_DISPATCH"
 
 EVENT_SCHEMA_VERSION = 1
 
@@ -69,7 +71,8 @@ KNOWN_EVENT_TYPES = frozenset(
         VERIFICATION_EVENT,
         REVIEW_EVENT,
         "STAGNATION_CONFIG",
-        "REPAIR_STRATEGY",
+        REPAIR_STRATEGY_EVENT,
+        REVIEW_DISPATCH_EVENT,
         "INFRA_FAILURE",
     )
 )
@@ -1028,6 +1031,12 @@ class RunStore:
             if not isinstance(status, int) or isinstance(status, bool) or status != 0:
                 raise MalformedEvidence(
                     "PASSED verification command must carry exact integer exit status 0: {0}".format(
+                        target
+                    )
+                )
+            if command.get("timed_out") is True:
+                raise MalformedEvidence(
+                    "PASSED verification command must not have timed out: {0}".format(
                         target
                     )
                 )

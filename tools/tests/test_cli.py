@@ -19,6 +19,7 @@ from pr_closure.store import RunStore
 
 COMMIT_A = "a" * 40
 COMMIT_B = "b" * 40
+COMMIT_C = "c" * 40
 PROJECT = "publyapp"
 REPOSITORY = "owner/repo"
 BRANCH = "feature/close"
@@ -694,6 +695,7 @@ class StatusCommandTests(CliTestCase):
             headRefOid=COMMIT_A,
             statusCheckRollup=PASSING_ROLLUP,
             mergeStateStatus="UNKNOWN",
+            mergeable="MERGEABLE",
         )
         config = self.write_config()
         proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
@@ -704,6 +706,28 @@ class StatusCommandTests(CliTestCase):
         proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertEqual("APPROVED", json.loads(proc.stdout)["state"])
+
+    def test_unknown_mergeability_pair_never_approves(self):
+        self.set_git()
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            mergeStateStatus="UNKNOWN",
+            mergeable="UNKNOWN",
+        )
+        config = self.write_config()
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        review = self.write_review(commit=COMMIT_A)
+        proc = self.run_cli("import-review", "--config", config, "--pr", str(PR), "--review", review)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual("UNVERIFIED", payload["state"])
+        self.assertIn("mergeability evidence is unknown", payload["reasons"])
 
     def test_unknown_mergeable_causes_source_malformed(self):
         self.set_git()
@@ -935,6 +959,32 @@ class RecordVerificationTests(CliTestCase):
         with open(child_pid_file) as handle:
             child_pid = int(handle.read())
         self.assertFalse(self._process_exists(child_pid))
+
+    def test_timeout_cannot_be_mutated_into_pass_by_trapping_term(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config(
+            overrides={
+                "verification_command_timeout_seconds": 1,
+                "local_review_ready_commands": [
+                    "trap 'exit 0' TERM; while :; do sleep 1; done"
+                ],
+            }
+        )
+
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+
+        self.assertEqual(5, proc.returncode)
+        self.assertFalse(os.path.isfile(self.verification_path(COMMIT_A)))
+        failed = [
+            event for event in self.read_events()
+            if event["event_type"] == "verification"
+        ]
+        self.assertEqual(1, len(failed))
+        self.assertEqual("FAILED", failed[0]["outcome"])
+        self.assertEqual(0, failed[0]["commands"][0]["exit_status"])
+        self.assertTrue(failed[0]["commands"][0]["timed_out"])
+        self.assertEqual("timeout", failed[0]["commands"][0]["failure_reason"])
 
     @staticmethod
     def _process_exists(pid: int) -> bool:
@@ -1607,6 +1657,30 @@ class CheckTransitionTests(CliTestCase):
         self.assertIn("target=APPROVED", proc.stdout)
         self.assertIn("allowed=no", proc.stdout)
 
+    def test_unknown_mergeability_pair_denies_transition_to_approved(self):
+        self.set_git()
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            mergeStateStatus="UNKNOWN",
+            mergeable="UNKNOWN",
+        )
+        config = self.write_config()
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        review = self.write_review(commit=COMMIT_A)
+        proc = self.run_cli("import-review", "--config", config, "--pr", str(PR), "--review", review)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+
+        proc = self.run_cli(
+            "check-transition", "--config", config, "--pr", str(PR), "--to", "APPROVED"
+        )
+
+        self.assertEqual(4, proc.returncode)
+        self.assertIn("state=UNVERIFIED", proc.stdout)
+        self.assertIn("target=APPROVED", proc.stdout)
+        self.assertIn("allowed=no", proc.stdout)
+
     def test_terminal_state_target_succeeds(self):
         config = self.prepare_approved(verdict="APPROVED")
         proc = self.run_cli("check-transition", "--config", config, "--pr", str(PR), "--to", "APPROVED")
@@ -1654,6 +1728,114 @@ class CheckTransitionTests(CliTestCase):
         proc = self.run_cli("check-transition", "--config", config, "--pr", str(PR), "--to", "APPROVED")
         self.assertEqual(3, proc.returncode)
 
+
+class LifecycleCommandTests(CliTestCase):
+    ROOT_CAUSE = "missing-lifecycle-invariant"
+
+    def prepare_tip(self, commit=COMMIT_A):
+        self.set_git(head=commit, local=commit, remote=commit)
+        self.set_gh(headRefOid=commit, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config()
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        return config
+
+    def dispatch_review(self, config, lane_id):
+        proc = self.run_cli(
+            "record-review-dispatch",
+            "--config", config,
+            "--pr", str(PR),
+            "--lane-id", lane_id,
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+
+    def import_blocking_review(self, config, commit, review_id):
+        finding = {
+            "id": "F-{0}".format(review_id),
+            "root_cause": self.ROOT_CAUSE,
+            "severity": "MAJOR",
+            "disposition": "BLOCKS_PR",
+            "scope": "tools/pr_closure/cli.py",
+            "summary": "the lifecycle invariant still fails",
+            "evidence": ["test:lifecycle"],
+            "bad_case_evidence": ["mutation:still-red"],
+            "good_case_evidence": ["control:green"],
+        }
+        review = self.write_review(
+            commit=commit,
+            verdict="CHANGES_REQUIRED",
+            findings=[finding],
+        )
+        target = os.path.join(self.root, "{0}.json".format(review_id))
+        os.replace(review, target)
+        proc = self.run_cli(
+            "import-review", "--config", config, "--pr", str(PR), "--review", target
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+
+    def record_repair(self, config, strategy, lane_id):
+        proc = self.run_cli(
+            "record-repair-strategy",
+            "--config", config,
+            "--pr", str(PR),
+            "--root-cause", self.ROOT_CAUSE,
+            "--strategy", strategy,
+            "--lane-id", lane_id,
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+
+    def status_state(self, config):
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        return json.loads(proc.stdout)["state"]
+
+    def test_review_dispatch_and_import_drive_reviewing_lifecycle(self):
+        config = self.prepare_tip()
+
+        self.dispatch_review(config, "review-a")
+        self.assertEqual("REVIEWING", self.status_state(config))
+
+        self.import_blocking_review(config, COMMIT_A, "review-a")
+        self.assertEqual("CHANGES_REQUIRED", self.status_state(config))
+
+    def test_repair_strategy_drives_fixing_from_current_blocker(self):
+        config = self.prepare_tip()
+        self.dispatch_review(config, "review-a")
+        self.import_blocking_review(config, COMMIT_A, "review-a")
+
+        self.record_repair(config, "structural-guard", "fix-a")
+
+        self.assertEqual("FIXING", self.status_state(config))
+
+    def test_same_root_cause_surviving_two_repairs_drives_design_reset(self):
+        config = self.prepare_tip(COMMIT_A)
+        self.dispatch_review(config, "review-a")
+        self.import_blocking_review(config, COMMIT_A, "review-a")
+        self.record_repair(config, "structural-guard", "fix-a")
+
+        self.set_git(head=COMMIT_B, local=COMMIT_B, remote=COMMIT_B)
+        self.set_gh(headRefOid=COMMIT_B, statusCheckRollup=PASSING_ROLLUP)
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.dispatch_review(config, "review-b")
+        self.import_blocking_review(config, COMMIT_B, "review-b")
+        self.assertEqual("CHANGES_REQUIRED", self.status_state(config))
+        self.record_repair(config, "boundary-validation", "fix-b")
+        self.assertEqual("FIXING", self.status_state(config))
+
+        self.set_git(head=COMMIT_C, local=COMMIT_C, remote=COMMIT_C)
+        self.set_gh(headRefOid=COMMIT_C, statusCheckRollup=PASSING_ROLLUP)
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.dispatch_review(config, "review-c")
+        self.import_blocking_review(config, COMMIT_C, "review-c")
+
+        self.assertEqual("DESIGN_RESET", self.status_state(config))
+        proc = self.run_cli(
+            "check-transition", "--config", config, "--pr", str(PR), "--to", "DESIGN_RESET"
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("allowed=yes", proc.stdout)
 
 class SyncCommandTests(CliTestCase):
 
