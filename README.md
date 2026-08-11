@@ -195,6 +195,11 @@ PYTHONPATH="$HOME/ai-orchestration-playbook/tools" \
   --projection-adapter /absolute/non-symlink/executable --apply
 ```
 
+For `trello:*` mappings, a successful adapter result must include
+`"delivery_cards_complete": true`. It attests that every active or newly created delivery card has
+the required detailed sections (`Objectif`, `État actuel`, `Périmètre / ce qui change`, `Liens`, and
+observable `Comment tester` steps). It is projection-completeness metadata, never approval evidence.
+
 ### One-time import of legacy verdicts
 
 Reviews written before the gate are free-form and never count as approval on their own. Transcribe

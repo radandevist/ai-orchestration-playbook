@@ -142,7 +142,7 @@ When the human explicitly optimizes for latency, you may batch several low-risk 
 
 **Stagnation and retry escalation.** Activity is not progress: a running process, another review number, or another dispatch does not reset the stagnation clock. No qualifying progress within the adapter's `stagnation_budget_minutes`, or two executors dying on the same packet without valid evidence, enters `STALLED`. Proven infrastructure failures may be rerun only within the adapter's `infra_retry_budget`; exhausting it enters `NEEDS_OWNER`. Heavy verification (full builds, e2e, API suites) runs under an exclusive heavy-job lease so two expensive suites never overlap.
 
-**Sources of truth and projections.** Authoritative, in order: Git worktree and remote refs; GitHub PR metadata and CI; durable local verification records; durable structured review records; GitHub follow-up issues. Trello, dashboards, chat summaries, and notifications are derived projections and are never approval evidence. Projection writes are refused only when required sources are unavailable, malformed, or contradictory; valid intermediate states are projected normally. A projection failure never mutates authoritative closure evidence.
+**Sources of truth and projections.** Authoritative, in order: Git worktree and remote refs; GitHub PR metadata and CI; durable local verification records; durable structured review records; GitHub follow-up issues. Trello, dashboards, chat summaries, and notifications are derived projections and are never approval evidence. Trello is nevertheless the owner's delivery view: every active or newly created delivery card must have a detailed description with `Objectif`, `État actuel`, `Périmètre / ce qui change`, `Liens` (issue/PR when available), and `Comment tester` containing observable steps. A lacunary card is an incomplete projection, never a complete delivery update. Projection writes are refused when required sources are unavailable, malformed, or contradictory, or when the projection contract is not satisfied; valid intermediate states are projected normally. A projection failure never mutates authoritative closure evidence.
 
 **The mechanical gate.** One reusable command ships in this repo:
 
@@ -160,6 +160,9 @@ pr-closure sync --config <project-closure.json> --pr <N> \
 `none`, no adapter is needed: `sync` prints the derived state and refuses `--apply`. When it names a
 mapping (for example `trello:publyapp`), the separate `--projection-adapter
 /absolute/non-symlink/executable` argument is required for both the dry-run and the apply form.
+For a `trello:*` mapping, the adapter must verify the resulting card descriptions against the
+delivery-card contract above and return `delivery_cards_complete: true`; missing or false
+attestation fails `sync` closed in both modes.
 
 `pr-closure check-transition` is a **mandatory precondition** before every state-changing closure action (dispatch, fix, rerun, review, follow-up filing, projection apply, ready report). A denied transition stops the action. Missing evidence and tool/API failures are non-zero exits — fail closed, never infer a favorable state. Exit codes are stable: `0` read/check succeeded, `2` invalid input, `3` source unavailable or malformed, `4` transition denied, `5` verification/projection command failed, `6` heavy-job lease unavailable. Evidence lives in a durable run directory outside temporary session folders; the run's `state.json` is a cache, never the authority. Empty, undersized, or markerless lane output is failure even with exit 0.
 

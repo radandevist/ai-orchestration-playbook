@@ -84,7 +84,12 @@ PROJECTION_STDOUT_MAX_BYTES = 65536
 PROJECTION_STDERR_MAX_BYTES = 4096
 PROJECTION_MAX_CHANGES = 100
 PROJECTION_CHANGE_SUMMARY_MAX = 200
-PROJECTION_RESULT_ALLOWED_KEYS = ("schema_version", "applied", "changes")
+PROJECTION_RESULT_ALLOWED_KEYS = (
+    "schema_version",
+    "applied",
+    "changes",
+    "delivery_cards_complete",
+)
 PROJECTION_CHANGE_ALLOWED_KEYS = ("type", "summary")
 PROJECTION_CHANGE_TYPES = frozenset(
     {"list_update", "card_update", "card_create", "card_move", "card_archive"}
@@ -833,7 +838,7 @@ def _invoke_adapter(argv, timeout):
         raise ProjectionFailure("projection adapter returned invalid UTF-8 output")
 
 
-def _parse_adapter_result(stdout, mode):
+def _parse_adapter_result(stdout, mode, require_delivery_cards=False):
     """Validate the versioned JSON result of a projection adapter run.
 
     The version-1 contract is strict and bounded (T6L-F7): unknown result
@@ -903,6 +908,15 @@ def _parse_adapter_result(stdout, mode):
         raise ProjectionFailure("dry-run must report applied: false")
     if mode == "apply" and not applied:
         raise ProjectionFailure("apply must report applied: true")
+    delivery_cards_complete = data.get("delivery_cards_complete")
+    if delivery_cards_complete is not None and not isinstance(delivery_cards_complete, bool):
+        raise ProjectionFailure(
+            "projection adapter delivery card attestation must be a boolean"
+        )
+    if require_delivery_cards and delivery_cards_complete is not True:
+        raise ProjectionFailure(
+            "Trello projection adapter must attest complete delivery card descriptions"
+        )
     return data
 
 
@@ -942,7 +956,11 @@ def cmd_sync(config, args) -> int:
         "--mode", mode,
     )
     stdout = _invoke_adapter(argv, PROJECTION_ADAPTER_TIMEOUT)
-    result = _parse_adapter_result(stdout, mode)
+    result = _parse_adapter_result(
+        stdout,
+        mode,
+        require_delivery_cards=projection.startswith("trello:"),
+    )
     sys.stdout.write(
         "state={0}\nprojection {1}: changes={2}\n".format(
             decision.state.value,

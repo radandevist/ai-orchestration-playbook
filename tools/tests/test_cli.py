@@ -183,7 +183,12 @@ def main():
         if raw:
             out = json.loads(raw)
         else:
-            out = {"schema_version": 1, "applied": mode == "apply", "changes": []}
+            out = {
+                "schema_version": 1,
+                "applied": mode == "apply",
+                "changes": [],
+                "delivery_cards_complete": True,
+            }
         sys.stdout.write(json.dumps(out))
 
 
@@ -1652,6 +1657,42 @@ class CheckTransitionTests(CliTestCase):
 
 class SyncCommandTests(CliTestCase):
 
+    def test_trello_sync_rejects_missing_delivery_card_attestation(self):
+        config, args = self.prepare_projection()
+        output = {"schema_version": 1, "applied": False, "changes": []}
+        proc = self.run_cli(*args, extra_env=self.adapter_env(output=output))
+        self.assertEqual(5, proc.returncode)
+        self.assertIn("delivery card", proc.stderr)
+
+    def test_trello_sync_rejects_incomplete_delivery_cards(self):
+        config, args = self.prepare_projection()
+        output = {
+            "schema_version": 1,
+            "applied": False,
+            "changes": [],
+            "delivery_cards_complete": False,
+        }
+        proc = self.run_cli(*args, extra_env=self.adapter_env(output=output))
+        self.assertEqual(5, proc.returncode)
+        self.assertIn("delivery card", proc.stderr)
+
+    def test_trello_sync_accepts_complete_delivery_card_attestation(self):
+        config, args = self.prepare_projection()
+        output = {
+            "schema_version": 1,
+            "applied": False,
+            "changes": [],
+            "delivery_cards_complete": True,
+        }
+        proc = self.run_cli(*args, extra_env=self.adapter_env(output=output))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+
+    def test_non_trello_sync_does_not_require_delivery_card_attestation(self):
+        config, args = self.prepare_projection(mapping="dashboard:publyapp")
+        output = {"schema_version": 1, "applied": False, "changes": []}
+        proc = self.run_cli(*args, extra_env=self.adapter_env(output=output))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+
     def test_sync_dry_run_with_adapter_reports_proposed_changes(self):
         config, args = self.prepare_projection()
         proc = self.run_cli(*args, extra_env=self.adapter_env())
@@ -2461,6 +2502,7 @@ class ProjectionRedactionTests(CliTestCase):
         output = {
             "schema_version": 1,
             "applied": False,
+            "delivery_cards_complete": True,
             "changes": [
                 {
                     "type": "list_update",
@@ -3218,6 +3260,7 @@ class AdapterBoundedOutputTests(CliTestCase):
         output = {
             "schema_version": 1,
             "applied": False,
+            "delivery_cards_complete": True,
             "changes": [{"type": "list_update", "summary": "secret token all-alpha-leak"}],
         }
         proc = self.run_cli(

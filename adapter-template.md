@@ -73,4 +73,9 @@ executable, never an executable itself. When it is non-`none`, the gate requires
 over a versioned, bounded JSON protocol (deadline and output caps included), passing the mapping as
 `--mapping`. The adapter never emits secrets on stdout. The gate distinguishes dry-run (`sync`
 without `--apply`) from apply (`sync --apply`), and the project board is selected explicitly by the
-mapping, never guessed. A projection failure never mutates authoritative closure evidence.
+mapping, never guessed. For a `trello:*` mapping, every active or newly created delivery card must
+have a detailed description with `Objectif`, `État actuel`, `Périmètre / ce qui change`, `Liens`
+(issue/PR when available), and `Comment tester` with observable steps. The adapter must verify the
+resulting descriptions and return `delivery_cards_complete: true`; otherwise `sync` fails closed.
+This attestation proves only projection completeness, never approval. A projection failure never
+mutates authoritative closure evidence.
