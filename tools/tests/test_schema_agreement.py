@@ -412,6 +412,7 @@ def _valid_config():
         "infra_retry_budget": 1,
         "stagnation_budget_minutes": 240,
         "heavy_job_limit": 1,
+        "verification_command_timeout_seconds": 300,
         "tracking_projection": "trello card update",
     }
 
@@ -500,6 +501,24 @@ def config_agreement_corpus():
     )
     add("heavy_job_limit two", lambda c: c.update({"heavy_job_limit": 2}), False, False)
     add("heavy_job_limit zero", lambda c: c.update({"heavy_job_limit": 0}), False, False)
+    add(
+        "missing verification_command_timeout_seconds",
+        lambda c: c.pop("verification_command_timeout_seconds"),
+        False,
+        False,
+    )
+    add(
+        "zero verification_command_timeout_seconds",
+        lambda c: c.update({"verification_command_timeout_seconds": 0}),
+        False,
+        False,
+    )
+    add(
+        "float verification_command_timeout_seconds",
+        lambda c: c.update({"verification_command_timeout_seconds": 5.5}),
+        False,
+        False,
+    )
     add("project with slash", lambda c: c.update({"project": "a/b"}), False, False)
     add("project with backslash", lambda c: c.update({"project": "a\\b"}), False, False)
     add(
@@ -672,7 +691,7 @@ class ConfigCorpusShapeTests(unittest.TestCase):
                 "null_projection": 1,
                 "required_valid": 1,
                 "required_empty": 1,
-                "structural": 35,
+                "structural": 38,
                 "asymmetric": 9,
             },
             counts,

@@ -44,6 +44,7 @@ BASE_CONFIG = {
     "infra_retry_budget": 1,
     "stagnation_budget_minutes": 240,
     "heavy_job_limit": 1,
+    "verification_command_timeout_seconds": 2,
     "tracking_projection": None,
 }
 
@@ -232,6 +233,20 @@ sys.stderr.write("y" * 5000)
 sys.stderr.flush()
 while True:
     time.sleep(1)
+'''
+
+_TIMEOUT_CHILD_SCRIPT = r'''#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+import time
+
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(120)"],
+)
+with open(os.environ["ADAPTER_PIDFILE"], "w") as handle:
+    handle.write(str(child.pid))
+time.sleep(120)
 '''
 
 
@@ -805,6 +820,55 @@ class RecordVerificationTests(CliTestCase):
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertIn("state: LOCAL_VERIFY", proc.stdout)
         self.assertNotIn("APPROVED", proc.stdout.split("state: ")[1].splitlines()[0])
+
+    def test_verification_command_timeout_fails_and_cleans_up_processes(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        self._write_fake("timeout-child", _TIMEOUT_CHILD_SCRIPT)
+        child_pid_file = os.path.join(self.root, "verification-child.pid")
+        config = self.write_config(
+            overrides={
+                "verification_command_timeout_seconds": 1,
+                "local_review_ready_commands": [os.path.join(self.bin_dir, "timeout-child")],
+            }
+        )
+        start = time.time()
+        proc = self.run_cli(
+            "record-verification",
+            "--config",
+            config,
+            "--pr",
+            str(PR),
+            extra_env={"ADAPTER_PIDFILE": child_pid_file},
+        )
+        elapsed = time.time() - start
+        self.assertEqual(5, proc.returncode)
+        self.assertLess(elapsed, 5.0)
+        self.assertFalse(os.path.isfile(self.verification_path(COMMIT_A)))
+        events = self.read_events()
+        failed = [e for e in events if e["event_type"] == "verification"]
+        self.assertEqual(1, len(failed))
+        self.assertEqual("FAILED", failed[0]["outcome"])
+        self.assertEqual(["local_review_ready"], [c["phase"] for c in failed[0]["commands"]])
+        self.assertEqual(1, len(failed[0]["commands"]))
+        self.assertNotEqual(0, failed[0]["commands"][0]["exit_status"])
+        self.assertTrue(failed[0]["commands"][0]["timed_out"])
+        self.assertEqual("timeout", failed[0]["commands"][0]["failure_reason"])
+        deadline = time.time() + 2
+        while time.time() < deadline and not os.path.exists(child_pid_file):
+            time.sleep(0.05)
+        self.assertTrue(os.path.exists(child_pid_file))
+        with open(child_pid_file) as handle:
+            child_pid = int(handle.read())
+        self.assertFalse(self._process_exists(child_pid))
+
+    @staticmethod
+    def _process_exists(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
 
     def test_full_pass_control_approves_when_other_evidence_valid(self):
         config = self.prepare_approved(verdict="APPROVED")
@@ -2156,6 +2220,7 @@ class ConfigValidationTests(CliTestCase):
             "schema_version", "project", "repository", "repo_path", "default_branch",
             "closure_state_dir", "local_review_ready_commands", "closure_acceptance_commands",
             "infra_retry_budget", "stagnation_budget_minutes", "heavy_job_limit",
+            "verification_command_timeout_seconds",
             "tracking_projection",
         ):
             with self.subTest(key=key):
@@ -2175,13 +2240,18 @@ class ConfigValidationTests(CliTestCase):
         self.assert_config_rejected({"schema_version": 2}, "schema_version")
 
     def test_rejects_boolean_and_float_integer_fields(self):
-        for field in ("infra_retry_budget", "stagnation_budget_minutes", "heavy_job_limit"):
+        for field in (
+            "infra_retry_budget",
+            "stagnation_budget_minutes",
+            "heavy_job_limit",
+            "verification_command_timeout_seconds",
+        ):
             for bad in (True, 1.5):
                 with self.subTest(field=field, value=bad):
                     self.assert_config_rejected({field: bad}, field)
 
     def test_rejects_non_positive_budgets(self):
-        for field in ("infra_retry_budget", "stagnation_budget_minutes"):
+        for field in ("infra_retry_budget", "stagnation_budget_minutes", "verification_command_timeout_seconds"):
             for bad in (0, -1):
                 with self.subTest(field=field, value=bad):
                     self.assert_config_rejected({field: bad}, field)

@@ -141,6 +141,7 @@ class ProjectConfig:
     infra_retry_budget: int
     stagnation_budget_minutes: int
     heavy_job_limit: int
+    verification_command_timeout_seconds: int
     tracking_projection: Optional[str]
     ci_required_checks: Tuple[str, ...] = ()
 

@@ -62,9 +62,9 @@ SEMANTIC_ASYMMETRIES = (
     ),
     SemanticAsymmetry(
         "exact_integer_types",
-        "integer-valued JSON numbers such as schema_version 1.0, pr_number 42.0, or "
-        "follow_up_issue 900.0 satisfy JSON Schema integer/const semantics, while the "
-        "Python gate requires exact int values and rejects floats and booleans.",
+        "integer-valued JSON numbers such as schema_version 1.0, pr_number 42.0, "
+        "or follow_up_issue 900.0 satisfy JSON Schema integer/const semantics, "
+        "while the Python gate requires exact int values and rejects floats and booleans.",
     ),
 )
 
@@ -118,6 +118,7 @@ PROJECT_CONFIG_FIELDS = (
     _f("infra_retry_budget", "integer", {"minimum": 1}),
     _f("stagnation_budget_minutes", "integer", {"minimum": 1}),
     _f("heavy_job_limit", "const_int", {"value": 1}),
+    _f("verification_command_timeout_seconds", "integer", {"minimum": 1}),
     _f("tracking_projection", "nullable_text"),
     _f("ci_required_checks", "check_name_array"),
 )
@@ -131,8 +132,9 @@ CONFIG_SEMANTIC_ASYMMETRIES = (
     SemanticAsymmetry(
         "exact_integer_types",
         "integer-valued JSON numbers such as schema_version 1.0, infra_retry_budget 1.0, "
-        "or heavy_job_limit 1.0 satisfy JSON Schema integer/const semantics, while the "
-        "Python gate requires exact int values and rejects floats and booleans.",
+        "heavy_job_limit 1.0, or verification_command_timeout_seconds 1.0 satisfy JSON Schema "
+        "integer/const semantics, while the Python gate requires exact int values and rejects "
+        "floats and booleans.",
     ),
     SemanticAsymmetry(
         "forbidden_temporary_paths",
@@ -451,6 +453,7 @@ def validate_project_config(record: Mapping) -> ProjectConfig:
         infra_retry_budget=values["infra_retry_budget"],
         stagnation_budget_minutes=values["stagnation_budget_minutes"],
         heavy_job_limit=values["heavy_job_limit"],
+        verification_command_timeout_seconds=values["verification_command_timeout_seconds"],
         tracking_projection=values["tracking_projection"],
         ci_required_checks=values.get("ci_required_checks", ()),
     )

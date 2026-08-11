@@ -138,7 +138,7 @@ def _read_config(path: str) -> Mapping:
     return data
 
 
-def _run_shell_command(command: str, cwd: str) -> dict:
+def _run_shell_command(command: str, cwd: str, timeout_seconds: int = 60) -> dict:
     """Run one configured shell command string in the resolved PR worktree.
 
     The command is always passed as exactly one ``sh -c`` argv element and
@@ -149,19 +149,19 @@ def _run_shell_command(command: str, cwd: str) -> dict:
     stdout and stderr go to ``DEVNULL`` (T6L-F8): configured commands are
     arbitrary and their output cannot be safely redacted, so it is never
     captured or emitted on any CLI stream or persisted anywhere. The returned
-    run record carries timestamps and the exit status only; the raw command
-    text is never persisted (C6D-F4). A subprocess argument ``ValueError``
+    run record carries timestamps, exit status, and timeout metadata only; the raw
+    command text is never persisted (C6D-F4). A subprocess argument ``ValueError``
     (for example an embedded NUL byte) is mapped to the typed CLI failure
     contract (T6L-F9).
     """
     started = datetime.now(timezone.utc)
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             ("sh", "-c", command),
             cwd=cwd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            check=False,
+            start_new_session=os.name == "posix",
         )
     except (OSError, ValueError) as error:
         raise VerificationFailure(
@@ -169,12 +169,23 @@ def _run_shell_command(command: str, cwd: str) -> dict:
                 redact(str(error))
             )
         ) from error
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _terminate_process_group(proc, signal.SIGTERM)
+        _reap_process(proc)
     ended = datetime.now(timezone.utc)
-    return {
+    result = {
         "started_at": started.isoformat(timespec="microseconds"),
         "ended_at": ended.isoformat(timespec="microseconds"),
         "exit_status": proc.returncode,
     }
+    if timed_out:
+        result["timed_out"] = True
+        result["failure_reason"] = "timeout"
+    return result
 
 
 def _require_live_pr(github, config):
@@ -547,7 +558,9 @@ def cmd_record_verification(config, args) -> int:
         runs = []
         failed = None
         for index, (phase, command) in enumerate(commands, start=1):
-            run = _run_shell_command(command, cwd=worktree)
+            run = _run_shell_command(
+                command, cwd=worktree, timeout_seconds=config.verification_command_timeout_seconds
+            )
             run["phase"] = phase
             run["command_digest"] = command_digest(command)
             run["command_label"] = "{0}:{1}".format(phase, index)
@@ -590,6 +603,12 @@ def cmd_record_verification(config, args) -> int:
                 "failed_command_digest": failed["command_digest"],
             },
         )
+        if failed.get("failure_reason") == "timeout":
+            raise VerificationFailure(
+                "verification command timed out after {0}s ({1})".format(
+                    config.verification_command_timeout_seconds, failed["command_label"]
+                )
+            )
         raise VerificationFailure(
             "verification command failed with exit status {0} ({1})".format(
                 failed["exit_status"], failed["command_label"]
@@ -658,8 +677,8 @@ def _require_projection_adapter(path):
     return path
 
 
-def _terminate_process_group(proc) -> None:
-    """Kill the adapter's entire process group, with a per-platform fallback.
+def _terminate_process_group(proc, signal_to_send=signal.SIGKILL) -> None:
+    """Kill the adapter/verification child process group, with a per-platform fallback.
 
     The adapter starts as a session leader (``start_new_session=True``), so
     every descendant that does not create its own session shares the group;
@@ -669,25 +688,22 @@ def _terminate_process_group(proc) -> None:
     """
     if os.name == "posix":
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(proc.pid, signal_to_send)
             return
         except (OSError, ProcessLookupError):
             pass
     try:
-        proc.kill()
+        proc.send_signal(signal_to_send)
     except OSError:
         pass
 
 
 def _reap_process(proc) -> None:
-    """Reap the direct child with a bound, so cleanup never hangs the CLI."""
+    """Reap a command with a bounded window, force-killing only if needed."""
     try:
         proc.wait(timeout=5)
     except (subprocess.TimeoutExpired, TimeoutError):
-        try:
-            proc.kill()
-        except OSError:
-            pass
+        _terminate_process_group(proc, signal.SIGKILL)
         try:
             proc.wait(timeout=5)
         except (subprocess.TimeoutExpired, TimeoutError):
