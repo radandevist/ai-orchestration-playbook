@@ -29,7 +29,7 @@ These hold on every run, for every agent. They override speed, convenience, and 
 3. **Never merge without explicit, per-request human authorization.** A human says "merge X" each time. Prior approval of one merge never implies the next.
    *Why:* merging is the one irreversible, outward-facing step; it's the human's call, every time.
 
-4. **The review loop is mandatory before integration, and the reviewer must be a different model family than the implementer.** Every executor result gets an independent review pass before it's integrated. The reviewer runs on a different provider/model family than produced the result (Codex implements → Claude reviews, and vice versa) — never review Codex output with Codex. Feed findings back until clean. Reviews must be rigorous: cover the full requirements coverage matrix plus affected-risk analysis — tests, performance, security, robustness, completeness, design patterns, code reuse (DRY), code elegance, and better-approach pressure while sticking to locked decisions/specs/plans.
+4. **The review loop is mandatory before integration, and the reviewer must be a different model family than the implementer.** Every executor result gets an independent review pass before it's integrated. The reviewer runs on a different provider/model family than produced the result — implementation defaults to DeepSeek V4 Flash, independent review defaults to GPT-5.6 Luna (see §2.6), and a family never reviews its own output: an OpenAI-family reviewer may cover a DeepSeek implementation, but never an OpenAI-family implementation. Feed findings back until clean. Reviews must be rigorous: cover the full requirements coverage matrix plus affected-risk analysis — tests, performance, security, robustness, completeness, design patterns, code reuse (DRY), code elegance, and better-approach pressure while sticking to locked decisions/specs/plans.
    *Why:* an executor checking its own work is not a second opinion; cross-family review is what catches the plausible-but-wrong result. Same-family review also doubles that family's token spend on one task — the review re-ingests the full diff and coverage matrix on the same context window. Routing the review to the other family both sharpens the check and halves the per-family input cost.
 
 5. **Effort ceiling — default high; xhigh requires ledgered escalation.** Cap executor/review effort at `high` by default. `xhigh` is allowed only with a ledgered escalation reason: final integration review, security/auth change, high-risk billing/data operation, architecture dispute, or pre-merge gate. Every xhigh use must be recorded in the run preflight ledger.
@@ -72,7 +72,7 @@ Each phase below states a portable **principle**, the **why**, a tagged **exampl
 **Principle.** Run N executors concurrently, each in its **own isolated worktree**, each handed one **self-contained brief** (§3).
 **Why.** Isolation prevents executors from colliding on the working tree; self-contained briefs keep an executor from needing context it doesn't have.
 If the run must outlive the current orchestrator session (overnight work, disconnect-prone client, quota-reset wait), make it **durable**: materialize a run directory with prompts, reports, status markers, and a monitor entrypoint, then launch only as many concurrent executors as the adapter says the host can sustain.
-For multi-clone work, start one captain from the adapter `captain_root` (usually the parent directory above sibling clones), keep a hot backlog of 3-5 ready packets, and dispatch bounded one-shot workers into `clone_roots`. Use provider lanes, not free-for-all sessions: each heavy Claude/Codex lane takes the next surgical packet that fits its role and current headroom; local/cheap lanes handle prep, tests, logs, summaries, and mechanical checks. Burst heavy concurrency only when packets are independently briefable (file-disjoint edits, cross-family reviews, competing design probes, or separated debugging probes).
+For multi-clone work, start one captain from the adapter `captain_root` (usually the parent directory above sibling clones), keep a hot backlog of 3-5 ready packets, and dispatch bounded one-shot workers into `clone_roots`. Use provider lanes, not free-for-all sessions: each heavy lane takes the next surgical packet that fits its role and current headroom — the DeepSeek V4 Flash implementation lane and the GPT-5.6 Luna `xhigh` independent-review lane (§2.6; the review `xhigh` is ledgered per §1.5); the local lane handles prep, tests, logs, summaries, and mechanical checks. Burst heavy concurrency only when packets are independently briefable (file-disjoint edits, cross-family reviews, competing design probes, or separated debugging probes).
 **Name each worktree after the pull request it produces, never after the issue** (`pr<NUMBER>`, e.g. `pr994`). One issue routinely spawns several competing implementations, and the moment it does, issue-named directories collide and the human can no longer tell which tree holds which attempt. The PR number is also what a reviewer actually searches for. Because that number does not exist until the branch is pushed, create the worktree under a provisional slug, push and open the PR immediately, then `git worktree move` it onto its `pr<NUMBER>` name — the provisional window is minutes, not days.
 *Example (PublyApp/.NET):* 7 parallel executor briefs, one per triage PR, each in `.worktrees/pr<NUMBER>`.
 **STOP triggers:** more than one hot captain is steering the same board → collapse to one captain; concurrent **heavy-resource** jobs (Docker/e2e stacks, full builds/test suites) exceed host capacity → serialize those — agent *headcount* is not the cap, lightweight agents run many-in-parallel; a task isn't truly file-disjoint from a sibling in the same wave → re-decompose; the parent session may disappear before children finish and no durable monitor path exists → harden the run first.
@@ -92,14 +92,99 @@ When the human explicitly optimizes for latency, you may batch several low-risk 
 *Example (PublyApp/.NET):* a GPT review of the architecture-helper PR caught a `Contains("OpenApi")` substring exclusion that would have **silently dropped an authored type** from guard coverage with zero failing tests — fixed and spec-guarded before merge.
 **STOP triggers:** review returns a blocking finding → fix-and-re-review, do not merge; review and executor disagree on whether something is real → get a second reviewer rather than averaging; a "skip review loops" instruction is being interpreted as "skip independent review before merge" → stop and correct the interpretation.
 
-### 2.6 Merge dance
+### 2.6 PR closure state machine (mandatory gate)
+
+**Principle.** Pull-request closure is a mechanical state machine, not a prose claim. Every PR has exactly one derived state. Readiness is derived from evidence tied to the **same pushed commit**: clean worktree, local tip equals remote tip, required local gates green at that tip, GitHub CI green at that tip, a fresh independent review naming that exact tip with no blocking findings, every deferred finding backed by a verified issue, and verdict `APPROVED` or `APPROVED_WITH_FOLLOW_UPS`. Missing, stale, malformed, or contradictory evidence is `UNVERIFIED` — never success.
+
+**States and their meaning (each PR has exactly one):**
+
+| State | Meaning | Allowed next actions |
+|---|---|---|
+| `CI_RED` | A branch-caused required check is red. | Implement or verify a fix. No approval. |
+| `CI_INFRA_RETRY` | A required check failed before testing code, with concrete infrastructure evidence. | Rerun the failed job within the adapter's retry budget. |
+| `FIXING` | A bounded implementation packet owns named blocking findings. | Commit, push, and verify. |
+| `LOCAL_VERIFY` | Work is pushed but the adapter's required local evidence is incomplete or stale. | Run the missing gate, one heavy command at a time. |
+| `REVIEW_READY` | CI and local gates are green at the pushed tip. | Dispatch an independent adversarial review. |
+| `REVIEWING` | One reviewer owns the exact pushed tip. | Wait for a structured verdict; do not edit the reviewed worktree. |
+| `NEEDS_RESOLUTION` | GitHub reports mergeability problems (`mergeable=CONFLICTING`) and changes must be rebased/resolved before other progress. | Resolve merge conflicts, re-run the required gates, and re-check state. |
+| `CHANGES_REQUIRED` | The review contains at least one blocking finding. | Create one fix packet accounting for every blocker. |
+| `DESIGN_RESET` | The same root-cause class survived two attempted repair strategies. | Replace the mechanism or proof strategy, then verify and re-review. |
+| `FOLLOW_UP_FILING` | No blockers remain, but follow-up findings lack issue IDs. | File and verify the issues. |
+| `APPROVED_WITH_FOLLOW_UPS` | CI and local gates are green; review approved; every deferred finding has a verified issue. | Report ready and wait for owner merge authority. |
+| `APPROVED` | CI and local gates are green; review approved with no required follow-ups. | Report ready and wait for owner merge authority. |
+| `NEEDS_OWNER` | A genuine owner decision blocks progress. | Ask one narrow decision question. |
+| `STALLED` | No qualifying progress within the adapter's time budget, or repeated executors died without producing evidence. | Rescue the lane, redesign the packet, or move to `NEEDS_OWNER`; another identical dispatch is forbidden. |
+| `UNVERIFIED` | Required evidence is missing, malformed, stale, or contradictory. | Restore evidence; never infer a more favorable state. |
+
+**Terminal states.** Only `APPROVED` and `APPROVED_WITH_FOLLOW_UPS` are terminal, and only a terminal state ends ownership of the PR, its packets, worktrees, and reviewer lanes. `NEEDS_OWNER` and `STALLED` pause or force rescue but never end ownership. A state-changing closure action may run only when the derived state equals the intended target — no prose claim can override a denied transition.
+
+**Structured verdicts.** Reviewers return exactly one machine verdict: `CHANGES_REQUIRED` (at least one blocking finding), `APPROVED_WITH_FOLLOW_UPS` (no blockers; every follow-up finding has a verified issue), `APPROVED` (no blockers or required follow-ups), or `INCONCLUSIVE` (the reviewer could not prove the central claim or complete the required evidence). `INCONCLUSIVE` blocks approval without automatically accusing the code. An unknown schema version, unknown verdict, duplicate finding ID, missing follow-up issue ID, or malformed record is `UNVERIFIED`.
+
+**Findings.** Each finding carries a severity (`CRITICAL`, `MAJOR`, `MEDIUM`, `MINOR`, `NOTE`) and a disposition (`BLOCKS_PR`, `FOLLOW_UP_ISSUE`, `NOTE_ONLY`). Only `BLOCKS_PR` blocks the PR; severity does not decide disposition by itself. `FOLLOW_UP_ISSUE` may leave the branch only after a real issue is filed, linked, and verified open or deliberately scheduled; verified follow-up findings are what lead to `APPROVED_WITH_FOLLOW_UPS`. `NOTE_ONLY` findings remain recorded notes and cannot reopen the loop.
+
+**Mandatory blockers.** The following can never be deferred, whatever label the reviewer used — the gate promotes them to `BLOCKS_PR`:
+
+- branch-caused red CI;
+- an unmet acceptance requirement;
+- a regression introduced or exposed by the branch;
+- security, authorization, privacy, billing, or data-integrity uncertainty;
+- failure or unverifiability of the PR's central claim;
+- a guard that silently treats an undecidable input as safe;
+- a test or verification mechanism that cannot detect the defect it claims to detect;
+- unpushed work, dirty probe residue, or a reviewed-tip mismatch; and
+- the same underlying blocker returning after an attempted fix.
+
+**Central-claim rules.** Each project adapter declares `central_claim_rules`: claims that may never be deferred for that project. Reviewers must try to falsify the PR's central claim and provide both the failing escape and the legitimate control.
+
+**Exact pushed-commit binding and stale approval.** All evidence — local verification, CI, review — binds to one exact pushed commit. Approval is invalidated immediately by any new commit, changed CI result, reopened blocker, missing follow-up issue, or mismatch between reviewed, local, remote, and CI tips. `INCONCLUSIVE`, unresolved evidence, and failed source lookups are loud refusals, never silent passes.
+
+**Repeated-root-cause circuit breaker.** Each blocking finding carries a normalized `root_cause`. If the same root cause survives two attempted repairs, the PR enters `DESIGN_RESET`: no further syntax-instance patch; instead require a mechanism-level explanation of the wrong default or missing invariant, a structural or mechanical control that prevents bypass, paired proof with a mutation that disables the control, and a fresh full adversarial review. This is not a review cap and cannot be used to defer the blocker.
+
+**Stagnation and retry escalation.** Activity is not progress: a running process, another review number, or another dispatch does not reset the stagnation clock. No qualifying progress within the adapter's `stagnation_budget_minutes`, or two executors dying on the same packet without valid evidence, enters `STALLED`. Proven infrastructure failures may be rerun only within the adapter's `infra_retry_budget`; exhausting it enters `NEEDS_OWNER`. Heavy verification (full builds, e2e, API suites) runs under an exclusive heavy-job lease so two expensive suites never overlap.
+
+**Sources of truth and projections.** Authoritative, in order: Git worktree and remote refs; GitHub PR metadata and CI; durable local verification records; durable structured review records; GitHub follow-up issues. Trello, dashboards, chat summaries, and notifications are derived projections and are never approval evidence. Trello is nevertheless the owner's delivery view: every active or newly created delivery card must have a detailed description with `Objectif`, `État actuel`, `Périmètre / ce qui change`, `Liens` (issue/PR when available), and `Comment tester` containing observable steps. A lacunary card is an incomplete projection, never a complete delivery update. Projection writes are refused when required sources are unavailable, malformed, or contradictory, or when the projection contract is not satisfied; valid intermediate states are projected normally. A projection failure never mutates authoritative closure evidence.
+
+**The mechanical gate.** One reusable command ships in this repo:
+
+```bash
+pr-closure status --config <project-closure.json> --pr <N>
+pr-closure check-transition --config <project-closure.json> --pr <N> --to <STATE>
+pr-closure record-review-dispatch --config <project-closure.json> --pr <N> --lane-id <ID>
+pr-closure record-repair-strategy --config <project-closure.json> --pr <N> \
+  --root-cause <ROOT> --strategy <STRATEGY> --lane-id <ID>
+# tracking projection — dry-run (default) and apply forms:
+pr-closure sync --config <project-closure.json> --pr <N> \
+  --projection-adapter /absolute/non-symlink/executable
+pr-closure sync --config <project-closure.json> --pr <N> \
+  --projection-adapter /absolute/non-symlink/executable --apply
+```
+
+`sync` reads the board mapping from the config's `tracking_projection` key. When that key is
+`none`, no adapter is needed: `sync` prints the derived state and refuses `--apply`. When it names a
+mapping (for example `trello:publyapp`), the separate `--projection-adapter
+/absolute/non-symlink/executable` argument is required for both the dry-run and the apply form.
+For a `trello:*` mapping, the adapter must verify the resulting card descriptions against the
+delivery-card contract above and return `delivery_cards_complete: true`; missing or false
+attestation fails `sync` closed in both modes.
+
+`pr-closure check-transition` is a **mandatory precondition** before every state-changing closure action (dispatch, fix, rerun, review, follow-up filing, projection apply, ready report). A denied transition stops the action. Missing evidence and tool/API failures are non-zero exits — fail closed, never infer a favorable state. Exit codes are stable: `0` read/check succeeded, `2` invalid input, `3` source unavailable or malformed, `4` transition denied, `5` verification/projection command failed, `6` heavy-job lease unavailable. Evidence lives in a durable run directory outside temporary session folders; the run's `state.json` is a cache, never the authority. Empty, undersized, or markerless lane output is failure even with exit 0.
+
+**Model policy (all projects).** Implementation defaults to DeepSeek V4 Flash at its highest supported effort (`max`). Independent review defaults to GPT-5.6 Luna at `xhigh` reasoning effort. No new Claude implementation, review, or coordination calls. Historical Claude artifacts remain valid evidence when they already satisfy the structured cross-family contract; they are not rerun solely because the default changed. The reviewer family must differ from the implementer family — an OpenAI-family reviewer may review a DeepSeek implementation, but never an OpenAI-family implementation.
+
+**Adversarial review is preserved.** The gate reduces wasted cycles, not review pressure: every `REVIEW_READY` commit gets a fresh independent cross-family review, every fix is re-reviewed once CI and local gates are green, and there is no maximum review count.
+
+**Why.** Reminders did not stop the paid failure modes: reviewing red CI, reviewing unpushed commits, losing verdicts under temporary session directories, milestone-as-approval, and status from memory while GitHub, Trello, and the worktree disagree. Deriving state from sources of truth and refusing invalid transitions makes progress and approval machine-checkable.
+
+**STOP triggers:** `check-transition` denies the requested transition → stop; the derived state governs. Required evidence is missing, stale, or contradictory → `UNVERIFIED`; restore evidence, never infer. The same root cause returns after a second repair → `DESIGN_RESET`; no instance patch. No qualifying progress within the stagnation budget, or repeated executor deaths → `STALLED`; rescue with a changed strategy, never repeat the identical dispatch. An adapter lacks closure fields → preflight STOP.
+
+### 2.7 Merge dance
 
 **Principle.** Integrate in a fixed order: pre-flight the PR (tolerate transient `UNKNOWN` state with bounded retries) → rebase only if needed (additive resolution for known shared files; STOP on anything else) → rerun the adapter's **full acceptance gate** after the rebase, not just touched tests → **remove the worktree before deleting the branch** → squash-merge with the body persisted to `dump_dir` → sync the default branch → repeat for the next PR.
 **Why.** The order is load-bearing: a live worktree blocks branch deletion; an un-synced default branch makes the next PR's pre-flight lie; a non-additive conflict resolved by guessing corrupts the merge; and a rebase can silently import same-surface changes that only the full suite exposes.
 *Example (PublyApp/.NET):* a four-PR sequence stalled when `--delete-branch` failed against a still-checked-out worktree; the fix was to remove the worktree *first*, then merge — and to retry the GitHub `UNKNOWN/UNKNOWN` pre-flight state with short sleeps rather than treating it as a failure.
 **STOP triggers:** a conflict appears in a file not on the adapter's `additive_merge_files` list → report, don't guess; pre-flight stays `UNKNOWN` after bounded retries → report; the rebase pulled in a newly-landed same-surface feature or hard-rule obligation that changes scope → surface the expansion before proceeding; the human hasn't authorized this specific merge → halt (see §1.3).
 
-### 2.7 Close-out
+### 2.8 Close-out
 
 **Principle.** After merges, reconcile the issue tree: link children as native sub-issues, apply `Refs` vs `Closes` deliberately, and close issues (with a wrap-up comment) where policy requires a manual close.
 **Why.** The issue tree is the human's map of the work; a PR that should have closed its issue but didn't, or an unlinked child, leaves the map wrong.
@@ -133,7 +218,7 @@ The captain keeps a hot backlog of the next 3-5 packets. A packet is ready only 
 *Example (PublyApp/.NET) — a single-PR brief, abbreviated:*
 
 > `--effort high --write --no-sandbox`
-> Create worktree `…/.claude/worktrees/538a-rename` off `origin/develop`. Use `git -C "<absolute-worktree-path>"` for every git command.
+> Create worktree `…/.worktrees/538a-rename` off `origin/develop`. Use `git -C "<absolute-worktree-path>"` for every git command.
 > **Read first:** `apps/api/Modules/Auth/Handlers/PassWordLogin.cs` (confirm class is already `PasswordLogin`).
 > **Work:** rename the file to `PasswordLogin.cs` (two-step temp rename — Windows is case-insensitive: `→ _tmp.cs → PasswordLogin.cs`, commit between).
 > **Verify:** `dotnet restore` (fresh worktree) → `just build-api` (expect 0/0) → arch spec filter (expect pass).
@@ -162,7 +247,7 @@ Every repo supplies `<repo>/.ai/orchestration-adapter.md` as **fielded descripti
 | `host_parallelism` | Safe concurrency ceiling / batching rule for this host and repo (especially when builds/tests are heavy). |
 | `executor` | Which executor to dispatch + its default effort (≤ `high`). |
 | `model_ladder` | Preferred fallback order when the primary executor/model rate-limits or hits quota, including any approved cross-family alternates so the orchestrator can route automatically without repeatedly asking the human. |
-| `provider_lanes` | Approved Claude/Codex/local lanes, their default roles, and which lane owns review/fix/design/verification packets. |
+| `provider_lanes` | Approved DeepSeek/OpenAI/local lanes, their default roles, and which lane owns review/fix/design/verification packets. |
 | `hot_backlog` | Number of pre-shaped packets the captain should keep ready (default 3-5), plus where packet/board files live if durable. |
 | `packet_template` | Path to the repo's packet template, or `~/ai-orchestration-playbook/captain-packet-template.md`. |
 | `push_guard` | The real enforcement path for push/merge policy (active hook path, CI gate, soft gate, or `none`). |
@@ -170,6 +255,8 @@ Every repo supplies `<repo>/.ai/orchestration-adapter.md` as **fielded descripti
 | `additive_merge_files` | Files whose merge conflicts are resolved *additively* (keep both sides); anything else → STOP. |
 | `dump_dir` | Where squash bodies and working artifacts are written. |
 | `issue_hierarchy` | Epic structure + the sub-issue linking convention/command. |
+
+PR-opening repos must also supply the closure fields from §2.6 (see `adapter-template.md`); an adapter that lacks them is a preflight STOP for orchestrated PR work.
 
 **Discoverability (dual).** (a) An orchestrating agent reads `<repo>/.ai/orchestration-adapter.md` at the start of every run; **and** (b) each repo adds a one-line pointer to that file under an **"AI Orchestration"** heading in its `AGENTS.md`, so even an agent that doesn't know the `.ai/` convention finds it.
 
@@ -188,9 +275,9 @@ Every repo supplies `<repo>/.ai/orchestration-adapter.md` as **fielded descripti
 | `captain_root` | repo parent when coordinating sibling clones; otherwise repo root |
 | `clone_roots` | sibling local clones/worktrees approved by the adapter, or `none` |
 | `host_parallelism` | at most 3 concurrent executor waves; never run multiple heavy `dotnet` / `pnpm` verification jobs at once |
-| `executor` | `codex:codex-rescue` @ effort `high` |
-| `model_ladder` | primary `codex:codex-rescue` @ `high`; on quota/rate-limit fall back per repo policy to the next approved executor without changing the orchestration contract |
-| `provider_lanes` | Codex lane for repo edits/verification/review packets; Claude lane for architecture/design/review packets; local lane for grep/log/test prep |
+| `executor` | DeepSeek V4 Flash implementation lane (`codex exec -c model="deepseek-v4-flash" -c model_provider="openmodel" -c model_reasoning_effort="max"`) |
+| `model_ladder` | primary `deepseek-v4-flash` @ `max`; on quota/rate-limit fall back per repo policy to the next approved executor (never a Claude model) without changing the orchestration contract |
+| `provider_lanes` | DeepSeek V4 Flash lane for implementation; GPT-5.6 Luna `xhigh` lane for independent review; local lane for grep/log/test prep |
 | `hot_backlog` | keep 3-5 ready packets in the run `dump_dir`; do not launch broad exploratory packets |
 | `packet_template` | `~/ai-orchestration-playbook/captain-packet-template.md` |
 | `push_guard` | active hook path is Husky (`core.hooksPath=.husky/_`); `.husky/pre-push` blocks direct pushes to `develop`; feature-branch policies beyond that are soft/brief-driven unless CI says otherwise |
@@ -208,7 +295,7 @@ Portable token-saving tactics, independent of which agent loads them. Each tacti
 **Cost reality — optimize input, not reasoning.** On a real run, ~99% of an executor's token spend is **input/context** (briefs, injected instruction files, required-reading, re-ingested diffs); output and reasoning tokens are typically <1% combined. Effort tiering and the xhigh ceiling (§5.1, §1.5) cap that <1% — necessary for quality control, but they do **not** move the bill. Token savings come from cutting input volume: instruction-file size (§5.5), cross-family review routing (§5.6), brief distillation (§3.2), and not re-shipping context on retries.
 
 ### 5.1 Model tiering by task value
-Decomposition, planning, spec review, and routine dispatch use fast/cheap models. Reserve expensive models (xhigh, Opus) for final integration review, high-risk/security/auth changes, architectural disputes, and pre-merge gates only. Every xhigh use requires a ledgered escalation reason (see §6). *(This controls quality and the <1% reasoning slice, not the input bill — see Cost reality above.)*
+Decomposition, planning, spec review, and routine dispatch use fast/cheap models. Reserve `xhigh` for final integration review, high-risk/security/auth changes, architectural disputes, and pre-merge gates only. Every xhigh use requires a ledgered escalation reason (see §6). *(This controls quality and the <1% reasoning slice, not the input bill — see Cost reality above.)*
 
 ### 5.2 Targeted verification
 Per-task inner loops use focused test runs (targeted files, --last-failed, smoke checks). The full acceptance gate runs once after rebase (rebase can invalidate per-task results). These are sequential gates, not alternatives. Neither skips the other.
@@ -224,22 +311,21 @@ Batch low-risk edits into a milestone before running verification, rather than r
 | Context-Mode | Routes heavy tool output through a sandbox, returns only the summary | Available on demand; do not auto-inject its plugin unless a run will actually use `ctx_batch_execute`, `ctx_execute_file`, or `ctx_search` |
 | Caveman | Terse prose (note: benchmarks show +7% tokens, +3% cost) | Dormant — do not invoke |
 | Ponytail | 7-rung lazy-senior-dev ladder before writing code (-54% LOC, -22% tokens) | Available on demand; do not auto-inject globally. Use lite/full/ultra only when the task benefits from the ladder |
-| Claude Codex plugin | Lets Claude Code delegate through Codex | Enable only for Claude Code lanes that actually dispatch Codex; keep unrelated Claude plugins disabled by default |
 
 Tools report three states: `missing` (not installed), `available` (installed, ready), `active` (used this run). Only `active` counts toward token optimization in the preflight ledger.
 
 ### 5.5 Context hygiene
 - Keep system/project files (CLAUDE.md, AGENTS.md) under 1KB each — invariants only. These inject on **every** turn, so a fat instruction file is a fixed multiplier on the whole session. Don't restate what a hook, MCP server, or the playbook already injects; point to it instead. Re-measure after edits (`wc -c`); an 11KB AGENTS.md is ~10x its budget.
 - Keep agent plugin/skill/tool surfaces lean by default. Enable only the plugin/skill/toolsets needed for the current lane; park heavy narrative/style plugins, broad skill banks, browser/media tools, and delegation schemas unless the task explicitly needs them. A useful default is: memory + skills + file + terminal + web/search + code execution + session search + cron/todo/clarify; add browser/vision/image/audio/delegation only for that run.
-- Default interactive/routine agents to cheap models and low/medium reasoning; expose named escalation lanes (`*-high`, `*-xhigh`, Opus/Max) for deliberate use. If a one-line/status prompt can burn premium-window percentage points, the default lane is wrong.
-- Re-measure prompt surfaces after config changes: Claude Code `claude -p 'status' --output-format json --max-turns 1`; Codex `codex debug prompt-input 'status'` byte count; Hermes `hermes tools list` plus config/toolset inspection. Record before/after in the ledger or closeout note.
+- Default interactive/routine agents to cheap models and low/medium reasoning; expose named `*-high` and `*-xhigh` escalation lanes for deliberate use. If a one-line/status prompt can burn premium-window percentage points, the default lane is wrong.
+- Re-measure prompt surfaces after config changes: Codex `codex debug prompt-input 'status'` byte count; Hermes `hermes tools list` plus config/toolset inspection. Record before/after in the ledger or closeout note.
 - Use surgical file context — reference specific files and functions, not full repos.
 - Start fresh (/clear, /new) between unrelated tasks. Long sessions compound costs exponentially.
 - Disconnect unused MCP servers — each adds thousands of tokens per message in tool definitions.
 - Never re-ship full context on retry. On quota/rate-limit (429) or a flaked dispatch, stop and re-route — do **not** resend the entire brief on a fixed retry cycle. A retry storm that re-ingests the brief every N seconds is pure wasted input; kill the executor/broker rather than letting it loop.
 
 ### 5.6 Cross-family review routing
-The mandatory review (§1.4) runs on a **different model family than the implementer**. This is a token tactic as much as a quality one: reviewing Codex output with Codex makes one task two full-context Codex passes (the review re-ingests the diff + the rigorous coverage matrix). Routing the review to the other family halves the per-family input load on the heavy path and gives a genuinely independent check. Record the implementer/reviewer route split in the preflight ledger (§6) — a row where both are the same family is a STOP-and-reconsider, not a dispatch.
+The mandatory review (§1.4) runs on a **different model family than the implementer**. This is a token tactic as much as a quality one: reviewing a DeepSeek implementation with another DeepSeek executor makes one task two full-context DeepSeek passes (the review re-ingests the diff + the rigorous coverage matrix). Routing the review to the other family halves the per-family input load on the heavy path and gives a genuinely independent check. Record the implementer/reviewer route split in the preflight ledger (§6) — a row where both are the same family is a STOP-and-reconsider, not a dispatch.
 
 ### 5.7 Parallel-session discipline
 When the human would otherwise open 2-3 orchestration sessions for sibling clones, use the captain/lane model instead (§1.9, §2.3). Keep one hot captain and launch bounded one-shot packets into clones. Track waste as **fresh input per completed packet**, not raw activity: if multiple packets re-ship the same broad context, stop and distill the stable prefix once before launching more. Do not throttle useful independent packets just because they are parallel; throttle duplicate context and heavy-resource jobs.
@@ -254,7 +340,7 @@ Before dispatching any executor or subagent, append one JSONL preflight row to t
 
 ```
 run_id, timestamp
-captain: {session_id, board_dir, packet_id, lane: claude|codex|local|other, target_clone, hot_backlog_size}
+captain: {session_id, board_dir, packet_id, lane: deepseek|openai-review|local|other, target_clone, hot_backlog_size}
 task_risk: {level: low|medium|high|critical, reasons: []}
 scope: {repo, worktree, branch, dirty_state}
 routes: {implementer: {provider, model, quota_signal}, reviewer: {provider, model, quota_signal}, fallbacks: []}

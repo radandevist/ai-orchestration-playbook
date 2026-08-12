@@ -5,7 +5,7 @@
 
 > **One captain. Many hands. You hold the merge button.**
 
-A portable, agent-neutral operating model for orchestrating **batches** of software work through AI coding agents — Claude Code, Codex CLI, Hermes, or any future agent. It is **documentation only**: no code, no scripts, no runtime. You clone it once and point your agent at it.
+A portable, agent-neutral operating model for orchestrating **batches** of software work through AI coding agents — Claude Code, Codex CLI, Hermes, or any future agent. It is documentation plus one small fail-closed CLI (`tools/pr-closure`) that makes pull-request closure machine-checkable (§2.6) — no daemons, no runtime, no external services. You clone it once and point your agent at it.
 
 The agent-facing artifact is **[`PLAYBOOK.md`](./PLAYBOOK.md)** — a single self-contained document an orchestrating agent loads before a run and follows throughout.
 
@@ -153,6 +153,94 @@ curl -fsSL https://raw.githubusercontent.com/radandevist/ai-orchestration-playbo
 
 ---
 
+## Mechanical PR closure gate
+
+Since §2.6, pull-request closure is a mandatory state machine, not a prose claim. The repo ships one
+self-contained CLI (`tools/pr-closure`) and two machine schemas (`tools/schemas/review-record-v1.json`,
+`tools/schemas/project-closure-v1.json`). The CLI derives one state per pull request from Git, GitHub,
+durable verification, and durable review records, and refuses invalid transitions.
+
+### Install
+
+The CLI is self-contained — no dependencies, no build. It lives in the playbook clone; optionally
+expose it on `PATH`:
+
+```bash
+ln -s "$HOME/ai-orchestration-playbook/tools/pr-closure" ~/.local/bin/pr-closure
+```
+
+### Status
+
+```bash
+PYTHONPATH="$HOME/ai-orchestration-playbook/tools" \
+  "$HOME/ai-orchestration-playbook/tools/pr-closure" status \
+  --config /absolute/project-closure.json --pr 123
+```
+
+`check-transition` is the mandatory precondition before every state-changing closure action
+(`--to <STATE>`). `sync` plans (dry-run, the default) or applies (`--apply`) the tracking projection;
+the board mapping comes from the config's `tracking_projection` key, and both forms pass the separate
+`--projection-adapter` executable, required only when that mapping is non-`none`:
+
+```bash
+PYTHONPATH="$HOME/ai-orchestration-playbook/tools" \
+  "$HOME/ai-orchestration-playbook/tools/pr-closure" sync \
+  --config /absolute/project-closure.json --pr 123 \
+  --projection-adapter /absolute/non-symlink/executable
+
+# dry-run by default; add --apply to write the projection:
+PYTHONPATH="$HOME/ai-orchestration-playbook/tools" \
+  "$HOME/ai-orchestration-playbook/tools/pr-closure" sync \
+  --config /absolute/project-closure.json --pr 123 \
+  --projection-adapter /absolute/non-symlink/executable --apply
+```
+
+For `trello:*` mappings, a successful adapter result must include
+`"delivery_cards_complete": true`. It attests that every active or newly created delivery card has
+the required detailed sections (`Objectif`, `État actuel`, `Périmètre / ce qui change`, `Liens`, and
+observable `Comment tester` steps). It is projection-completeness metadata, never approval evidence.
+
+Lifecycle ownership is durable rather than inferred from chat or a board. After
+`check-transition --to REVIEW_READY`, record the exact review lane; after a blocking review, record
+the named root cause and distinct repair strategy owned by the fix lane:
+
+```bash
+pr-closure record-review-dispatch --config /absolute/project-closure.json \
+  --pr 123 --lane-id review-123-a
+pr-closure record-repair-strategy --config /absolute/project-closure.json \
+  --pr 123 --root-cause missing-invariant --strategy structural-guard --lane-id fix-123-a
+```
+
+The first event derives `REVIEWING`; the second derives `FIXING`. A later blocking review that finds
+the same root cause after two distinct recorded strategies derives `DESIGN_RESET`.
+
+### One-time import of legacy verdicts
+
+Reviews written before the gate are free-form and never count as approval on their own. Transcribe
+each legacy verdict into the structured review schema once, then import it:
+
+```bash
+"$HOME/ai-orchestration-playbook/tools/pr-closure" import-review \
+  --config /absolute/project-closure.json --pr 123 --review /path/to/review.json
+```
+
+Imported reviews are validated (schema version, verdict, finding IDs, follow-up issues) and fail
+closed on anything unknown or malformed.
+
+### Project migration and preflight
+
+- Add the closure fields to the repo adapter (see [`adapter-template.md`](./adapter-template.md) and
+  `PLAYBOOK.md` §2.6); missing fields are a preflight STOP for orchestrated PR work.
+- Existing PRs are imported without trusting their labels or summaries; no PR is merged by the adoption.
+
+### Preserved adversarial review
+
+The gate reduces wasted cycles, not review pressure: every green tip gets a fresh independent
+cross-family review, every fix is re-reviewed, and there is no maximum review count. The reviewer
+family must differ from the implementer family.
+
+---
+
 ## Running an orchestrated session
 
 Once installed and the repo is onboarded, you drive a session through your agent in plain language. For a multi-clone effort, open one captain session from the parent/coordination directory, then let it dispatch bounded packets into the target clones named by the adapter.
@@ -207,6 +295,7 @@ When a run exposes a new failure mode, capture it so it never bites twice:
 | **[`PLAYBOOK.md`](./PLAYBOOK.md)** | The agent-facing operating model. **The core artifact.** Read top-to-bottom before a run. |
 | [`adapter-template.md`](./adapter-template.md) | Blank fielded template — copy into a repo's `.ai/` to bind the playbook to that project. |
 | [`captain-packet-template.md`](./captain-packet-template.md) | Board + packet template for one-captain, multi-clone / provider-lane runs. |
+| [`tools/pr-closure`](./tools/pr-closure) + `tools/schemas/` | Fail-closed PR closure gate CLI and machine schemas behind §2.6. |
 | [`CHANGELOG.md`](./CHANGELOG.md) | Living-doc version log — what changed and why, per release. |
 | `orchestration/ledger/` | Real preflight-ledger entries (JSONL) from actual orchestrated sessions — the playbook is battle-tested, not theoretical. |
 
