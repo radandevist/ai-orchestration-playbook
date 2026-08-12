@@ -530,7 +530,8 @@ class ReviewValidationTests(unittest.TestCase):
 class ConfiguredFamilySpellingTests(unittest.TestCase):
     CONFIGURED = {
         "deepseek-v4-flash": "deepseek",
-        "cline-pass/cline-pass/deepseek-v4-flash": "deepseek",
+        "openmodel/deepseek-v4-flash": "deepseek",
+        "opencode-go/deepseek-v4-flash": "deepseek",
         "opencode/deepseek-v4-flash-free": "deepseek",
         "gpt-5.3-codex": "openai",
         "gpt-5.3-codex-spark": "openai",
@@ -566,7 +567,7 @@ class ConfiguredFamilySpellingTests(unittest.TestCase):
     SAME_LINEAGE_PAIRS = (
         ("openrouter/anthropic/claude-opus-5", "claude-opus-5"),
         ("gpt-5.6-sol", "gpt-5.3-codex-spark"),
-        ("cline-pass/cline-pass/deepseek-v4-flash", "opencode/deepseek-v4-flash-free"),
+        ("openmodel/deepseek-v4-flash", "opencode-go/deepseek-v4-flash"),
         ("kimi-k2.6", "moonshot/kimi-k2"),
         ("z-ai/glm-5.2", "glm-4"),
         ("x-ai/grok-4", "grok-3-mini"),
