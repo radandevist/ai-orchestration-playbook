@@ -1,5 +1,7 @@
 # Required CI Check Policy Implementation Plan
 
+> **Historical, non-normative model routing and issue admission:** The Luna/`xhigh` instructions below record the policy used when this plan was written (2026-08-09) and are **superseded and non-normative**. Current dispatches must follow the live [PLAYBOOK model policy](../../../PLAYBOOK.md): exactly one cross-family GPT-5.6 Sol review at `high` (the final adversarial judgment before merge), with no reviewer shotgun, fallback cascade, or Claude-family calls. Issue admission follows the live §2.6 ladder; every admitted deferred root defect has one verified root issue.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use executing-plans with the AI orchestration playbook. DeepSeek V4 Flash implements at `max`; GPT-5.6 Luna at xhigh independently reviews. Do not push or merge without the owner approval recorded for this run.
 
 **Goal:** Add an opt-in, fail-closed authoritative CI-check list to the PR closure gate.

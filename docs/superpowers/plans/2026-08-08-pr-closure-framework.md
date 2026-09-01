@@ -1,5 +1,7 @@
 # PR Closure Framework Implementation Plan
 
+> **Historical, non-normative model example and issue admission:** The Luna identifier in the sample review record below documents the cross-family contract used when this plan was written (2026-08-08); it is **not current routing guidance**. Current dispatches must follow the live [PLAYBOOK model policy](../../../PLAYBOOK.md): exactly one cross-family GPT-5.6 Sol review at `high` (the final adversarial judgment before merge), with no reviewer shotgun, fallback cascade, or Claude-family calls. Issue admission in this document is likewise historical: follow the live §2.6 ladder (`BLOCKS_PR` → link existing root issue → `FOLLOW_UP_ISSUE` only for a concrete reproducible independent root defect → `NOTE_ONLY`); the default is not a new issue, and every admitted deferred root defect has one verified root issue.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a reusable, fail-closed pull-request closure state machine that ties CI, local verification, adversarial review, follow-up issues, and tracking projections to one pushed commit.

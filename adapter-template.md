@@ -25,9 +25,9 @@
 - **captain_root:** `<absolute parent/coordination directory for one captain, or repo root>`
 - **clone_roots:** `<sibling clone/worktree roots the captain may dispatch into, or none>`
 - **host_parallelism:** `<safe heavy-resource concurrency rule for this repo/host>`
-- **executor:** `<which executor to dispatch + default effort (≤ high)>`
+- **executor:** `<which executor to dispatch + default effort (free implementation lane at its model's highest supported effort, e.g. max; review lane fixed at high)>`
 - **model_ladder:** `<fallback order when the primary model/provider rate-limits or hits quota>`
-- **provider_lanes:** `<approved DeepSeek/OpenAI/local lanes and their default roles; no new Claude model calls>`
+- **provider_lanes:** `<approved DeepSeek/OpenAI/local lanes and their default roles; strictly no Claude-family implementation, review, or coordination calls.>`
 - **hot_backlog:** `<target ready packet count, usually 3-5, plus durable board/packet path if any>`
 - **packet_template:** `<repo-specific template path, or ~/ai-orchestration-playbook/captain-packet-template.md>`
 - **push_guard:** `<actual push/merge enforcement path: hook, CI gate, soft gate, or none>`

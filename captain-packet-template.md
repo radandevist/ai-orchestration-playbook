@@ -7,7 +7,7 @@ Use this when one captain coordinates several clones/worktrees. Keep the board s
 - **Goal:** `<one sentence>`
 - **Captain root:** `<absolute parent/coordination directory>`
 - **Stable prefix already distilled:** `<playbook, adapter, repo rules, standing constraints>`
-- **Provider lanes:** `<DeepSeek implementation roles>; <GPT-5.6 Luna review roles>; <local roles>`
+- **Provider lanes:** `<DeepSeek implementation roles in the free lane>; <exactly one GPT-5.6 Sol review role at high>; <local roles>`
 - **Hot backlog target:** `3-5 ready packets`
 
 | Packet | Lane | Target clone/worktree | Status | Notes |
@@ -25,7 +25,7 @@ Save each packet as its own Markdown file under the run artifact directory.
 
 - **Lane:** <deepseek|openai-review|local>
 - **Target clone/worktree:** <absolute path>
-- **Effort:** <low|medium|high> (`xhigh` only with ledgered escalation)
+- **Effort:** <low|medium|high|max> — the implementation free lane uses the model's highest effort (`max` for DeepSeek V4 Flash); the `openai-review` lane is fixed at `high` (playbook §1.5, §2.6)
 - **Start checkpoint:** <branch + commit or explicit WIP note>
 
 ## Distilled Context
@@ -99,14 +99,14 @@ codex exec --ephemeral --skip-git-repo-check \
   - < /absolute/run/packet.md
 ```
 
-OpenAI review packet (GPT-5.6 Luna at `xhigh` — record the ledgered escalation reason, playbook
-§1.5/§2.6):
+OpenAI review packet (exactly one GPT-5.6 Sol run at fixed `high` — the final adversarial
+judgment before merge; record the route with its `reasoning_effort` under playbook §6):
 
 ```bash
 codex exec --ephemeral --skip-git-repo-check \
   --dangerously-bypass-approvals-and-sandbox \
-  -c model="gpt-5.6-luna" \
-  -c model_reasoning_effort="xhigh" \
+  -c model="gpt-5.6-sol" \
+  -c model_reasoning_effort="high" \
   -C /absolute/target/clone \
   - < /absolute/run/packet.md
 ```

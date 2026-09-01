@@ -74,7 +74,7 @@ The playbook references these tools in §5.4 (Installed tooling). They compress 
 
 - **Parallelism without chaos.** The captain splits a goal into file-disjoint tasks and runs N executors concurrently in isolated worktrees. No collisions, no entangled blame.
 - **You stay in control.** The captain **pauses** at three gates — scope-changing decisions, every merge, and anything outward-facing/irreversible. It asks; it never guesses and never merges on its own.
-- **Nothing integrates unreviewed.** Every result gets an independent review pass — ideally from a *different model family* than produced it — before it touches the default branch. This is what catches the plausible-but-wrong result that passes all tests.
+- **Nothing integrates unreviewed.** Every result gets an independent review pass from a *different model family* than produced it — before it touches the default branch. This is what catches the plausible-but-wrong result that passes all tests.
 - **Dead executors don't block you.** A hung or crashed executor is inherited by a fresh one with its on-disk WIP, not hand-patched.
 - **Works with the agents you already use.** Agent-neutral. Claude Code, Codex CLI, Hermes — same playbook, same adapter contract.
 - **It improves from use.** A living document: every session that exposes a new failure mode feeds back into the playbook or the project adapter. The `orchestration/ledger/` directory holds real preflight-ledger entries from actual orchestrated runs.

@@ -1,5 +1,7 @@
 # PR Closure State Machine and Mechanical Gate
 
+> **Historical, non-normative model routing and issue admission:** The Luna/`xhigh` instructions below record the policy used when this design was written (2026-08-08) and are **superseded and non-normative**. Current dispatches must follow the live [PLAYBOOK model policy](../../../PLAYBOOK.md): exactly one cross-family GPT-5.6 Sol review at `high` (the final adversarial judgment before merge), with no reviewer shotgun, fallback cascade, or Claude-family calls. Issue admission follows the live §2.6 ladder (`BLOCKS_PR` → link existing root issue → `FOLLOW_UP_ISSUE` only for a concrete reproducible independent root defect → `NOTE_ONLY`); every admitted deferred root defect has one verified root issue, and disposition is decided by admission, not severity.
+
 **Date:** 2026-08-08
 **Scope:** Every project using the AI Orchestration Playbook
 **First live adoption:** PublyApp's six open pull requests
@@ -52,7 +54,7 @@ readiness from evidence tied to the same pushed commit:
 4. GitHub CI passed at that tip;
 5. the latest independent review names that exact tip;
 6. the review has no blocking findings;
-7. every deferred finding has a real follow-up issue; and
+7. every deferred finding has a real follow-up issue — **superseded wording (live §2.6):** every admitted deferred root defect has one verified root issue; and
 8. the review verdict is `APPROVED` or `APPROVED_WITH_FOLLOW_UPS`.
 
 Unknown, missing, stale, or contradictory evidence is `UNVERIFIED`, never success.
@@ -71,8 +73,8 @@ Each pull request has exactly one derived state:
 | `REVIEWING` | One reviewer owns the exact pushed tip. | Wait for a structured verdict; do not edit the reviewed worktree. |
 | `CHANGES_REQUIRED` | The review contains at least one blocking finding. | Create one fix packet accounting for every blocker. |
 | `DESIGN_RESET` | The same root-cause class survived two attempted repair strategies. | Replace the mechanism or proof strategy, then verify and re-review. |
-| `FOLLOW_UP_FILING` | No blockers remain, but follow-up findings lack issue IDs. | File and verify the issues. |
-| `APPROVED_WITH_FOLLOW_UPS` | CI and local gates are green; review approved; every deferred finding has an issue. | Report ready and wait for owner merge authority. |
+| `FOLLOW_UP_FILING` | No blockers remain, but follow-up findings lack issue IDs. **Superseded (live §2.6):** no blockers remain, but an independently admitted root defect lacks an issue ID. | File and verify the issues. |
+| `APPROVED_WITH_FOLLOW_UPS` | CI and local gates are green; review approved; every deferred finding has an issue. **Superseded (live §2.6):** every admitted deferred root defect has one verified root issue. | Report ready and wait for owner merge authority. |
 | `APPROVED` | CI and local gates are green; review approved with no required follow-ups. | Report ready and wait for owner merge authority. |
 | `NEEDS_OWNER` | A genuine owner decision blocks progress. | Ask one narrow decision question. |
 | `STALLED` | No qualifying progress occurred within the adapter's time budget, or repeated executors died without producing evidence. | Rescue the lane, redesign the packet, or move to `NEEDS_OWNER`; another identical dispatch is forbidden. |
@@ -99,7 +101,7 @@ Every finding has two independent classifications.
 ### Disposition
 
 - `BLOCKS_PR` — must be fixed and independently re-reviewed before approval.
-- `FOLLOW_UP_ISSUE` — may leave the branch only after a real issue is filed and linked.
+- `FOLLOW_UP_ISSUE` — may leave the branch only after a real issue is filed and linked. **Superseded (live §2.6):** `FOLLOW_UP_ISSUE` is admitted only for a concrete reproducible failure whose root cause is independent of the branch's central claim; reuse the existing root issue when one exists, and never mint several issues for one cause.
 - `NOTE_ONLY` — recorded in the review; no issue required.
 
 Severity does not decide disposition by itself. Scope, causality, and risk do. A major pre-existing

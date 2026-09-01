@@ -1,5 +1,7 @@
 # PublyApp PR Closure Adoption Plan
 
+> **Historical, non-normative model routing and issue admission:** The Luna/`xhigh` instructions below record the policy used when this plan was written (2026-08-08) and are **superseded and non-normative**. Current dispatches must follow the live [PLAYBOOK model policy](../../../PLAYBOOK.md): exactly one cross-family GPT-5.6 Sol review at `high` (the final adversarial judgment before merge), with no reviewer shotgun, fallback cascade, or Claude-family calls. Issue admission in this document is likewise superseded: follow the live §2.6 ladder (`BLOCKS_PR` → link existing root issue → `FOLLOW_UP_ISSUE` only for a concrete reproducible independent root defect → `NOTE_ONLY`); the default is not a new issue, and every admitted deferred root defect has one verified root issue.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans together with the AI orchestration playbook. DeepSeek V4 Flash implements at `max`; GPT-5.6 Luna at `xhigh` independently reviews every pushed tip. Do not merge.
 
 **Goal:** Make PublyApp the first live user of the mechanical closure gate and drive PRs #1054, #1061, #1065, #1066, #1078, and #1083 to an evidence-backed `APPROVED`, `APPROVED_WITH_FOLLOW_UPS`, or genuine `NEEDS_OWNER` state.
@@ -141,7 +143,9 @@ Every finding receives `severity`, `disposition`, `scope`, `root_cause`, evidenc
 
 - [ ] **Step 3: Route eligible non-blockers immediately**
 
-For `MEDIUM`, `MINOR`, or `NOTE` findings outside the changed central claim, verify that the problem still exists and is independently actionable. File a GitHub follow-up issue, record its issue number, and use `FOLLOW_UP_ISSUE`. Do not file duplicates; search open issues first.
+> **Superseded by the live issue-admission ladder (PLAYBOOK §2.6).** The severity-driven filing instruction below contradicts current policy and is non-normative: disposition is decided by the admission ladder (`BLOCKS_PR` → link existing root issue → `FOLLOW_UP_ISSUE` only for a concrete, reproducible, independent root defect → `NOTE_ONLY`), never by severity labels alone. Improvements, style preferences, theoretical hardening, and unproven uncertainty are `NOTE_ONLY`. The default is not a new issue: file only for a step-3 admission, reuse an open issue for the same root cause, and never mint successor issues for the same cause.
+
+~~For `MEDIUM`, `MINOR`, or `NOTE` findings outside the changed central claim, verify that the problem still exists and is independently actionable. File a GitHub follow-up issue, record its issue number, and use `FOLLOW_UP_ISSUE`. Do not file duplicates; search open issues first.~~
 
 - [ ] **Step 4: Generate one current fix packet per blocked PR**
 
