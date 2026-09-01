@@ -2,6 +2,15 @@
 
 All notable changes to the AI Orchestration Playbook are recorded here. This is a **living document** — it is updated from real use, as sessions expose new failure modes and better patterns. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.1] - 2026-08-31 — Sol review policy: high, cross-family, Claude-free
+
+- Free jcode models own implementation, corrections, and audits: implementation defaults to DeepSeek V4 Flash at its highest supported effort (`max`).
+- Superseded the 0.2.0 Luna/`xhigh` review default with exactly one GPT-5.6 Sol independent review at `high`: the final adversarial judgment before merge, with no risk-tiered `medium` and no `xhigh` review level.
+- Restored the explicit Claude-family ban: no Claude implementation, review, or coordination calls; historical Claude review artifacts remain valid evidence without rerun.
+- Required the reviewer family to differ from the implementer family and prohibited reviewer shotgun or paid/substitute fallback cascades; a failed Sol run is handled explicitly as an infrastructure failure.
+- Made the preflight dispatch ledger record the reviewer `reasoning_effort` and limited `routes.fallbacks` to approved free lanes.
+- Updated the live captain packet and adapter templates, and marked the older design/implementation documents as historical and non-normative across both model routing and issue admission; the old severity-driven filing instructions are neutralized in place.
+
 ## [0.2.0] - 2026-08-09 — Mechanical PR closure gate
 
 - Added §2.6 PR closure state machine as a mandatory gate: one derived state per PR, exact terminal states (`APPROVED`, `APPROVED_WITH_FOLLOW_UPS`), stale-approval invalidation, design reset, stagnation and infrastructure-retry escalation, and `pr-closure check-transition` as a mandatory precondition before every state-changing closure action.
