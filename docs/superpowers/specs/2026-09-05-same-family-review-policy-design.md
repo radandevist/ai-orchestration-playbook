@@ -12,8 +12,8 @@ Make the review-family rule express the owner-approved PublyApp exception precis
 - Every model explicitly authorized as a GPT-family implementer for PublyApp is reviewed by the
   exact reviewer model `gpt-5.6-sol`.
 - That GPT-to-Sol route is a named, auditable same-family exception rather than a silent weakening
-  of the shared rule. The policy enumerates the complete authorized GPT implementer set; prose or
-  family inference cannot widen it.
+  of the shared rule. The single machine-readable route table enumerates the complete authorized
+  GPT implementer set; prose, a duplicate constant, or family inference cannot widen it.
 - Every other project and every unconfigured route continues to reject same-family review.
 
 The gate remains fail-closed. A missing policy, malformed policy, unknown model, missing
@@ -22,9 +22,9 @@ exception declaration, stale artifact, or contradictory family claim cannot prod
 ## Current contract and constraints
 
 `validate_review()` currently resolves `implementer_family` and `reviewer_family`, then rejects
-equal resolved families. `ProjectConfig` has no review policy. `cmd_import_review()` and the
-read-only `status` path both validate durable review records, so they must consume the same
-policy object.
+equal resolved families. `ProjectConfig` has no review policy or machine route table.
+`cmd_import_review()` and the read-only `status` path both validate durable review records, so they
+must consume the same normalized policy and route objects.
 
 The existing field names are misleading in practice: durable records frequently put model IDs
 such as `gpt-5.6-sol` and `claude-sonnet-5` in fields named `*_family`. The new contract must not
@@ -60,11 +60,22 @@ class SameFamilyReviewException:
     id: str
     registry_version: str
     implementer_family: str
-    implementer_models: tuple[str, ...]
     reviewer_model: str
-    required_for_implementer_models: bool
+    required_for_authorized_family: bool
     owner_authorization: str
     rationale: str
+
+@dataclass(frozen=True)
+class ModelRoute:
+    id: str
+    registry_version: str
+    implementer_model: str
+    implementer_runner: str
+    implementer_invocation_model: str
+    reviewer_model: str
+    reviewer_runner: str
+    reviewer_invocation_model: str
+    same_family_policy_id: str | None
 
 class ReviewPolicyMode(StrEnum):
     STAGED = "staged"
@@ -76,6 +87,9 @@ class ReviewPolicy:
     owner_authorization: str | None = None
     forbidden_reviewer_families: tuple[str, ...] = ()
     same_family_exceptions: tuple[SameFamilyReviewException, ...] = ()
+
+# Optional for legacy policy-disabled projects; mandatory when review_policy is non-empty.
+ProjectConfig.model_routes: tuple[ModelRoute, ...] = ()
 ```
 
 `ProjectConfig.review_policy` is optional and defaults to an empty `ReviewPolicy`. The JSON
@@ -83,6 +97,30 @@ shape is:
 
 ```json
 {
+  "model_routes": [
+    {
+      "id": "publyapp-luna-to-sol-v1",
+      "registry_version": "models-v1",
+      "implementer_model": "gpt-5.6-luna",
+      "implementer_runner": "codex",
+      "implementer_invocation_model": "gpt-5.6-luna",
+      "reviewer_model": "gpt-5.6-sol",
+      "reviewer_runner": "codex",
+      "reviewer_invocation_model": "gpt-5.6-sol",
+      "same_family_policy_id": "publyapp-gpt-implementation-sol-review-v1"
+    },
+    {
+      "id": "publyapp-deepseek-to-sol-v1",
+      "registry_version": "models-v1",
+      "implementer_model": "deepseek-v4-flash",
+      "implementer_runner": "opencode",
+      "implementer_invocation_model": "cline-pass/cline-pass/deepseek-v4-flash",
+      "reviewer_model": "gpt-5.6-sol",
+      "reviewer_runner": "codex",
+      "reviewer_invocation_model": "gpt-5.6-sol",
+      "same_family_policy_id": null
+    }
+  ],
   "review_policy": {
     "mode": "staged",
     "owner_authorization": "Radan; owner instruction 2026-09-05",
@@ -92,9 +130,8 @@ shape is:
         "id": "publyapp-gpt-implementation-sol-review-v1",
         "registry_version": "models-v1",
         "implementer_family": "openai",
-        "implementer_models": ["gpt-5.6-luna"],
         "reviewer_model": "gpt-5.6-sol",
-        "required_for_implementer_models": true,
+        "required_for_authorized_family": true,
         "owner_authorization": "Radan; owner instruction 2026-09-05",
         "rationale": "GPT implementation is reviewed by gpt-5.6-sol; Claude is forbidden."
       }
@@ -113,18 +150,24 @@ Configuration validation is fail-closed:
 - Exception IDs are non-blank, unique, and stable path-safe identifiers.
 - Model IDs are non-blank raw canonical registry keys with no whitespace; each must resolve to a
   known family. Trimming or case-folding an input is not normalization and cannot make it valid.
-- `implementer_models` is non-empty and unique.
-- `registry_version` names one released immutable registry, and every `implementer_models` entry
-  must map to `implementer_family` in that exact registry version.
+- A non-empty review policy requires a non-empty `model_routes` table. Route IDs and implementer
+  models are unique; every route field is exact and non-blank except nullable
+  `same_family_policy_id`.
+- A disabled policy requires an empty route table, preserving legacy behavior. A route table can
+  neither authorize dispatch nor constrain closure without a staged or enforced policy beside it.
+- A route's `registry_version` names one released immutable registry, and both canonical model IDs
+  must exist in that exact version. Runner and invocation-model values are validated against the
+  supported launcher contract and are passed to dispatch verbatim.
 - `reviewer_model`, `owner_authorization`, and `rationale` are non-blank.
-- `required_for_implementer_models` is an exact boolean. When true, every listed implementer model
-  must use this exception ID and exact reviewer; an ordinary cross-family review cannot bypass it.
+- `required_for_authorized_family` is an exact boolean. When true, every authorized model route
+  whose implementer belongs to that family must name this exception ID and exact reviewer; an
+  ordinary cross-family reviewer cannot bypass it.
 - The exception's model families must be equal; otherwise it is not a same-family exception.
-- `reviewer_model` is exact and cannot also appear in `implementer_models`; the policy cannot turn
+- A route cannot use the same canonical model as implementer and reviewer; the policy cannot turn
   Sol implementation into Sol self-review.
 - An exception cannot authorize a reviewer family listed in `forbidden_reviewer_families`.
 - Duplicate exceptions or duplicate forbidden families are rejected.
-- One implementer model cannot appear in two required routes.
+- One implementer model cannot appear in two routes.
 - No policy is inferred from the project name, repository name, environment, or reviewer text.
 
 #### Policy lifecycle and staging
@@ -227,29 +270,42 @@ adding v2 fails CI. It separately asserts that `MODEL_ALIASES_V1` remains the ex
 mapping, so aliases cannot change without a new version even though the registry digest covers only
 the canonical model-to-family mapping.
 
-For PublyApp, the exact policy above is the only same-family exception. `gpt-5.6-luna` is currently
-the sole GPT model authorized by the adapter for implementation; `gpt-5.6-sol` is reviewer-only,
-while Terra and Codex Spark being routable does not make them authorized implementers. The
-exception's `implementer_models` must equal the adapter's complete authorized GPT-implementer set
-for its pinned registry version, and an adapter-policy agreement check fails closed on either a
-missing or extra model. If an already registered GPT model is later authorized for implementation,
-the adapter and policy list change together. If its ID is not registered, first append a complete
-`models-v2`, then pin the policy and provenance to v2 and update the exhaustive list. No future GPT
-model is authorized implicitly. Every authorized GPT implementation routes to the exact reviewer
-`gpt-5.6-sol`; Claude is removed from all PublyApp new-review lanes.
+#### Single machine-readable route authority
 
-The PublyApp exception sets `required_for_implementer_models: true`. Consequently, a Luna artifact
-reviewed by DeepSeek, Claude, Terra, or any model other than exact Sol is rejected under the staged
-or enforced PublyApp policy even though some of those pairs are cross-family. The generic
-cross-family path remains unchanged only for implementers that do not match a required route and
-for projects whose policy is disabled.
+`ProjectConfig.model_routes` is the sole authority for allowed implementer models and their review
+routes. The dispatcher loads it to select the implementation runner/model and the required review
+runner/model. Import, status, and policy-transition checks load the same normalized objects to
+validate provenance and reviewer choice. The adapter Markdown may explain the routes but cannot
+authorize one, and neither dispatch nor closure scrapes or interprets Markdown. No second model
+list, runner map, or adapter constant is permitted.
+
+For PublyApp, the table above authorizes exactly two implementation routes today:
+
+- `gpt-5.6-luna` through the existing Codex runner, reviewed by exact `gpt-5.6-sol` through Codex,
+  with the named same-family exception; and
+- `deepseek-v4-flash` through the existing `cline-pass` OpenCode invocation, reviewed by exact
+  `gpt-5.6-sol` through Codex as an ordinary cross-family review.
+
+The registry only establishes identity and family; a registered or routable model is not an
+authorized implementer until it has exactly one `model_routes` entry. The PublyApp exception sets
+`required_for_authorized_family: true`, so every authorized route whose implementer resolves to
+OpenAI must select exact Sol and name that exception. Adding Terra, Codex Spark, or another GPT
+model to `model_routes` without those fields makes config loading, dispatch, import, and status fail
+closed. If the ID already exists in the pinned registry, only the single route table changes. If it
+does not, append `models-v2` first and pin the new route and exception to v2. No future GPT model is
+authorized implicitly. Claude is absent from every PublyApp reviewer route and remains forbidden.
 
 ### Review validation API
 
 Change the validator to:
 
 ```python
-validate_review(record, *, review_policy: ReviewPolicy | None = None) -> ReviewRecord
+validate_review(
+    record,
+    *,
+    review_policy: ReviewPolicy | None = None,
+    model_routes: tuple[ModelRoute, ...] = (),
+) -> ReviewRecord
 ```
 
 `None` is normalized to a disabled empty policy. Validation first dispatches by schema version and
@@ -271,16 +327,22 @@ policy mode:
 4. Derive each family from the registry entry. If any supplied legacy family label, explicit family,
    or model field disagrees with that result, reject the record, even when both values happen to be
    in the same lineage. Never accept a same-lineage record merely because its labels agree.
-5. Reject a reviewer whose resolved family is forbidden by a staged or enforced project policy.
-6. If the implementer model matches an exception with `required_for_implementer_models: true`,
-   reject unless `review_exception.policy_id` and `reviewer_model` exactly match that route. This
-   check runs before the generic cross-family path.
-7. Otherwise, if the resolved families differ, accept the normal cross-family path and reject any
-   attached same-family exception declaration.
-8. If the resolved families are equal, reject unless a complete `review_exception` is present and
-   exactly matches one configured exception ID, implementer model, and reviewer model.
-9. Validate both provenance envelopes against the durable source and digest contract below.
-10. Preserve all existing finding, live-tip, and verdict validation. In staged mode a valid record
+5. Under a staged or enforced policy, require the implementer model to match exactly one normalized
+   `model_routes` entry. Reject a reviewer whose family is forbidden, or whose canonical model,
+   runner, or invocation model differs from that route.
+6. If the matched route's families are equal, require `same_family_policy_id` and
+   `review_exception.policy_id` to name the same configured exception. The exception registry
+   version, implementer family, and reviewer model must match the route exactly.
+7. If an exception has `required_for_authorized_family: true`, reject the entire configuration
+   unless every route for that implementer family selects the exception's exact reviewer and policy
+   ID. This validation happens at config load and again before dispatch/import/status.
+8. If the matched route's families differ, require `same_family_policy_id` and
+   `review_exception` to be absent; accept it as the configured cross-family path.
+9. With a disabled policy and no route table, preserve the existing generic cross-family path and
+   reject any same-family exception declaration.
+10. Validate both provenance envelopes against the durable source, route runner/model, and digest
+   contract below.
+11. Preserve all existing finding, live-tip, and verdict validation. In staged mode a valid record
    may be imported for migration, but ordinary status remains `UNVERIFIED` and grants it no authority.
 
 The default branch of this algorithm still rejects equal families. A policy is an allowlist of
@@ -301,12 +363,16 @@ Add these fields to generated `review-record-v2.json`:
     "registry_version": "models-v1",
     "implementer": {
       "model_id": "gpt-5.6-luna",
+      "runner": "codex",
+      "invocation_model": "gpt-5.6-luna",
       "run_ref": "orchestration://run/2026-09-05/luna-123",
       "durable_path": "/home/radan/.hermes/orchestration/closure/publyapp/2104/provenance/impl.json",
       "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     },
     "reviewer": {
       "model_id": "gpt-5.6-sol",
+      "runner": "codex",
+      "invocation_model": "gpt-5.6-sol",
       "run_ref": "orchestration://run/2026-09-05/sol-456",
       "durable_path": "/home/radan/.hermes/orchestration/closure/publyapp/2104/provenance/review.json",
       "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
@@ -324,12 +390,13 @@ Rules:
   policy.
 - `provenance` is mandatory for every newly imported schema-v2 review, not only for the exception
   path. Its keys are exact: `registry_version`, `implementer`, and `reviewer`.
-- Each provenance participant has exactly `model_id`, `run_ref`, `durable_path`, and `sha256`.
-  `model_id` must equal the corresponding artifact model field byte-for-byte and resolve directly
-  through the declared registry version. `run_ref` is a non-blank immutable lane/run identifier
-  that must resolve to a durable run-manifest entry under the configured closure root; the
-  manifest must name the same repository, PR, reviewed commit, canonical model ID, and output
-  digest. A string that is merely plausible or supplied only in the review JSON is not a valid run
+- Each provenance participant has exactly `model_id`, `runner`, `invocation_model`, `run_ref`,
+  `durable_path`, and `sha256`. The first three must equal the corresponding route endpoint
+  byte-for-byte; `model_id` must also equal the artifact model field and resolve through the route's
+  registry version. `run_ref` is a non-blank immutable lane/run identifier that must resolve to a
+  durable run-manifest entry under the configured closure root. The manifest must name the same
+  repository, PR, reviewed commit, canonical model ID, runner, invocation model, and output digest.
+  A string that is merely plausible or supplied only in the review JSON is not a valid run
   reference.
 - `provenance.registry_version` must name a released immutable registry. For a requested exception,
   it must equal that exception's configured `registry_version`; a record cannot select a newer
@@ -340,7 +407,8 @@ Rules:
   the path, regular-file, root, and digest checks on every read; missing, replaced, or inaccessible
   provenance is `UNVERIFIED`, never an approval.
 - The provenance file is an immutable lane envelope containing the run ref, canonical model ID,
-  registry version, reviewed commit, and producer output digest. There are two mandatory halves:
+  registry version, runner, invocation model, reviewed commit, and producer output digest. There
+  are two mandatory halves:
   one immutable implementer-lane output and one immutable reviewer-lane output. The referenced run
   manifests and both envelopes are read and digest-checked at import and status. The review JSON
   may reference them, but cannot replace either half with `local_evidence` text.
@@ -369,9 +437,11 @@ that `gpt-5.6-sol` actually reviewed the commit.
 
 ## Import and status consistency
 
-`cmd_import_review()` passes `config.review_policy` to `validate_review()` before writing any
-artifact. The status path passes the same object while parsing every result from
-`store.bound_reviews()`. No second policy implementation is permitted.
+`cmd_import_review()` passes `config.review_policy` and `config.model_routes` to
+`validate_review()` before writing any artifact. The status path passes the same normalized objects
+while parsing every result from `store.bound_reviews()`. Dispatch consumes `config.model_routes`
+directly; it has no independent model constants. No second policy or route implementation is
+permitted.
 
 The version/policy matrix is normative:
 
@@ -527,11 +597,13 @@ place, invent a Sol review, or delete evidence.
   under the v1 name;
 - artifacts pinned to models-v1 keep the exact v1 mapping after models-v2 is introduced, with no
   latest-version fallback;
-- PublyApp's exception list equals the adapter's full authorized GPT-implementer set for the pinned
-  registry and rejects missing or extra models; adding a new GPT implementation lane requires the
-  policy/adapter update and, for an unknown ID, a new registry version;
-- every PublyApp GPT implementer matches exactly one required route to `gpt-5.6-sol`; a cross-family
-  reviewer cannot bypass that required route;
+- `ProjectConfig.model_routes` is the only authorized implementer/runner/reviewer source consumed by
+  dispatch and closure; no Markdown-derived or duplicated model list is consulted;
+- every PublyApp GPT implementer in that table matches exactly one required route to
+  `gpt-5.6-sol`; adding Terra, Codex Spark, or another OpenAI model without the exact reviewer and
+  exception ID makes config loading red before dispatch;
+- adding, removing, or changing a route changes the project-config digest and invalidates stale
+  activation evidence and review authority;
 - schema-v2/config accepts only byte-exact lowercase registry keys; surrounding whitespace,
   case variants, Unicode lookalikes, and punctuation variants are rejected;
 - legacy aliases are accepted only by the explicitly scoped inventory reader and never by a
@@ -556,9 +628,9 @@ place, invent a Sol review, or delete evidence.
 - schema-v1 `deepseek` to `claude` remains accepted by the existing family resolver when policy is
   absent or empty, while schema-v1 `gpt-4o` to `gpt-5` remains rejected as same-family;
 - same family with a policy ID absent from config is rejected;
-- every GPT implementer enumerated by the PublyApp policy is accepted only with exact reviewer
+- every GPT implementer authorized by the PublyApp route table is accepted only with exact reviewer
   `gpt-5.6-sol` and the configured exception ID;
-- a GPT model absent from the exhaustive implementer list, Sol as its own implementer/reviewer, a
+- a GPT model absent from the route table, Sol as its own implementer/reviewer, a
   different reviewer, or a different policy ID is rejected;
 - a registry alias normalizes only to its one explicit canonical ID; an ambiguous alias is rejected;
 - a legacy alias or family-only legacy declaration cannot satisfy the GPT-to-Sol exception;
@@ -579,8 +651,10 @@ place, invent a Sol review, or delete evidence.
   retirement/recovery, and makes status unconditionally `UNVERIFIED` with no approval authority;
 - `check-policy-activation` refuses a v1 artifact, forbidden reviewer, incomplete retirement,
   config/tip mismatch, or missing compliant v2 review; an eligible result still cannot approve;
-- staged deactivation keeps Anthropic forbidden, permits a genuine policy-free non-Claude
-  cross-family schema-v2 import, and remains `UNVERIFIED` until policy removal;
+- staged rollback keeps Anthropic forbidden, permits only the target non-Claude cross-family route,
+  and remains `UNVERIFIED` until the target policy is enforced;
+- rollback activation ends with an enforced policy whose forbidden-family list still contains
+  Anthropic and whose same-family exception list is empty; policy removal is not a valid rollback;
 - enforced status revalidates independently after a staged-to-enforced change that modifies only
   the mode;
 - schema-v1 import and status with absent or empty policy preserve the existing cross-family
@@ -652,31 +726,38 @@ and both the staged and projected enforced config digests. The rollout then chan
 status derivation. Failure at either step leaves or restores staged mode; it never falls back to
 Claude or treats staged evidence as approval.
 
-Rollback is a verified staged deactivation, not a direct config edit:
+Rollback is a verified transition to a different enforced policy, never policy removal. The target
+keeps owner authorization and `forbidden_reviewer_families: ["anthropic"]`, but has
+`same_family_exceptions: []`. Its sole `model_routes` table changes the GPT implementer route to the
+registered cross-family reviewer `deepseek-v4-flash`, runner `opencode`, invocation model
+`cline-pass/cline-pass/deepseek-v4-flash`, and `same_family_policy_id: null`. The DeepSeek
+implementer route continues to use exact `gpt-5.6-sol` through `codex`. Thus the final state cannot
+silently recover either Claude authority or the GPT-to-Sol exception.
 
-1. Replace the enforced policy with an owner-authorized staged deactivation config that retains
-   `forbidden_reviewer_families: ["anthropic"]` but has no same-family exception. Status immediately
-   becomes `UNVERIFIED`. This explicitly permits migration toward the disabled cross-family default
-   without permitting Claude or preserving the required GPT-to-Sol route as import authority.
-2. At the exact current pushed tip, obtain a fresh non-Claude, cross-family schema-v2 review with
-   complete provenance. For a GPT implementation, use a real registered non-Claude reviewer already
-   available to the adapter, such as `deepseek-v4-flash`; do not invent a provider or model.
-3. Import that review through the staged deactivation policy and validate its provenance digest,
-   local gates, CI, and live-tip binding. It remains non-authoritative while mode is staged.
+1. Replace the enforced policy and route table with an owner-authorized `mode: staged` form of that
+   exact rollback target. Status immediately becomes `UNVERIFIED`; the staged and projected
+   enforced digests are fixed before migration starts.
+2. At the exact current pushed tip, obtain a fresh cross-family schema-v2 review for every affected
+   GPT implementation from the route table's exact DeepSeek endpoint. Do not invent a provider,
+   model, or alternate route.
+3. Import each review through the staged target policy and validate its route-bound provenance
+   digest, local gates, CI, and live-tip binding. It remains non-authoritative while mode is staged.
 4. Retire the old same-family review and any forbidden-reviewer artifact through the complete
    `ACTIVE -> PREPARED -> COPIED -> COMMITTED -> FINALIZED` protocol.
-5. Run `check-policy-deactivation`. It evaluates the projected disabled empty policy with the same
-   validators and requires the new cross-family review to be the sole active review authority, no
-   incomplete retirement, exact tip binding, and green non-review gates. It records both staged and
-   projected disabled config digests but cannot emit approval.
-6. Remove `review_policy` only after that eligibility proof, then run normal `status`; it must derive
-   green under the empty default policy from the fresh non-Claude cross-family review.
+5. Run `check-policy-activation` against the projected enforced rollback target. It uses the same
+   route, policy, and closure validators and requires the new cross-family reviews to be the sole
+   active review authority, no incomplete retirement, exact tip binding, and green non-review gates.
+   It records both staged and projected enforced config digests and can return only `ELIGIBLE`, never
+   approval.
+6. Change only `mode: staged` to `mode: enforced`, producing the proved target digest, then run normal
+   `status`; it must independently derive green under the enforced policy that still forbids
+   Anthropic and contains no same-family exception.
 
-If any step fails, remain in or restore the staged deactivation config and resume the same bounded
-migration; status stays `UNVERIFIED`. Never restore review authority from an incomplete retirement,
-delete the replacement, fall back to Claude, or reactivate retired evidence automatically. A
-separately audited restore operation would have to verify the original digest and append a new
-event; it is not part of ordinary rollback.
+If any step fails, remain in or restore the staged form of the rollback target and resume the same
+bounded migration; status stays `UNVERIFIED`. Never remove the policy, restore review authority from
+an incomplete retirement, delete the replacement, fall back to Claude, or reactivate retired
+evidence automatically. A separately audited restore operation would have to verify the original
+digest and append a new event; it is not part of ordinary rollback.
 
 ## Non-goals
 
