@@ -69,6 +69,7 @@ class SameFamilyReviewException:
 class ModelRoute:
     id: str
     registry_version: str
+    launcher_registry_version: str
     implementer_model: str
     implementer_runner: str
     implementer_invocation_model: str
@@ -101,6 +102,7 @@ shape is:
     {
       "id": "publyapp-luna-to-sol-v1",
       "registry_version": "models-v1",
+      "launcher_registry_version": "launchers-v1",
       "implementer_model": "gpt-5.6-luna",
       "implementer_runner": "codex",
       "implementer_invocation_model": "gpt-5.6-luna",
@@ -112,6 +114,7 @@ shape is:
     {
       "id": "publyapp-deepseek-to-sol-v1",
       "registry_version": "models-v1",
+      "launcher_registry_version": "launchers-v1",
       "implementer_model": "deepseek-v4-flash",
       "implementer_runner": "opencode",
       "implementer_invocation_model": "cline-pass/cline-pass/deepseek-v4-flash",
@@ -155,9 +158,10 @@ Configuration validation is fail-closed:
   `same_family_policy_id`.
 - A disabled policy requires an empty route table, preserving legacy behavior. A route table can
   neither authorize dispatch nor constrain closure without a staged or enforced policy beside it.
-- A route's `registry_version` names one released immutable registry, and both canonical model IDs
-  must exist in that exact version. Runner and invocation-model values are validated against the
-  supported launcher contract and are passed to dispatch verbatim.
+- A route's `registry_version` and `launcher_registry_version` name released immutable registries.
+  Both canonical model IDs must exist in the exact model-registry version, and each complete
+  `(model_id, runner, invocation_model)` endpoint must exist in the exact launcher-registry version.
+  These values are passed to dispatch verbatim; no component reconstructs an invocation string.
 - `reviewer_model`, `owner_authorization`, and `rationale` are non-blank.
 - `required_for_authorized_family` is an exact boolean. When true, every authorized model route
   whose implementer belongs to that family must name this exception ID and exact reviewer; an
@@ -270,14 +274,55 @@ adding v2 fails CI. It separately asserts that `MODEL_ALIASES_V1` remains the ex
 mapping, so aliases cannot change without a new version even though the registry digest covers only
 the canonical model-to-family mapping.
 
+#### Immutable launcher identity registry
+
+Canonical model identity does not prove that a runner can invoke that model. The shared launcher
+layer therefore publishes a second machine-readable registry whose entries are exact endpoint
+identities, not project routes or review permissions:
+
+```python
+LAUNCHER_REGISTRY_V1 = {
+    ("deepseek-v4-flash", "opencode", "cline-pass/cline-pass/deepseek-v4-flash"),
+    ("gpt-5.6-luna", "codex", "gpt-5.6-luna"),
+    ("gpt-5.6-sol", "codex", "gpt-5.6-sol"),
+}
+
+LAUNCHER_REGISTRY_GOLDEN_SHA256 = {
+    "launchers-v1": "b7a4dd007921ffe1bf57e7c01a02bec95b9a32013d959500e411b7d9c88416c6",
+}
+```
+
+This is the complete `launchers-v1` set. Its canonical serialization is a JSON array of
+`[model_id, runner, invocation_model]` arrays, sorted lexicographically, with no insignificant
+whitespace and separators `,` and `:`. At validation, every endpoint's model ID must independently
+exist in the artifact- or route-declared immutable model registry. Released launcher registries are
+immutable complete snapshots: changing an endpoint or adding a real launcher capability creates
+`launchers-v2` and a new golden digest; there is no `latest` fallback.
+
+Membership means only that the shared launcher recognizes that exact endpoint. It does not
+authorize a model for a project, choose a reviewer, or establish that one participant reviewed the
+other. Those facts come respectively from an active project's `model_routes`, the review artifact,
+and the two immutable run manifests. Import and status require every schema-v2 provenance
+participant's complete endpoint identity to match both its durable manifest and one entry in the
+artifact's declared launcher-registry version. Unknown runner names, alternate invocation aliases,
+and plausible strings are rejected; the validator never synthesizes an endpoint or route.
+
 #### Single machine-readable route authority
 
-`ProjectConfig.model_routes` is the sole authority for allowed implementer models and their review
-routes. The dispatcher loads it to select the implementation runner/model and the required review
-runner/model. Import, status, and policy-transition checks load the same normalized objects to
-validate provenance and reviewer choice. The adapter Markdown may explain the routes but cannot
-authorize one, and neither dispatch nor closure scrapes or interprets Markdown. No second model
-list, runner map, or adapter constant is permitted.
+For a staged or enforced project policy, `ProjectConfig.model_routes` is the sole authority for
+allowed implementer models and their review routes. The dispatcher loads it to select the
+implementation runner/model and the required review runner/model. Import, status, and
+policy-transition checks load the same normalized objects to validate provenance and reviewer
+choice. The adapter Markdown may explain the routes but cannot authorize one, and neither dispatch
+nor closure scrapes or interprets Markdown. No second project model list, runner map, or adapter
+constant is permitted.
+
+The launcher registry is deliberately not a second project-route source: it describes globally
+real endpoints, while `model_routes` grants project-specific dispatch and reviewer choice only in
+staged or enforced mode. With policy disabled, schema-v2 validation consults no `model_routes`
+entry. It verifies each claimed participant independently against the launcher registry and its
+immutable manifest, then applies the generic cross-family rule. It neither authorizes dispatch nor
+invents a reviewer pairing that is absent from project configuration.
 
 For PublyApp, the table above authorizes exactly two implementation routes today:
 
@@ -291,9 +336,11 @@ authorized implementer until it has exactly one `model_routes` entry. The PublyA
 `required_for_authorized_family: true`, so every authorized route whose implementer resolves to
 OpenAI must select exact Sol and name that exception. Adding Terra, Codex Spark, or another GPT
 model to `model_routes` without those fields makes config loading, dispatch, import, and status fail
-closed. If the ID already exists in the pinned registry, only the single route table changes. If it
-does not, append `models-v2` first and pin the new route and exception to v2. No future GPT model is
-authorized implicitly. Claude is absent from every PublyApp reviewer route and remains forbidden.
+closed. If all required endpoint identities already exist in the pinned model and launcher
+registries, only the single route table changes. Otherwise publish the next complete immutable
+registry snapshot first, then pin the new route and exception to those versions. No future GPT
+model or launcher endpoint is authorized implicitly. Claude is absent from every PublyApp reviewer
+route and remains forbidden.
 
 ### Review validation API
 
@@ -327,22 +374,28 @@ policy mode:
 4. Derive each family from the registry entry. If any supplied legacy family label, explicit family,
    or model field disagrees with that result, reject the record, even when both values happen to be
    in the same lineage. Never accept a same-lineage record merely because its labels agree.
-5. Under a staged or enforced policy, require the implementer model to match exactly one normalized
+5. For every schema-v2 record, require each participant's exact
+   `(model_id, runner, invocation_model)` tuple to exist in the declared immutable launcher registry
+   and to equal the tuple in that participant's immutable run manifest and provenance envelope.
+   Reject an unknown or mismatched tuple; never derive one from the model ID.
+6. With a disabled policy and the required empty route table, do not look up or infer a project
+   route. Reject `review_exception`, reject equal resolved families, and otherwise accept the
+   generic cross-family pairing only after both independent launcher identities and manifests pass.
+7. Under a staged or enforced policy, require the implementer model to match exactly one normalized
    `model_routes` entry. Reject a reviewer whose family is forbidden, or whose canonical model,
-   runner, or invocation model differs from that route.
-6. If the matched route's families are equal, require `same_family_policy_id` and
+   runner, invocation model, model-registry version, or launcher-registry version differs from that
+   route.
+8. If the matched route's families are equal, require `same_family_policy_id` and
    `review_exception.policy_id` to name the same configured exception. The exception registry
    version, implementer family, and reviewer model must match the route exactly.
-7. If an exception has `required_for_authorized_family: true`, reject the entire configuration
+9. If an exception has `required_for_authorized_family: true`, reject the entire configuration
    unless every route for that implementer family selects the exception's exact reviewer and policy
    ID. This validation happens at config load and again before dispatch/import/status.
-8. If the matched route's families differ, require `same_family_policy_id` and
+10. If the matched route's families differ, require `same_family_policy_id` and
    `review_exception` to be absent; accept it as the configured cross-family path.
-9. With a disabled policy and no route table, preserve the existing generic cross-family path and
-   reject any same-family exception declaration.
-10. Validate both provenance envelopes against the durable source, route runner/model, and digest
-   contract below.
-11. Preserve all existing finding, live-tip, and verdict validation. In staged mode a valid record
+11. Validate both provenance envelopes against the durable source and digest contract below. Route
+    concordance is an additional check only in staged or enforced mode.
+12. Preserve all existing finding, live-tip, and verdict validation. In staged mode a valid record
    may be imported for migration, but ordinary status remains `UNVERIFIED` and grants it no authority.
 
 The default branch of this algorithm still rejects equal families. A policy is an allowlist of
@@ -361,6 +414,7 @@ Add these fields to generated `review-record-v2.json`:
   },
   "provenance": {
     "registry_version": "models-v1",
+    "launcher_registry_version": "launchers-v1",
     "implementer": {
       "model_id": "gpt-5.6-luna",
       "runner": "codex",
@@ -389,39 +443,48 @@ Rules:
 - The policy ID must be present in the loaded project config; an artifact cannot create or amend
   policy.
 - `provenance` is mandatory for every newly imported schema-v2 review, not only for the exception
-  path. Its keys are exact: `registry_version`, `implementer`, and `reviewer`.
+  path. Its keys are exact: `registry_version`, `launcher_registry_version`, `implementer`, and
+  `reviewer`.
 - Each provenance participant has exactly `model_id`, `runner`, `invocation_model`, `run_ref`,
-  `durable_path`, and `sha256`. The first three must equal the corresponding route endpoint
-  byte-for-byte; `model_id` must also equal the artifact model field and resolve through the route's
-  registry version. `run_ref` is a non-blank immutable lane/run identifier that must resolve to a
+  `durable_path`, and `sha256`. The first three must match one exact entry in
+  `launcher_registry_version` and the corresponding immutable run manifest byte-for-byte;
+  `model_id` must also equal the artifact model field and resolve through `registry_version`.
+  Under staged or enforced policy, the same tuple and both registry versions must additionally
+  equal the corresponding `model_routes` endpoint. Under disabled policy there is no route
+  concordance check. `run_ref` is a non-blank immutable lane/run identifier that must resolve to a
   durable run-manifest entry under the configured closure root. The manifest must name the same
-  repository, PR, reviewed commit, canonical model ID, runner, invocation model, and output digest.
-  A string that is merely plausible or supplied only in the review JSON is not a valid run
-  reference.
+  repository, PR, reviewed commit, canonical model ID, runner, invocation model, model-registry
+  version, launcher-registry version, and output digest. A string that is merely plausible or
+  supplied only in the review JSON is not a valid run reference.
 - `provenance.registry_version` must name a released immutable registry. For a requested exception,
   it must equal that exception's configured `registry_version`; a record cannot select a newer
   mapping than the policy that authorizes it.
+- `provenance.launcher_registry_version` must name a released immutable launcher registry. It must
+  equal the route's `launcher_registry_version` only when policy is staged or enforced; disabled
+  validation has no project route to match.
 - `durable_path` must be absolute, resolve without a symlink escape, be a regular readable file
   under the configured durable closure root, and not live under a temporary session directory.
   The importer reads its bytes and requires the lowercase 64-hex `sha256` to match. Status repeats
   the path, regular-file, root, and digest checks on every read; missing, replaced, or inaccessible
   provenance is `UNVERIFIED`, never an approval.
 - The provenance file is an immutable lane envelope containing the run ref, canonical model ID,
-  registry version, runner, invocation model, reviewed commit, and producer output digest. There
-  are two mandatory halves:
+  model- and launcher-registry versions, runner, invocation model, reviewed commit, and producer
+  output digest. There are two mandatory halves:
   one immutable implementer-lane output and one immutable reviewer-lane output. The referenced run
   manifests and both envelopes are read and digest-checked at import and status. The review JSON
   may reference them, but cannot replace either half with `local_evidence` text.
 - For a same-family exception, the model fields are mandatory even when legacy family fields are
   also present. The validator derives the family from these model fields and checks every duplicate
   declaration for consistency.
-- New schema-v2 producers must populate model fields. With a disabled policy, schema-v1 records
-  remain authoritative under the existing cross-family rule through the existing resolver. With a
-  staged or enforced policy, schema-v1 records are non-authoritative and cannot use an exception or
-  regain authority without schema-v2 replacement plus explicit retirement.
+- New schema-v2 producers must populate model fields, runner and invocation identities, and both
+  registry versions. With a disabled policy, schema-v1 records remain authoritative under the
+  existing cross-family rule through the existing resolver; schema-v2 records additionally require
+  two launcher-registered, manifest-backed identities but no project route. With a staged or
+  enforced policy, schema-v1 records are non-authoritative and cannot use an exception or regain
+  authority without schema-v2 replacement plus explicit retirement.
 
 The normalized schema-v2 `ReviewRecord` stores `implementer_model`, `reviewer_model`, the resolved
-family values, registry version, provenance descriptors, and the optional exception ID. The
+family values, both registry versions, provenance descriptors, and the optional exception ID. The
 existing normalized schema-v1 record remains unchanged on the policy-empty compatibility path. Raw
 JSON remains byte-preserved in the durable store; normalization never rewrites evidence. A project
 with a staged or enforced `review_policy` cannot use a schema-v1 record as current-tip approval
@@ -439,9 +502,11 @@ that `gpt-5.6-sol` actually reviewed the commit.
 
 `cmd_import_review()` passes `config.review_policy` and `config.model_routes` to
 `validate_review()` before writing any artifact. The status path passes the same normalized objects
-while parsing every result from `store.bound_reviews()`. Dispatch consumes `config.model_routes`
-directly; it has no independent model constants. No second policy or route implementation is
-permitted.
+while parsing every result from `store.bound_reviews()`. When policy is staged or enforced, policy
+dispatch consumes `config.model_routes` directly and has no independent project-model constants.
+Policy-disabled projects retain their legacy orchestration dispatch configuration, but closure does
+not read that configuration, convert it into a route, or use it to relax the generic cross-family
+rule. No second active-policy route implementation is permitted.
 
 The version/policy matrix is normative:
 
@@ -449,7 +514,7 @@ The version/policy matrix is normative:
 |---|---|---|---|
 | schema v1 | disabled | Existing v1 validator; write only if cross-family | Existing v1 validator; accepted cross-family review remains authority |
 | schema v1 | staged or enforced | Reject before write | `UNVERIFIED` until schema-v2 replacement and retirement |
-| schema v2 | disabled | Schema-v2 cross-family validator and provenance checks | Identical validator; same-family remains forbidden |
+| schema v2 | disabled | Cross-family validator; each participant must match its immutable manifest and launcher-registry identity; no project route lookup | Identical validator; no route is inferred and same-family remains forbidden |
 | schema v2 | staged | Candidate-policy validator permits migration import; forbidden reviewer families already rejected | Always `UNVERIFIED`; staged evidence has no approval authority |
 | schema v2 | enforced | Enforced-policy validator and provenance checks | Identical validator; compliant active review may contribute authority |
 
@@ -458,11 +523,15 @@ An empty policy means `mode` and `owner_authorization` are `None` and both colle
 repository name, schema-v2 support, or staged import cannot implicitly activate approval authority.
 
 The policy is loaded and validated once with `ProjectConfig`; its normalized immutable value is
-passed through both paths. A policy change invalidates no bytes and silently upgrades no record.
-If a durable record or its provenance no longer satisfies the enforced policy, status returns a typed
-malformed/unverified error rather than treating another review or a projection as approval
-evidence. Import validates provenance before creating the review event, and status validates the
-same envelope, path, registry version, model IDs, reviewed commit, and digest before considering
+passed through both paths. `model_routes` concordance is evaluated only for staged or enforced
+policy. The disabled schema-v2 branch requires the configured route table to be empty and validates
+only the generic cross-family rule plus the two independently registered, manifest-backed launcher
+identities; it cannot synthesize or persist a project route. A policy change invalidates no bytes
+and silently upgrades no record. If a durable record or its provenance no longer satisfies the
+enforced policy, status returns a typed malformed/unverified error rather than treating another
+review or a projection as approval evidence. Import validates provenance before creating the
+review event, and status validates the same envelope, path, registry versions, model IDs, runner and
+invocation identities, reviewed commit, and digest before considering
 the review verdict. Staged import calls this same validator but cannot bypass the mode-level
 `UNVERIFIED` status result.
 
@@ -597,8 +666,16 @@ place, invent a Sol review, or delete evidence.
   under the v1 name;
 - artifacts pinned to models-v1 keep the exact v1 mapping after models-v2 is introduced, with no
   latest-version fallback;
+- the complete canonical `launchers-v1` serialization contains only the three declared endpoint
+  identities and hashes to
+  `b7a4dd007921ffe1bf57e7c01a02bec95b9a32013d959500e411b7d9c88416c6`; changing an endpoint
+  or digest fails, while a real new launcher capability requires a complete `launchers-v2` snapshot;
+- every schema-v2 participant's launcher entry names the same canonical model resolved through the
+  artifact's model-registry version, and unknown runners or invocation aliases are rejected rather
+  than normalized;
 - `ProjectConfig.model_routes` is the only authorized implementer/runner/reviewer source consumed by
-  dispatch and closure; no Markdown-derived or duplicated model list is consulted;
+  dispatch and closure under staged or enforced policy; no Markdown-derived or duplicated project
+  model list is consulted;
 - every PublyApp GPT implementer in that table matches exactly one required route to
   `gpt-5.6-sol`; adding Terra, Codex Spark, or another OpenAI model without the exact reviewer and
   exception ID makes config loading red before dispatch;
@@ -611,6 +688,8 @@ place, invent a Sol review, or delete evidence.
 - blank, duplicate, unknown, or conflicting policy fields are rejected;
 - a forbidden reviewer family in an exception is rejected;
 - schema/Python agreement covers project policy and the schema-v2 artifact/provenance fields;
+- schema/Python agreement includes `launcher_registry_version` in routes, artifacts, provenance
+  envelopes, and immutable manifests;
 - schema-v1 uses the normal existing validator and can remain current-tip cross-family authority
   only when policy is absent or empty;
 - schema-v1 is accepted only by the historical/migration reader when policy is staged or enforced
@@ -625,6 +704,11 @@ place, invent a Sol review, or delete evidence.
 ### Review validator
 
 - same family with no policy is rejected;
+- disabled schema-v2 accepts a cross-family pair only when each participant independently matches
+  an exact launcher-registry entry and immutable manifest; it neither consults `model_routes` nor
+  constructs a project route from those two identities;
+- disabled schema-v2 rejects a missing launcher version, unknown runner, invocation alias, manifest
+  mismatch, or any non-empty route table before writing and again during status;
 - schema-v1 `deepseek` to `claude` remains accepted by the existing family resolver when policy is
   absent or empty, while schema-v1 `gpt-4o` to `gpt-5` remains rejected as same-family;
 - same family with a policy ID absent from config is rejected;
@@ -647,6 +731,8 @@ place, invent a Sol review, or delete evidence.
 
 - import applies the policy before any write;
 - status applies the identical policy to durable artifacts;
+- import and status apply launcher-registry and immutable-manifest identity checks to every
+  schema-v2 record, while route concordance runs only for staged or enforced policy;
 - staged policy accepts only policy-compliant schema-v2 imports, rejects new Claude reviews, permits
   retirement/recovery, and makes status unconditionally `UNVERIFIED` with no approval authority;
 - `check-policy-activation` refuses a v1 artifact, forbidden reviewer, incomplete retirement,
@@ -705,9 +791,10 @@ every authorized GPT implementation uses the exact staged GPT-to-Sol exception.
 For each active-tip schema-v1 artifact, migrate in this order:
 
 1. Locate the immutable implementer-lane output and reviewer-lane output. Each output must have a
-   durable run manifest, exact reviewed commit, canonical model ID, and independently verifiable
-   digest. A chat transcript, model-family label, mutable worktree file, or review JSON alone is
-   not an implementer output.
+   durable run manifest, exact reviewed commit, canonical model ID, exact runner and invocation
+   model, pinned model- and launcher-registry versions, and independently verifiable digest. Every
+   endpoint tuple must exist in that launcher-registry snapshot. A chat transcript, model-family
+   label, mutable worktree file, or review JSON alone is not an implementer output.
 2. If either output exists and its digest verifies, create the schema-v2 provenance envelopes from
    those bytes without changing them. If the implementer output is missing, mutable, or cannot be
    digest-verified, do not fabricate provenance from the old review: start a fresh implementation
@@ -730,8 +817,9 @@ Rollback is a verified transition to a different enforced policy, never policy r
 keeps owner authorization and `forbidden_reviewer_families: ["anthropic"]`, but has
 `same_family_exceptions: []`. Its sole `model_routes` table changes the GPT implementer route to the
 registered cross-family reviewer `deepseek-v4-flash`, runner `opencode`, invocation model
-`cline-pass/cline-pass/deepseek-v4-flash`, and `same_family_policy_id: null`. The DeepSeek
-implementer route continues to use exact `gpt-5.6-sol` through `codex`. Thus the final state cannot
+`cline-pass/cline-pass/deepseek-v4-flash`, pinned to `models-v1` and `launchers-v1`, and
+`same_family_policy_id: null`. The DeepSeek implementer route continues to use exact
+`gpt-5.6-sol` through `codex` with the same pinned registry versions. Thus the final state cannot
 silently recover either Claude authority or the GPT-to-Sol exception.
 
 1. Replace the enforced policy and route table with an owner-authorized `mode: staged` form of that
