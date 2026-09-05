@@ -42,7 +42,10 @@ project configuration can authorize it.
 The policy is additive to project-configuration schema version 1. Review artifacts move to schema
 version 2 because mandatory provenance is a safety boundary, not an optional decoration. Schema-v1
 artifacts remain parseable for historical inspection and migration diagnostics, but are not
-current approval evidence for a project with an active policy. Unknown fields remain rejected.
+current approval evidence for a project with an active policy. When `review_policy` is absent or
+empty, normal import and status retain the existing schema-v1 authority path unchanged: validate
+the exact v1 shape, resolve `implementer_family` and `reviewer_family` with the existing family
+resolver, and accept only a cross-family review. Unknown fields remain rejected in both versions.
 
 ### Configuration API
 
@@ -138,10 +141,13 @@ accident. It rejects internal or surrounding whitespace, control characters, pat
 empty values, unknown IDs, and labels that identify only a family (`gpt`, `openai`, `claude`, or
 `anthropic`). Registry entries map to one immutable family.
 
-Aliases exist only in a separately scoped `legacy-v1` reader for historical records. They are
-explicit, one-to-one, versioned mappings used to inventory or migrate old metadata; they are never
-accepted in schema-v2/configuration and never satisfy a same-family exception. The legacy reader
-retains both the original spelling and the resulting canonical key in its migration report.
+Aliases exist only in a separately scoped `legacy-v1` migration reader. They are explicit,
+one-to-one, versioned mappings used to inventory or migrate old metadata under an active policy;
+they are never accepted in schema-v2/configuration and never satisfy a same-family exception. The
+migration reader retains both the original spelling and the resulting canonical key in its report.
+This reader is separate from the normal policy-empty schema-v1 authority path, which continues to
+use the existing family resolver and accepts existing family-only labels such as `deepseek` and
+`claude` exactly as before.
 
 The config validator resolves every exception model through this registry. An unknown ID,
 ambiguous alias, family mismatch, or legacy declaration that disagrees with the registry is a
@@ -160,23 +166,29 @@ Change the validator to:
 validate_review(record, *, review_policy: ReviewPolicy | None = None) -> ReviewRecord
 ```
 
-`None` is normalized to an empty policy. The validator performs these checks in this order:
+`None` is normalized to an empty policy. Validation first dispatches by schema version and policy:
 
-1. Validate the existing record shape and exact schema version.
-2. Resolve both raw model IDs through the versioned registry. New records use the model fields
-   below and require exact registry keys; a legacy record may use its old `*_family` values through
-   the explicitly scoped `legacy-v1` alias reader for inventory only. Family-only legacy labels are
-   historical metadata, not current model provenance.
-3. Derive each family from the registry entry. If any supplied legacy family label, explicit family,
+1. For schema v1 with an empty policy, run the existing v1 validator unchanged. It validates the
+   exact v1 shape, resolves the two `*_family` fields with `families.resolve_family()`, rejects equal
+   resolved families, and preserves all existing finding, live-tip, and verdict validation. This is
+   the normal import/status path and its accepted cross-family record remains current-tip authority.
+2. For schema v1 with an active policy, normal import rejects the record before any write. Status
+   treats any active-tip v1 artifact as non-authoritative and returns `UNVERIFIED`; it cannot skip
+   the artifact in favor of another review. Only the separate migration reader may parse it for an
+   inventory or retirement decision. Replacement with schema v2 and explicit retirement are
+   required before approval.
+3. For schema v2, resolve both raw model IDs through the declared versioned registry. Schema-v2
+   records require exact registry keys; family-only labels and legacy aliases are invalid.
+4. Derive each family from the registry entry. If any supplied legacy family label, explicit family,
    or model field disagrees with that result, reject the record, even when both values happen to be
    in the same lineage. Never accept a same-lineage record merely because its labels agree.
-4. Reject a reviewer whose resolved family is forbidden by the project policy.
-5. If the resolved families differ, accept the normal cross-family path and reject any attached
+5. Reject a reviewer whose resolved family is forbidden by the project policy.
+6. If the resolved families differ, accept the normal cross-family path and reject any attached
    same-family exception declaration.
-6. If the resolved families are equal, reject unless a complete `review_exception` is present and
+7. If the resolved families are equal, reject unless a complete `review_exception` is present and
    exactly matches one configured exception ID, implementer model, and reviewer model.
-7. Validate both provenance envelopes against the durable source and digest contract below.
-8. Preserve all existing finding, live-tip, and verdict validation.
+8. Validate both provenance envelopes against the durable source and digest contract below.
+9. Preserve all existing finding, live-tip, and verdict validation.
 
 The default branch of this algorithm still rejects equal families. A policy is an allowlist of
 exact pairs, not a boolean bypass.
@@ -239,14 +251,17 @@ Rules:
 - For a same-family exception, the model fields are mandatory even when legacy family fields are
   also present. The validator derives the family from these model fields and checks every duplicate
   declaration for consistency.
-- New producers must populate model fields. Legacy records remain valid only under the existing
-  cross-family rule and cannot use a same-family exception without the new fields.
+- New schema-v2 producers must populate model fields. With an empty policy, schema-v1 records remain
+  authoritative under the existing cross-family rule through the existing resolver. With an active
+  policy, schema-v1 records are non-authoritative and cannot use an exception or regain authority
+  without schema-v2 replacement plus explicit retirement.
 
-The normalized `ReviewRecord` stores `schema_version=2`, `implementer_model`, `reviewer_model`, the resolved family
-values, registry version, provenance descriptors, and the optional exception ID. The raw JSON
-remains byte-preserved in the durable store; normalization never rewrites evidence. Schema-v1
-records can be read for historical inspection, but a project with an active `review_policy` cannot
-use a schema-v1 record as current-tip approval because it lacks mandatory provenance.
+The normalized schema-v2 `ReviewRecord` stores `implementer_model`, `reviewer_model`, the resolved
+family values, registry version, provenance descriptors, and the optional exception ID. The
+existing normalized schema-v1 record remains unchanged on the policy-empty compatibility path. Raw
+JSON remains byte-preserved in the durable store; normalization never rewrites evidence. A project
+with an active `review_policy` cannot use a schema-v1 record as current-tip approval because it
+lacks mandatory provenance.
 
 This is honest about what the artifact proves: it records the model IDs claimed by the lane and
 binds them to the reviewed tip, but it does not claim cryptographic proof of provider execution.
@@ -259,6 +274,18 @@ that `gpt-5.6-sol` actually reviewed the commit.
 `cmd_import_review()` passes `config.review_policy` to `validate_review()` before writing any
 artifact. The status path passes the same object while parsing every result from
 `store.bound_reviews()`. No second policy implementation is permitted.
+
+The version/policy matrix is normative:
+
+| Artifact | Policy | `import-review` | `status` |
+|---|---|---|---|
+| schema v1 | absent or empty | Existing v1 validator; write only if cross-family | Existing v1 validator; accepted cross-family review remains authority |
+| schema v1 | active | Reject before write | `UNVERIFIED` until schema-v2 replacement and retirement |
+| schema v2 | absent, empty, or active | Schema-v2 validator and provenance checks | Identical schema-v2 policy and provenance checks |
+
+An empty policy means both collections in `ReviewPolicy` are empty; it is semantically identical to
+an absent `review_policy`. A project name, repository name, or schema-v2 support cannot implicitly
+activate policy behavior.
 
 The policy is loaded and validated once with `ProjectConfig`; its normalized immutable value is
 passed through both paths. A policy change invalidates no bytes and silently upgrades no record.
@@ -353,7 +380,8 @@ place, invent a Sol review, or delete evidence.
 
 ### Contract and schema
 
-- policy absent preserves the current default;
+- policy absent or explicitly empty preserves the current schema-v1 default, including existing
+  family-only labels and cross-family authority;
 - valid PublyApp policy parses to normalized immutable values;
 - the complete `models-v1` registry contains every active adapter model exactly once, and no
   unlisted model ID or family-only label validates;
@@ -364,8 +392,10 @@ place, invent a Sol review, or delete evidence.
 - blank, duplicate, unknown, or conflicting policy fields are rejected;
 - a forbidden reviewer family in an exception is rejected;
 - schema/Python agreement covers project policy and the schema-v2 artifact/provenance fields;
-- schema-v1 is accepted only by the explicit historical/migration reader and cannot become
-  current-tip approval under an active policy;
+- schema-v1 uses the normal existing validator and can remain current-tip cross-family authority
+  only when policy is absent or empty;
+- schema-v1 is accepted only by the historical/migration reader when policy is active and cannot
+  become current-tip approval in that mode;
 - missing provenance, wrong registry version, unknown run ref, path escape, symlink, missing file,
   changed bytes, or SHA-256 mismatch is rejected by both import and status;
 - implementer and reviewer provenance are both mandatory; an artifact with only reviewer output
@@ -376,6 +406,8 @@ place, invent a Sol review, or delete evidence.
 ### Review validator
 
 - same family with no policy is rejected;
+- schema-v1 `deepseek` to `claude` remains accepted by the existing family resolver when policy is
+  absent or empty, while schema-v1 `gpt-4o` to `gpt-5` remains rejected as same-family;
 - same family with a policy ID absent from config is rejected;
 - Luna→Sol with the exact configured ID is accepted;
 - a different GPT implementation, reviewer, or policy ID is rejected;
@@ -393,8 +425,13 @@ place, invent a Sol review, or delete evidence.
 
 - import applies the policy before any write;
 - status applies the identical policy to durable artifacts;
+- schema-v1 import and status with absent or empty policy preserve the existing cross-family
+  authority path and all existing v1 regression tests remain green;
+- schema-v1 import with an active policy rejects before writing, and status with an active-tip v1
+  artifact returns `UNVERIFIED` even when that artifact was a valid cross-family approval before
+  policy activation;
 - an accepted same-family artifact cannot be read as approved when the config exception is removed;
-- a legacy cross-family artifact remains readable;
+- a legacy cross-family artifact remains authoritative only on the policy-empty compatibility path;
 - an old Claude artifact plus a new Sol artifact fails until the old artifact is explicitly retired;
 - rollout inventory catches every schema-v1 artifact at the active tip, including old
   cross-family records and records with no Claude;
