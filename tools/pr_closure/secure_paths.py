@@ -453,7 +453,15 @@ def read_contained_file(path, root, label: str) -> Tuple[bytes, str]:
         os.close(root_fd)
 
 
-def append_contained_file(path, root, raw: bytes, label: str, *, create=True) -> None:
+def append_contained_file(
+    path,
+    root,
+    raw: bytes,
+    label: str,
+    *,
+    create=True,
+    expected_identity=None,
+) -> None:
     """Append bytes to one contained regular file without following links.
 
     The target is opened through a descriptor-relative no-follow chain, pinned
@@ -516,7 +524,7 @@ def append_contained_file(path, root, raw: bytes, label: str, *, create=True) ->
 
         flags = os.O_WRONLY | os.O_APPEND | nofollow
         if create:
-            flags |= os.O_CREAT
+            flags |= os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
         if hasattr(os, "O_NONBLOCK"):
@@ -527,6 +535,11 @@ def append_contained_file(path, root, raw: bytes, label: str, *, create=True) ->
         opened = os.fstat(file_fd)
         if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
             raise SecurePathError("{0} must be a single-link regular file".format(label))
+        if expected_identity is not None and (
+            opened.st_dev,
+            opened.st_ino,
+        ) != expected_identity:
+            raise SecurePathError("{0} changed identity before append".format(label))
         try:
             entry = os.lstat(path_absolute)
         except OSError as error:

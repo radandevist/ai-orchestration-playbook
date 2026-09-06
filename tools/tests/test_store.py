@@ -568,6 +568,44 @@ class AuthoritativeEventStreamTests(StoreTestCase):
 
         self.assertIsNone(store.current_policy_adoption("owner/repo"))
 
+    def test_event_stream_pre_open_inode_substitution_cannot_accept_an_append(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip"))
+        original = store.events_path.read_bytes()
+        archived = self.root / "archived-events.jsonl"
+        swapped = False
+
+        import unittest.mock as mock
+
+        from pr_closure import store as store_module
+
+        original_append = store_module.secure_append_contained_file
+
+        def swap_before_open(path, root, raw, label, *, create, expected_identity):
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                store.events_path.replace(archived)
+                store.events_path.write_bytes(original)
+            return original_append(
+                path,
+                root,
+                raw,
+                label,
+                create=create,
+                expected_identity=expected_identity,
+            )
+
+        with mock.patch(
+            "pr_closure.store.secure_append_contained_file",
+            side_effect=swap_before_open,
+        ):
+            with self.assertRaises(MalformedEvidence):
+                store.record_commit(COMMIT_B, self.durable_file("new-tip"))
+
+        self.assertEqual(original, archived.read_bytes())
+        self.assertEqual(original, store.events_path.read_bytes())
+
 
 class AtomicRecordWriteTests(StoreTestCase):
     def test_verification_lives_at_commit_config_attempt_path(self):
