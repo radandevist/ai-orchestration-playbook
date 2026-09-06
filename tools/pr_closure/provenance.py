@@ -1,0 +1,189 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import stat
+from pathlib import Path
+from typing import Mapping
+
+from pr_closure.model import ProvenanceParticipant, ReviewRecord
+
+
+class ProvenanceValidationError(ValueError):
+    """Raised when durable model provenance cannot be independently verified."""
+
+
+_DIGEST_KEYS = frozenset({"producer_output_sha256", "manifest_sha256"})
+_MANIFEST_KEYS = frozenset({
+    "schema_version",
+    "run_ref",
+    "repository",
+    "pr_number",
+    "reviewed_commit",
+    "registry_version",
+    "launcher_registry_version",
+    "model_id",
+    "runner",
+    "invocation_model",
+    "producer_output_sha256",
+})
+_ENVELOPE_KEYS = _MANIFEST_KEYS | frozenset({"manifest_path", "manifest_sha256"})
+
+
+def _is_under(path: str, root: str) -> bool:
+    return path == root or path.startswith(root + os.sep)
+
+
+def _read_bound(path_value: str, root_value: str, label: str) -> tuple[bytes, str]:
+    if not isinstance(path_value, str) or not os.path.isabs(path_value):
+        raise ProvenanceValidationError(label + " path must be absolute")
+    root = os.path.realpath(os.fspath(root_value))
+    path = os.path.realpath(path_value)
+    if not _is_under(path, root):
+        raise ProvenanceValidationError(label + " path escapes the closure root")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path_value, os.O_RDONLY | nofollow)
+    except OSError as error:
+        raise ProvenanceValidationError(
+            "cannot open {0}: {1}".format(label, error)
+        ) from error
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise ProvenanceValidationError(label + " must be a single-link regular file")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        entry = os.lstat(path_value)
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or entry.st_nlink != 1
+            or (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise ProvenanceValidationError(label + " changed identity during read")
+    except OSError as error:
+        raise ProvenanceValidationError("cannot verify {0}".format(label)) from error
+    finally:
+        os.close(fd)
+    return raw, hashlib.sha256(raw).hexdigest()
+
+
+def _json_object(raw: bytes, label: str) -> Mapping:
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProvenanceValidationError(label + " is not valid UTF-8 JSON") from error
+    if not isinstance(value, dict):
+        raise ProvenanceValidationError(label + " must be a JSON object")
+    return value
+
+
+def _exact_keys(value: Mapping, keys: frozenset, label: str) -> None:
+    actual = frozenset(value)
+    if actual != keys:
+        raise ProvenanceValidationError(
+            "{0} keys differ: missing={1}, unknown={2}".format(
+                label,
+                sorted(keys - actual),
+                sorted(actual - keys),
+            )
+        )
+
+
+def _require_digest(value, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
+        raise ProvenanceValidationError(label + " must be lowercase 64-hex")
+    return value
+
+
+def _expected_identity(
+    record: ReviewRecord,
+    participant: ProvenanceParticipant,
+) -> dict:
+    provenance = record.provenance
+    if provenance is None:
+        raise ProvenanceValidationError("schema-v2 review has no provenance")
+    return {
+        "run_ref": participant.run_ref,
+        "repository": record.repository,
+        "pr_number": record.pr_number,
+        "reviewed_commit": record.reviewed_commit,
+        "registry_version": provenance.registry_version,
+        "launcher_registry_version": provenance.launcher_registry_version,
+        "model_id": participant.model_id,
+        "runner": participant.runner,
+        "invocation_model": participant.invocation_model,
+    }
+
+
+def _verify_participant(
+    record: ReviewRecord,
+    participant: ProvenanceParticipant,
+    closure_root: Path,
+    label: str,
+) -> None:
+    envelope_raw, envelope_digest = _read_bound(
+        participant.durable_path,
+        os.fspath(closure_root),
+        label + " envelope",
+    )
+    if envelope_digest != participant.sha256:
+        raise ProvenanceValidationError(label + " envelope digest mismatch")
+    envelope = _json_object(envelope_raw, label + " envelope")
+    _exact_keys(envelope, _ENVELOPE_KEYS, label + " envelope")
+    if envelope.get("schema_version") != 1 or isinstance(
+        envelope.get("schema_version"), bool
+    ):
+        raise ProvenanceValidationError(label + " envelope schema_version must be 1")
+    expected = _expected_identity(record, participant)
+    for key, value in expected.items():
+        if envelope.get(key) != value:
+            raise ProvenanceValidationError(
+                "{0} envelope {1} does not match review".format(label, key)
+            )
+    producer_digest = _require_digest(
+        envelope.get("producer_output_sha256"),
+        label + " producer_output_sha256",
+    )
+    manifest_path = envelope.get("manifest_path")
+    manifest_digest = _require_digest(
+        envelope.get("manifest_sha256"), label + " manifest_sha256"
+    )
+    manifest_raw, actual_manifest_digest = _read_bound(
+        manifest_path,
+        os.fspath(closure_root),
+        label + " manifest",
+    )
+    if manifest_digest != actual_manifest_digest:
+        raise ProvenanceValidationError(label + " manifest digest mismatch")
+    manifest = _json_object(manifest_raw, label + " manifest")
+    _exact_keys(manifest, _MANIFEST_KEYS, label + " manifest")
+    if manifest.get("schema_version") != 1 or isinstance(
+        manifest.get("schema_version"), bool
+    ):
+        raise ProvenanceValidationError(label + " manifest schema_version must be 1")
+    for key, value in expected.items():
+        if manifest.get(key) != value:
+            raise ProvenanceValidationError(
+                "{0} manifest {1} does not match review".format(label, key)
+            )
+    if manifest.get("producer_output_sha256") != producer_digest:
+        raise ProvenanceValidationError(label + " producer output digest mismatch")
+
+
+def verify_review_provenance(record: ReviewRecord, closure_root: Path) -> None:
+    provenance = record.provenance
+    if record.schema_version != 2 or provenance is None:
+        raise ProvenanceValidationError("only schema-v2 reviews carry model provenance")
+    _verify_participant(record, provenance.implementer, closure_root, "implementer")
+    _verify_participant(record, provenance.reviewer, closure_root, "reviewer")

@@ -16,6 +16,8 @@ from unittest import mock
 from pr_closure.cli import ProjectionFailure, _invoke_adapter
 from pr_closure.lease import HeavyJobLease
 from pr_closure.store import REPAIR_STRATEGY_EVENT, RunStore, StoreError
+from tools.tests.test_policy_config import active_policy_config
+from tools.tests.test_review_policy import v2_record
 
 COMMIT_A = "a" * 40
 COMMIT_B = "b" * 40
@@ -557,6 +559,145 @@ class CliExitCodeTests(CliTestCase):
         config = self.write_config()
         proc = self.run_cli("status", "--config", config, "--pr", str(PR))
         self.assertEqual(0, proc.returncode, proc.stderr)
+
+    def test_retire_review_retires_an_exact_active_artifact(self):
+        config = self.prepare_approved()
+        review_path = os.path.join(self.state_dir, PROJECT, str(PR), "reviews", COMMIT_A, "review.json")
+        with open(review_path, "rb") as handle:
+            source_digest = hashlib.sha256(handle.read()).hexdigest()
+        proc = self.run_cli(
+            "retire-review",
+            "--config", config,
+            "--pr", str(PR),
+            "--commit", COMMIT_A,
+            "--review-id", "review",
+            "--retirement-id", "retire-cli-1",
+            "--reason", "policy-migration: schema-v2-provenance-required",
+            "--policy-id", "policy-v1",
+            "--expected-sha256", source_digest,
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertFalse(os.path.exists(review_path))
+        events = self.read_events()
+        self.assertEqual("review_retirement_finalized", events[-1]["event_type"])
+
+    def test_check_policy_activation_rejects_non_staged_policy(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config()
+        proc = self.run_cli(
+            "check-policy-activation", "--config", config, "--pr", str(PR)
+        )
+        self.assertEqual(2, proc.returncode)
+        self.assertIn("staged", proc.stderr)
+
+    def test_check_policy_activation_rejects_an_active_v1_artifact(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        policy = active_policy_config()
+        config = self.write_config(
+            overrides={
+                "model_routes": policy["model_routes"],
+                "review_policy": policy["review_policy"],
+            }
+        )
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        review_path = self.write_review()
+        with open(review_path) as handle:
+            record = json.load(handle)
+        store = RunStore(self.state_dir, PROJECT, PR)
+        store.write_review(COMMIT_A, "legacy", record)
+        proc = self.run_cli(
+            "check-policy-activation", "--config", config, "--pr", str(PR)
+        )
+        self.assertEqual(4, proc.returncode, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual("INELIGIBLE", payload["result"])
+        self.assertIn("schema_v1_review_requires_retirement", payload["reasons"])
+
+    def test_staged_import_and_enforced_status_revalidate_v2_provenance(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        policy = active_policy_config()
+        config = self.write_config(
+            overrides={
+                "model_routes": policy["model_routes"],
+                "review_policy": policy["review_policy"],
+            }
+        )
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+
+        record = v2_record()
+        record.update({
+            "repository": REPOSITORY,
+            "pr_number": PR,
+            "reviewed_branch": BRANCH,
+            "reviewed_commit": COMMIT_A,
+        })
+        for role in ("implementer", "reviewer"):
+            participant = record["provenance"][role]
+            manifest = {
+                "schema_version": 1,
+                "run_ref": participant["run_ref"],
+                "repository": REPOSITORY,
+                "pr_number": PR,
+                "reviewed_commit": COMMIT_A,
+                "registry_version": "models-v1",
+                "launcher_registry_version": "launchers-v1",
+                "model_id": participant["model_id"],
+                "runner": participant["runner"],
+                "invocation_model": participant["invocation_model"],
+                "producer_output_sha256": ("2" if role == "implementer" else "3") * 64,
+            }
+            manifest_path = Path(self.state_dir) / "runs" / (role + "-manifest.json")
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_json(str(manifest_path), manifest)
+            manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            envelope = dict(manifest)
+            envelope.update({
+                "manifest_path": str(manifest_path),
+                "manifest_sha256": manifest_digest,
+            })
+            envelope_path = Path(self.state_dir) / "provenance" / (role + ".json")
+            envelope_path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_json(str(envelope_path), envelope)
+            participant["durable_path"] = str(envelope_path)
+            participant["sha256"] = hashlib.sha256(envelope_path.read_bytes()).hexdigest()
+        review_path = os.path.join(self.root, "v2-review.json")
+        self._write_json(review_path, record)
+        proc = self.run_cli(
+            "import-review", "--config", config, "--pr", str(PR), "--review", review_path
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        activation = self.run_cli(
+            "check-policy-activation", "--config", config, "--pr", str(PR)
+        )
+        self.assertEqual(0, activation.returncode, activation.stderr)
+        activation_payload = json.loads(activation.stdout)
+        self.assertEqual("ELIGIBLE", activation_payload["result"])
+        self.assertEqual(COMMIT_A, activation_payload["commit"])
+        self.assertEqual("policy_activation", self.read_events()[-1]["event_type"])
+        staged = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(0, staged.returncode, staged.stderr)
+        staged_payload = json.loads(staged.stdout)
+        self.assertEqual("UNVERIFIED", staged_payload["state"])
+        self.assertIn("review_policy_staged", staged_payload["reasons"])
+
+        enforced_policy = json.loads(json.dumps(policy))
+        enforced_policy["review_policy"]["mode"] = "enforced"
+        enforced_config = self.write_config(
+            overrides={
+                "model_routes": enforced_policy["model_routes"],
+                "review_policy": enforced_policy["review_policy"],
+            }
+        )
+        enforced = self.run_cli(
+            "status", "--config", enforced_config, "--pr", str(PR), "--json"
+        )
+        self.assertEqual(0, enforced.returncode, enforced.stderr)
+        self.assertEqual("APPROVED", json.loads(enforced.stdout)["state"])
 
 
 class StatusCommandTests(CliTestCase):

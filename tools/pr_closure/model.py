@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import Optional, Tuple
@@ -25,6 +25,11 @@ class Verdict(StrEnum):
     APPROVED_WITH_FOLLOW_UPS = "APPROVED_WITH_FOLLOW_UPS"
     APPROVED = "APPROVED"
     INCONCLUSIVE = "INCONCLUSIVE"
+
+
+class ReviewPolicyMode(StrEnum):
+    STAGED = "staged"
+    ENFORCED = "enforced"
 
 
 class MergeableState(StrEnum):
@@ -121,12 +126,79 @@ class ReviewRecord:
     intentionally_not_findings: Tuple[str, ...] = ()
     base_commit: Optional[str] = None
     comparison_range: Optional[str] = None
+    implementer_model: Optional[str] = None
+    reviewer_model: Optional[str] = None
+    review_exception_id: Optional[str] = None
+    provenance: Optional[ReviewProvenance] = None
 
     def __post_init__(self):
         object.__setattr__(self, "findings", _as_tuple(self.findings))
         object.__setattr__(self, "intentionally_not_findings", _as_tuple(self.intentionally_not_findings))
         object.__setattr__(self, "local_evidence", _as_tuple(self.local_evidence))
         object.__setattr__(self, "ci_evidence", _as_tuple(self.ci_evidence))
+
+
+@dataclass(frozen=True)
+class SameFamilyReviewException:
+    id: str
+    registry_version: str
+    implementer_family: str
+    reviewer_model: str
+    required_for_authorized_family: bool
+    owner_authorization: str
+    rationale: str
+
+
+@dataclass(frozen=True)
+class ModelRoute:
+    id: str
+    registry_version: str
+    launcher_registry_version: str
+    implementer_model: str
+    implementer_runner: str
+    implementer_invocation_model: str
+    reviewer_model: str
+    reviewer_runner: str
+    reviewer_invocation_model: str
+    same_family_policy_id: Optional[str]
+
+
+@dataclass(frozen=True)
+class ReviewPolicy:
+    mode: Optional[ReviewPolicyMode] = None
+    owner_authorization: Optional[str] = None
+    forbidden_reviewer_families: Tuple[str, ...] = ()
+    same_family_exceptions: Tuple[SameFamilyReviewException, ...] = ()
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "forbidden_reviewer_families",
+            _as_tuple(self.forbidden_reviewer_families),
+        )
+        object.__setattr__(
+            self,
+            "same_family_exceptions",
+            _as_tuple(self.same_family_exceptions),
+        )
+
+
+@dataclass(frozen=True)
+class ProvenanceParticipant:
+    model_id: str
+    runner: str
+    invocation_model: str
+    run_ref: str
+    durable_path: str
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ReviewProvenance:
+    registry_version: str
+    launcher_registry_version: str
+    implementer: ProvenanceParticipant
+    reviewer: ProvenanceParticipant
 
 
 @dataclass(frozen=True)
@@ -151,6 +223,8 @@ class ProjectConfig:
     verification_command_timeout_seconds: int
     tracking_projection: Optional[str]
     ci_required_checks: Tuple[str, ...] = ()
+    model_routes: Tuple[ModelRoute, ...] = ()
+    review_policy: ReviewPolicy = field(default_factory=ReviewPolicy)
 
     def __post_init__(self):
         object.__setattr__(
@@ -160,6 +234,7 @@ class ProjectConfig:
             self, "closure_acceptance_commands", _as_tuple(self.closure_acceptance_commands)
         )
         object.__setattr__(self, "ci_required_checks", _as_tuple(self.ci_required_checks))
+        object.__setattr__(self, "model_routes", _as_tuple(self.model_routes))
 
 
 @dataclass(frozen=True)
@@ -197,6 +272,7 @@ class ClosureSnapshot:
     distinct_repair_strategies: int = 0
     executor_deaths: int = 0
     owner_decision_required: bool = False
+    review_policy_reason: Optional[str] = None
     mergeable: Optional[MergeableState] = None
     merge_state_status: Optional[str] = None
     infra_retry_budget: int = 0

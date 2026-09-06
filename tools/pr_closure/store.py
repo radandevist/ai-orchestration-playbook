@@ -52,6 +52,26 @@ REVIEW_DISPATCH_EVENT = "REVIEW_DISPATCH"
 LIFECYCLE_EVENT_TYPES = frozenset(
     (REPAIR_STRATEGY_EVENT, REVIEW_DISPATCH_EVENT)
 )
+RETIREMENT_PREPARED_EVENT = "review_retirement_prepared"
+RETIREMENT_COPIED_EVENT = "review_retirement_copied"
+RETIREMENT_COMMITTED_EVENT = "review_retirement_committed"
+RETIREMENT_FINALIZED_EVENT = "review_retirement_finalized"
+POLICY_ACTIVATION_EVENT = "policy_activation"
+
+RETIREMENT_EVENT_TYPES = (
+    RETIREMENT_PREPARED_EVENT,
+    RETIREMENT_COPIED_EVENT,
+    RETIREMENT_COMMITTED_EVENT,
+    RETIREMENT_FINALIZED_EVENT,
+)
+RETIREMENT_STATES = ("ACTIVE", "PREPARED", "COPIED", "COMMITTED", "FINALIZED")
+RETIREMENT_REASONS = frozenset(
+    (
+        "policy-migration: claude-reviewer-forbidden",
+        "policy-migration: schema-v2-provenance-required",
+        "policy-rollback: same-family-review-replaced",
+    )
+)
 
 EVENT_SCHEMA_VERSION = 1
 
@@ -83,6 +103,8 @@ KNOWN_EVENT_TYPES = frozenset(
         REPAIR_STRATEGY_EVENT,
         REVIEW_DISPATCH_EVENT,
         "INFRA_FAILURE",
+        *RETIREMENT_EVENT_TYPES,
+        POLICY_ACTIVATION_EVENT,
     )
 )
 
@@ -93,6 +115,38 @@ _FORBIDDEN_ROOT_SPECS = ("/tmp", os.path.expanduser("~/.claude/jobs"))
 _COMMIT_ID_RE = re.compile(COMMIT_ID_PATTERN)
 _DIGEST_RE = re.compile("^[0-9a-f]{64}$")
 _UNSAFE_COMPONENT_RE = re.compile(r"[/\\\x00]")
+_RETIREMENT_ENVELOPE_KEYS = frozenset(
+    (
+        "schema_version",
+        "operation",
+        "retirement_id",
+        "repository",
+        "project",
+        "pr_number",
+        "commit",
+        "review_id",
+        "source_path",
+        "expected_sha256",
+        "reason",
+        "policy_id",
+        "requested_at",
+    )
+)
+_RETIREMENT_EVENT_KEYS = frozenset(
+    (
+        "event_id",
+        "operation",
+        "retirement_id",
+        "repository",
+        "review_id",
+        "source_path",
+        "staging_path",
+        "final_path",
+        "expected_sha256",
+        "reason",
+        "policy_id",
+    )
+)
 
 
 def _resolve(path: str) -> str:
@@ -542,6 +596,31 @@ class RunStore:
                 )
             )
 
+    def record_policy_activation(self, commit, staged_config_digest, projected_config_digest) -> dict:
+        commit = _require_commit(commit)
+        staged_config_digest = _require_digest(staged_config_digest)
+        projected_config_digest = _require_digest(projected_config_digest)
+        event_id = hashlib.sha256(
+            (commit + staged_config_digest + projected_config_digest).encode("ascii")
+        ).hexdigest()
+        payload = {
+            "event_id": event_id,
+            "result": "ELIGIBLE",
+            "staged_config_digest": staged_config_digest,
+            "projected_enforced_config_digest": projected_config_digest,
+        }
+        for event in self.read_events():
+            if event["event_type"] != POLICY_ACTIVATION_EVENT or event["commit"] != commit:
+                continue
+            if all(event.get(key) == value for key, value in payload.items()):
+                return event
+            raise EvidenceConflict("policy activation event conflicts with an existing result")
+        return self.append_event(
+            POLICY_ACTIVATION_EVENT,
+            commit,
+            os.fspath(self.events_path),
+            payload=payload,
+        )
     def _require_event_envelope(self, event: dict, number: int, path: Path) -> None:
         def fail(detail: str) -> None:
             raise MalformedEvidence(f"event at line {number}: {path}: {detail}")
@@ -732,9 +811,409 @@ class RunStore:
     def read_reviews(self, commit) -> Tuple[dict, ...]:
         return tuple(self.read_review(commit, path.stem) for path in self.review_paths(commit))
 
+    # -- durable review retirement ----------------------------------------
+
+    def retirement_dir(self, commit, retirement_id) -> Path:
+        return (
+            self._base
+            / "retirements"
+            / _require_commit(commit)
+            / _require_component(retirement_id, "retirement_id")
+        )
+
+    def retirement_envelope_path(self, commit, retirement_id) -> Path:
+        return self.retirement_dir(commit, retirement_id) / "envelope.json"
+
+    def retirement_staging_path(self, commit, retirement_id) -> Path:
+        return (
+            self._base
+            / "reviews-retirement-staging"
+            / _require_commit(commit)
+            / ("{0}.json".format(_require_component(retirement_id, "retirement_id")))
+        )
+
+    def retirement_final_path(self, commit, retirement_id) -> Path:
+        return (
+            self._base
+            / "reviews-retired"
+            / _require_commit(commit)
+            / ("{0}.json".format(_require_component(retirement_id, "retirement_id")))
+        )
+
+    def _retirement_event_payload(self, envelope, event_type) -> dict:
+        suffix = {
+            RETIREMENT_PREPARED_EVENT: "prepared",
+            RETIREMENT_COPIED_EVENT: "copied",
+            RETIREMENT_COMMITTED_EVENT: "committed",
+            RETIREMENT_FINALIZED_EVENT: "finalized",
+        }[event_type]
+        return {
+            "event_id": "{0}:{1}".format(envelope["retirement_id"], suffix),
+            "operation": envelope["operation"],
+            "retirement_id": envelope["retirement_id"],
+            "repository": envelope["repository"],
+            "review_id": envelope["review_id"],
+            "source_path": envelope["source_path"],
+            "staging_path": _resolve(
+                os.fspath(self.retirement_staging_path(envelope["commit"], envelope["retirement_id"]))
+            ),
+            "final_path": _resolve(
+                os.fspath(self.retirement_final_path(envelope["commit"], envelope["retirement_id"]))
+            ),
+            "expected_sha256": envelope["expected_sha256"],
+            "reason": envelope["reason"],
+            "policy_id": envelope["policy_id"],
+        }
+
+    def _require_retirement_envelope(self, envelope, commit, retirement_id) -> dict:
+        if not isinstance(envelope, dict):
+            raise MalformedEvidence("retirement envelope must be a JSON object")
+        if frozenset(envelope) != _RETIREMENT_ENVELOPE_KEYS:
+            raise MalformedEvidence("retirement envelope keys are not exact")
+        if envelope["schema_version"] != 1 or isinstance(envelope["schema_version"], bool):
+            raise MalformedEvidence("retirement envelope schema_version must be 1")
+        if envelope["operation"] != "REVIEW_RETIREMENT":
+            raise MalformedEvidence("retirement envelope operation is invalid")
+        if envelope["project"] != self._project or envelope["pr_number"] != self._pr:
+            raise MalformedEvidence("retirement envelope does not bind to this store")
+        if envelope["commit"] != _require_commit(commit):
+            raise MalformedEvidence("retirement envelope commit does not bind to its path")
+        if envelope["retirement_id"] != _require_component(retirement_id, "retirement_id"):
+            raise MalformedEvidence("retirement envelope id does not bind to its path")
+        _require_component(envelope["retirement_id"], "retirement_id")
+        _require_review_id(envelope["review_id"])
+        if not isinstance(envelope["repository"], str) or not envelope["repository"].strip():
+            raise MalformedEvidence("retirement envelope repository must be non-blank")
+        source = _resolve(os.fspath(self.review_path(commit, envelope["review_id"])))
+        if envelope["source_path"] != source:
+            raise MalformedEvidence("retirement envelope source path is not canonical")
+        _require_digest(envelope["expected_sha256"])
+        if envelope["reason"] not in RETIREMENT_REASONS:
+            raise MalformedEvidence("retirement reason is not an approved policy reason")
+        _require_component(envelope["policy_id"], "policy_id")
+        requested_at = envelope["requested_at"]
+        if not isinstance(requested_at, str):
+            raise MalformedEvidence("retirement requested_at must be a UTC timestamp")
+        try:
+            parsed = datetime.fromisoformat(requested_at)
+        except ValueError as error:
+            raise MalformedEvidence("retirement requested_at is not ISO-8601") from error
+        if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+            raise MalformedEvidence("retirement requested_at must be timezone-aware UTC")
+        return envelope
+
+    def _read_retirement_envelope(self, commit, retirement_id) -> Optional[dict]:
+        path = self.retirement_envelope_path(commit, retirement_id)
+        try:
+            raw, _digest = self._read_bound_bytes(path, "retirement envelope")
+        except FileNotFoundError:
+            return None
+        except MalformedEvidence as error:
+            if not path.exists() and not path.is_symlink():
+                return None
+            raise
+        except OSError as error:
+            raise MalformedEvidence("cannot read retirement envelope: {0}".format(path)) from error
+        return self._require_retirement_envelope(
+            _parse_json_bytes(raw, path, "retirement envelope"), commit, retirement_id
+        )
+
+    def _retirement_events(self, commit, retirement_id, events=None):
+        commit = _require_commit(commit)
+        retirement_id = _require_component(retirement_id, "retirement_id")
+        if events is None:
+            events = self.read_events()
+        selected = [
+            event
+            for event in events
+            if event["commit"] == commit
+            and event.get("event_type") in RETIREMENT_EVENT_TYPES
+            and event.get("retirement_id") == retirement_id
+        ]
+        ids = [event.get("event_id") for event in selected]
+        if any(not isinstance(value, str) or not value.strip() for value in ids):
+            raise MalformedEvidence("retirement events require non-blank event_id values")
+        if len(set(ids)) != len(ids):
+            raise MalformedEvidence("retirement event IDs must be unique")
+        return selected
+
+    def _validate_retirement_event(self, event, envelope, event_type):
+        if event["event_type"] != event_type:
+            raise MalformedEvidence("retirement event is out of order")
+        missing = sorted(_RETIREMENT_EVENT_KEYS - set(event))
+        if missing:
+            raise MalformedEvidence("retirement event is missing: {0}".format(", ".join(missing)))
+        expected = self._retirement_event_payload(envelope, event_type)
+        if any(event.get(key) != value for key, value in expected.items()):
+            raise MalformedEvidence("retirement event does not match its immutable envelope")
+
+    def _retirement_state(self, commit, retirement_id, events=None):
+        envelope = self._read_retirement_envelope(commit, retirement_id)
+        if envelope is None:
+            return None, None
+        selected = self._retirement_events(commit, retirement_id, events)
+        if not selected or selected[0]["event_type"] != RETIREMENT_PREPARED_EVENT:
+            raise MalformedEvidence("retirement envelope is not bound by PREPARED")
+        expected_types = [event["event_type"] for event in selected]
+        if expected_types != list(dict.fromkeys(expected_types)):
+            raise MalformedEvidence("retirement events contain duplicate transitions")
+        allowed_prefixes = [
+            [RETIREMENT_PREPARED_EVENT],
+            [RETIREMENT_PREPARED_EVENT, RETIREMENT_COPIED_EVENT],
+            [RETIREMENT_PREPARED_EVENT, RETIREMENT_COPIED_EVENT, RETIREMENT_COMMITTED_EVENT],
+            list(RETIREMENT_EVENT_TYPES),
+        ]
+        if expected_types not in allowed_prefixes:
+            raise MalformedEvidence("retirement events are not a valid state-machine prefix")
+        for event_type, event in zip(expected_types, selected):
+            self._validate_retirement_event(event, envelope, event_type)
+
+        source = Path(envelope["source_path"])
+        staging = self.retirement_staging_path(commit, retirement_id)
+        final = self.retirement_final_path(commit, retirement_id)
+        source_exists = source.exists()
+        staging_exists = staging.exists()
+        final_exists = final.exists()
+        if source_exists:
+            _source_raw, source_digest = self._read_bound_bytes(source, "active review record")
+            if source_digest != envelope["expected_sha256"]:
+                raise MalformedEvidence("active review digest changed during retirement")
+        if RETIREMENT_COPIED_EVENT in expected_types:
+            if not staging_exists:
+                raise MalformedEvidence("COPIED retirement is missing its staging proof")
+            _staging_raw, staging_digest = self._read_bound_bytes(staging, "retirement staging proof")
+            if staging_digest != envelope["expected_sha256"]:
+                raise MalformedEvidence("retirement staging digest does not match")
+        elif staging_exists:
+            raise MalformedEvidence("orphan retirement staging proof")
+        if RETIREMENT_COMMITTED_EVENT not in expected_types and final_exists:
+            raise MalformedEvidence("retirement final artifact exists before COMMITTED")
+        if final_exists:
+            _final_raw, final_digest = self._read_bound_bytes(final, "retired review record")
+            if final_digest != envelope["expected_sha256"]:
+                raise MalformedEvidence("retired review digest does not match")
+        if RETIREMENT_FINALIZED_EVENT in expected_types:
+            if source_exists or not staging_exists or not final_exists:
+                raise MalformedEvidence("FINALIZED retirement does not have the required paths")
+            state = "FINALIZED"
+        elif RETIREMENT_COMMITTED_EVENT in expected_types:
+            state = "COMMITTED"
+        elif RETIREMENT_COPIED_EVENT in expected_types:
+            state = "COPIED"
+        else:
+            state = "PREPARED"
+        return state, envelope
+
+    def retirement_status(self, commit, retirement_id) -> dict:
+        state, envelope = self._retirement_state(commit, retirement_id)
+        if envelope is None:
+            return {"state": "ACTIVE", "retirement_id": _require_component(retirement_id, "retirement_id")}
+        return {"state": state, **envelope}
+
+    def _append_retirement_transition(self, event_type, envelope, commit, events):
+        event_id = self._retirement_event_payload(envelope, event_type)["event_id"]
+        if any(event.get("event_id") == event_id for event in events):
+            return
+        self.append_event(
+            event_type,
+            commit,
+            os.fspath(self.retirement_envelope_path(commit, envelope["retirement_id"])),
+            payload=self._retirement_event_payload(envelope, event_type),
+        )
+
+    def _move_no_replace(self, source: Path, target: Path, expected_digest: str) -> None:
+        if target.exists() or target.is_symlink():
+            _target_raw, target_digest = self._read_bound_bytes(target, "retired review record")
+            if target_digest != expected_digest:
+                raise EvidenceConflict("retirement final path already contains different bytes")
+            if source.exists():
+                _source_raw, source_digest = self._read_bound_bytes(source, "active review record")
+                if source_digest != expected_digest:
+                    raise MalformedEvidence("active review changed before retirement move")
+                os.unlink(os.fspath(source))
+            return
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.link(os.fspath(source), os.fspath(target))
+        except FileExistsError:
+            self._move_no_replace(source, target, expected_digest)
+            return
+        except OSError as error:
+            raise MalformedEvidence("platform cannot provide no-replace retirement move") from error
+        try:
+            os.unlink(os.fspath(source))
+        except OSError as error:
+            raise MalformedEvidence("retirement move could not remove the active source") from error
+        for directory in (source.parent, target.parent):
+            try:
+                fd = os.open(os.fspath(directory), os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError as error:
+                raise MalformedEvidence("retirement directory could not be fsynced") from error
+
+    def retire_review(
+        self,
+        repository,
+        commit,
+        review_id,
+        retirement_id,
+        reason,
+        policy_id,
+        expected_sha256,
+    ) -> dict:
+        commit = _require_commit(commit)
+        review_id = _require_review_id(review_id)
+        retirement_id = _require_component(retirement_id, "retirement_id")
+        if not isinstance(repository, str) or not repository.strip():
+            raise MalformedEvidence("repository must be non-blank")
+        if reason not in RETIREMENT_REASONS:
+            raise MalformedEvidence("retirement reason is not an approved policy reason")
+        _require_component(policy_id, "policy_id")
+        expected_sha256 = _require_digest(expected_sha256)
+        source = self.review_path(commit, review_id)
+        envelope_path = self.retirement_envelope_path(commit, retirement_id)
+        envelope = self._read_retirement_envelope(commit, retirement_id)
+        if envelope is not None:
+            if any(
+                envelope.get(key) != value
+                for key, value in (
+                    ("repository", repository),
+                    ("review_id", review_id),
+                    ("source_path", _resolve(os.fspath(source))),
+                    ("expected_sha256", expected_sha256),
+                    ("reason", reason),
+                    ("policy_id", policy_id),
+                )
+            ):
+                raise EvidenceConflict("retirement id already has different immutable arguments")
+            state, _ = self._retirement_state(commit, retirement_id)
+            if state == "FINALIZED":
+                return self.retirement_status(commit, retirement_id)
+            return self.recover_retirement(retirement_id, commit)
+        if not source.exists():
+            raise MalformedEvidence("retirement source review does not exist")
+        raw, actual_digest = self._read_bound_bytes(source, "active review record")
+        if actual_digest != expected_sha256:
+            raise EvidenceConflict("retirement source digest does not match expected_sha256")
+        self.validate_event_relations(commit)
+        events = self.read_events()
+        requested = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        candidate = {
+            "schema_version": 1,
+            "operation": "REVIEW_RETIREMENT",
+            "retirement_id": retirement_id,
+            "repository": repository,
+            "project": self._project,
+            "pr_number": self._pr,
+            "commit": commit,
+            "review_id": review_id,
+            "source_path": _resolve(os.fspath(source)),
+            "expected_sha256": expected_sha256,
+            "reason": reason,
+            "policy_id": policy_id,
+            "requested_at": requested,
+        }
+        if envelope is None:
+            self._atomic_create(envelope_path, _serialize(candidate))
+            envelope = self._read_retirement_envelope(commit, retirement_id)
+        self._append_retirement_transition(RETIREMENT_PREPARED_EVENT, envelope, commit, events)
+        events = self.read_events()
+        staging = self.retirement_staging_path(commit, retirement_id)
+        if not staging.exists():
+            self._atomic_create(staging, raw)
+        self._append_retirement_transition(RETIREMENT_COPIED_EVENT, envelope, commit, events)
+        events = self.read_events()
+        if not self.retirement_final_path(commit, retirement_id).exists():
+            self._append_retirement_transition(RETIREMENT_COMMITTED_EVENT, envelope, commit, events)
+            events = self.read_events()
+        self._move_no_replace(source, self.retirement_final_path(commit, retirement_id), expected_sha256)
+        self._append_retirement_transition(RETIREMENT_FINALIZED_EVENT, envelope, commit, self.read_events())
+        return self.retirement_status(commit, retirement_id)
+
+    def recover_retirement(self, retirement_id, commit) -> dict:
+        envelope = self._read_retirement_envelope(commit, retirement_id)
+        if envelope is None:
+            raise MalformedEvidence("retirement envelope does not exist")
+        events = self.read_events()
+        original_review_events = [
+            event
+            for event in events
+            if event["commit"] == commit
+            and event["event_type"] == REVIEW_EVENT
+            and _resolve(event["evidence_path"]) == envelope["source_path"]
+            and event.get("content_digest") == envelope["expected_sha256"]
+        ]
+        if len(original_review_events) != 1:
+            raise MalformedEvidence("retirement must bind exactly one original REVIEW_EVENT")
+        source = Path(envelope["source_path"])
+        if source.exists():
+            raw, digest = self._read_bound_bytes(source, "active review record")
+            if digest != envelope["expected_sha256"]:
+                raise MalformedEvidence("retirement source digest does not match its envelope")
+        else:
+            raw = None
+        state, _ = self._retirement_state(commit, retirement_id, events)
+        if state == "FINALIZED":
+            return self.retirement_status(commit, retirement_id)
+        if state == "PREPARED" and raw is not None:
+            staging = self.retirement_staging_path(commit, retirement_id)
+            if not staging.exists():
+                self._atomic_create(staging, raw)
+            self._append_retirement_transition(RETIREMENT_COPIED_EVENT, envelope, commit, self.read_events())
+        events = self.read_events()
+        if not any(event["event_type"] == RETIREMENT_COMMITTED_EVENT for event in events if event.get("retirement_id") == retirement_id):
+            self._append_retirement_transition(RETIREMENT_COMMITTED_EVENT, envelope, commit, events)
+        self._move_no_replace(source, self.retirement_final_path(commit, retirement_id), envelope["expected_sha256"])
+        self._append_retirement_transition(RETIREMENT_FINALIZED_EVENT, envelope, commit, self.read_events())
+        return self.retirement_status(commit, retirement_id)
+
     # -- event/artifact relation (T6L-F5) ---------------------------------
 
     VERIFICATION_RECORD_PHASES = frozenset({"local_review_ready", "closure_acceptance"})
+
+    def _validate_all_retirements(self, commit, events):
+        retirement_event_ids = []
+        for event in events:
+            if event["commit"] == commit and event["event_type"] in RETIREMENT_EVENT_TYPES:
+                event_id = event.get("event_id")
+                if not isinstance(event_id, str) or not event_id.strip():
+                    raise MalformedEvidence("retirement events require non-blank event_id values")
+                retirement_event_ids.append(event_id)
+        if len(set(retirement_event_ids)) != len(retirement_event_ids):
+            raise MalformedEvidence("retirement event IDs must be unique")
+        retirement_ids = {
+            event.get("retirement_id")
+            for event in events
+            if event["commit"] == commit and event["event_type"] in RETIREMENT_EVENT_TYPES
+        }
+        retirement_root = self._base / "retirements" / commit
+        if retirement_root.exists():
+            if retirement_root.is_symlink() or not retirement_root.is_dir():
+                raise MalformedEvidence("retirement root must be a real directory")
+            for directory in retirement_root.iterdir():
+                if directory.is_symlink() or not directory.is_dir():
+                    raise MalformedEvidence("retirement entry must be a real directory")
+                retirement_ids.add(directory.name)
+        for retirement_id in sorted(retirement_ids):
+            state, envelope = self._retirement_state(commit, retirement_id, events)
+            if envelope is None or state is None:
+                raise MalformedEvidence("retirement event has no durable envelope")
+            source = Path(envelope["source_path"])
+            review_events = [
+                event
+                for event in events
+                if event["commit"] == commit
+                and event["event_type"] == REVIEW_EVENT
+                and _resolve(event["evidence_path"]) == envelope["source_path"]
+                and event.get("content_digest") == envelope["expected_sha256"]
+            ]
+            if len(review_events) != 1:
+                raise MalformedEvidence("retirement must bind exactly one original REVIEW_EVENT")
+            if state == "FINALIZED" and source.exists():
+                raise MalformedEvidence("FINALIZED retirement still has its active source")
 
     def validate_event_relations(self, commit) -> None:
         """Validate the complete event/artifact relation for one commit.
@@ -752,6 +1231,7 @@ class RunStore:
         commit = _require_commit(commit)
         events = self.read_events()
         commit_events = [event for event in events if event["commit"] == commit]
+        self._validate_all_retirements(commit, events)
 
         verification_by_path = {}
         review_by_path = {}
@@ -778,8 +1258,33 @@ class RunStore:
                     raise MalformedEvidence(
                         "review artifact event must bind a content_digest"
                     )
-                self._require_artifact_target(event, commit, "reviews")
+                target = Path(event["evidence_path"])
+                if target.exists():
+                    self._require_artifact_target(event, commit, "reviews")
+                else:
+                    finalized = any(
+                        retirement["state"] == "FINALIZED"
+                        and retirement["source_path"] == _resolve(event["evidence_path"])
+                        and retirement["expected_sha256"] == event["content_digest"]
+                        for retirement in self._retirement_records(commit, events)
+                    )
+                    if not finalized:
+                        raise MalformedEvidence(
+                            "review artifact event target is missing without finalized retirement"
+                        )
                 review_by_path.setdefault(event["evidence_path"], []).append(event)
+            elif event["event_type"] == POLICY_ACTIVATION_EVENT:
+                if event.get("result") != "ELIGIBLE":
+                    raise MalformedEvidence("policy activation event must be ELIGIBLE")
+                staged_digest = event.get("staged_config_digest")
+                projected_digest = event.get("projected_enforced_config_digest")
+                _require_digest(staged_digest)
+                _require_digest(projected_digest)
+                expected_id = hashlib.sha256(
+                    (commit + staged_digest + projected_digest).encode("ascii")
+                ).hexdigest()
+                if event.get("event_id") != expected_id:
+                    raise MalformedEvidence("policy activation event id is not bound to its digests")
 
         for path in self.verification_paths(commit):
             self._read_bound_bytes(path, "verification record")
@@ -791,6 +1296,7 @@ class RunStore:
                     )
                 )
             self._require_single_compatible_binding(bindings, path)
+
         for path in self.review_paths(commit):
             self._read_bound_bytes(path, "review record")
             bindings = review_by_path.get(_resolve(os.fspath(path)), ())
@@ -800,6 +1306,20 @@ class RunStore:
                 )
             self._require_single_compatible_binding(bindings, path)
 
+    def _retirement_records(self, commit, events=None):
+        if events is None:
+            events = self.read_events()
+        records = []
+        retirement_ids = {
+            event.get("retirement_id")
+            for event in events
+            if event["commit"] == commit and event["event_type"] in RETIREMENT_EVENT_TYPES
+        }
+        for retirement_id in sorted(retirement_ids):
+            state, envelope = self._retirement_state(commit, retirement_id, events)
+            if envelope is not None:
+                records.append({"state": state, **envelope})
+        return tuple(records)
     def _require_single_compatible_binding(self, bindings, path) -> None:
         identities = {
             (
@@ -1062,6 +1582,9 @@ class RunStore:
         """
         commit = _require_commit(commit)
         self.validate_event_relations(commit)
+        retirements = self._retirement_records(commit)
+        if any(item["state"] != "FINALIZED" for item in retirements):
+            raise MalformedEvidence("review retirement is incomplete; active authority is revoked")
         bound = []
         for path in self.review_paths(commit):
             raw, _digest = self._read_bound_bytes(path, "review record")
