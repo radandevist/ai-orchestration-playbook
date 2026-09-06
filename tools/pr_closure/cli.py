@@ -16,6 +16,7 @@ Trello/projection state as authority.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import selectors
@@ -33,6 +34,7 @@ from pr_closure.contract import (
     ReviewValidationError,
     command_digest,
     command_sequence_digest,
+    configuration_digest,
     validate_project_config,
 )
 from pr_closure.lease import (
@@ -46,7 +48,9 @@ from pr_closure.model import (
     ClosureState,
     Disposition,
     Evidence,
+    ReviewPolicyMode,
 )
+from pr_closure.provenance import ProvenanceValidationError, verify_review_provenance
 from pr_closure.review import require_live_binding, validate_review
 from pr_closure.sources import (
     INFRA_FAILURE_EVENT,
@@ -394,10 +398,25 @@ def _status_snapshot(config, pr_number):
     follow_up_findings = set()
     follow_up_issue_numbers = set()
     verdicts = set()
+    review_policy_reason = None
+    if (
+        config.review_policy.mode is not None
+        and config.review_policy.mode.value == "staged"
+    ):
+        review_policy_reason = "review_policy_staged"
     for _stem, data in store.bound_reviews(facts.local_commit):
+        if config.review_policy.mode is not None and data.get("schema_version") == 1:
+            review_policy_reason = "schema_v1_review_requires_retirement"
+            continue
         try:
-            record = validate_review(data)
-        except ReviewValidationError as error:
+            record = validate_review(
+                data,
+                review_policy=config.review_policy,
+                model_routes=config.model_routes,
+            )
+            if record.schema_version == 2:
+                verify_review_provenance(record, Path(config.closure_state_dir))
+        except (ReviewValidationError, ProvenanceValidationError) as error:
             raise SourceMalformed(
                 "durable review record is invalid: {0}".format(error)
             )
@@ -517,6 +536,7 @@ def _status_snapshot(config, pr_number):
         follow_ups_complete=follow_ups_complete,
         repeated_root_cause=repeated_root_cause,
         distinct_repair_strategies=distinct_repair_strategies,
+        review_policy_reason=review_policy_reason,
         infra_retry_budget=config.infra_retry_budget,
         infra_retries_used=len(infra_events),
         stagnation_budget_minutes=config.stagnation_budget_minutes,
@@ -605,7 +625,16 @@ def cmd_import_review(config, args) -> int:
         )
     if not isinstance(data, dict):
         raise CliInputError("review artifact must be a JSON object")
-    record = validate_review(data)
+    record = validate_review(
+        data,
+        review_policy=config.review_policy,
+        model_routes=config.model_routes,
+    )
+    if record.schema_version == 2:
+        try:
+            verify_review_provenance(record, Path(config.closure_state_dir))
+        except ProvenanceValidationError as error:
+            raise CliInputError("review provenance is invalid: {0}".format(error)) from error
     require_live_binding(
         record, config.repository, args.pr, pr.head_branch, pr.head_oid
     )
@@ -618,6 +647,140 @@ def cmd_import_review(config, args) -> int:
     review_id = Path(args.review).stem
     store.write_review(record.reviewed_commit, review_id, data)
     return EXIT_OK
+
+
+def cmd_retire_review(config, args) -> int:
+    store = RunStore(config.closure_state_dir, config.project, args.pr)
+    github = GitHubSource(config.repository, args.pr)
+    pr = _require_live_pr(github, config)
+    if pr.head_oid != args.commit:
+        raise CliInputError("retirement commit must match the live pull request tip")
+    durable_tip = store.current_commit()
+    if durable_tip != args.commit:
+        raise CliInputError("retirement commit must match the durably recorded tip")
+    result = store.retire_review(
+        repository=config.repository,
+        commit=args.commit,
+        review_id=args.review_id,
+        retirement_id=args.retirement_id,
+        reason=args.reason,
+        policy_id=args.policy_id,
+        expected_sha256=args.expected_sha256,
+    )
+    sys.stdout.write(json.dumps(result, sort_keys=True) + "\n")
+    return EXIT_OK
+
+
+def _activation_config_data(config_data, mode):
+    projected = copy.deepcopy(config_data)
+    policy = projected.get("review_policy")
+    if not isinstance(policy, dict):
+        raise CliInputError("staged policy must contain a review_policy object")
+    policy["mode"] = mode
+    return projected
+
+
+def _activation_refusal(reasons, staged_digest=None, projected_digest=None, commit=None):
+    return {
+        "schema_version": 1,
+        "result": "INELIGIBLE",
+        "reasons": list(dict.fromkeys(reasons)),
+        "commit": commit,
+        "staged_config_digest": staged_digest,
+        "projected_enforced_config_digest": projected_digest,
+    }
+
+
+def cmd_check_policy_activation(config, args) -> int:
+    current_data = _read_config(args.config)
+    if config.review_policy.mode is not ReviewPolicyMode.STAGED:
+        raise CliInputError("check-policy-activation requires an explicitly staged policy")
+    if args.projected_config is None:
+        projected_data = _activation_config_data(current_data, ReviewPolicyMode.ENFORCED.value)
+        projected_config = validate_project_config(projected_data)
+    else:
+        projected_data = _read_config(args.projected_config)
+        projected_config = validate_project_config(projected_data)
+        expected_projected = _activation_config_data(
+            current_data, ReviewPolicyMode.ENFORCED.value
+        )
+        if projected_data != expected_projected:
+            raise CliInputError(
+                "projected enforced config must differ from staged config only by mode"
+            )
+    if projected_config.review_policy.mode is not ReviewPolicyMode.ENFORCED:
+        raise CliInputError("projected policy must be enforced")
+    staged_digest = configuration_digest(current_data)
+    projected_digest = configuration_digest(projected_data)
+    try:
+        snapshot, _decision = _status_snapshot(config, args.pr)
+    except (SourceMalformed, SourceUnavailable, MalformedEvidence) as error:
+        payload = _activation_refusal(
+            ["activation_evidence_invalid: {0}".format(error)],
+            staged_digest,
+            projected_digest,
+        )
+        sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
+        return EXIT_TRANSITION_DENIED
+    store = RunStore(config.closure_state_dir, config.project, args.pr)
+    reasons = []
+    if snapshot.ci_state.value != "PASSING":
+        reasons.append("non_review_ci_not_passing")
+    if snapshot.local_verification is not True:
+        reasons.append("local_verification_not_passing")
+    if snapshot.worktree_clean is not True:
+        reasons.append("worktree_not_clean")
+    if snapshot.local_commit != snapshot.remote_commit or snapshot.local_commit != snapshot.durable_tip:
+        reasons.append("tip_binding_mismatch")
+    if snapshot.pr_state != "OPEN" or snapshot.pr_is_draft:
+        reasons.append("pull_request_not_open_or_is_draft")
+    if snapshot.mergeable is not None and snapshot.mergeable.value == "CONFLICTING":
+        reasons.append("merge_conflict")
+    reasons.extend(_contradictions_of(snapshot))
+    compliant_reviews = 0
+    try:
+        for _review_id, data in store.bound_reviews(snapshot.local_commit):
+            if data.get("schema_version") == 1:
+                reasons.append("schema_v1_review_requires_retirement")
+                continue
+            record = validate_review(
+                data,
+                review_policy=projected_config.review_policy,
+                model_routes=projected_config.model_routes,
+            )
+            verify_review_provenance(record, Path(projected_config.closure_state_dir))
+            require_live_binding(
+                record,
+                projected_config.repository,
+                args.pr,
+                snapshot.head_branch,
+                snapshot.local_commit,
+            )
+            compliant_reviews += 1
+    except (ReviewValidationError, ProvenanceValidationError) as error:
+        reasons.append("review_not_compliant: {0}".format(error))
+    if compliant_reviews == 0:
+        reasons.append("missing_compliant_schema_v2_review")
+    payload = (
+        {
+            "schema_version": 1,
+            "result": "ELIGIBLE",
+            "commit": snapshot.local_commit,
+            "staged_config_digest": staged_digest,
+            "projected_enforced_config_digest": projected_digest,
+        }
+        if not reasons
+        else _activation_refusal(
+            reasons, staged_digest, projected_digest, snapshot.local_commit
+        )
+    )
+    if payload["result"] == "ELIGIBLE":
+        event = store.record_policy_activation(
+            snapshot.local_commit, staged_digest, projected_digest
+        )
+        payload["activation_event_id"] = event["event_id"]
+    sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
+    return EXIT_OK if payload["result"] == "ELIGIBLE" else EXIT_TRANSITION_DENIED
 
 
 def cmd_record_verification(config, args) -> int:
@@ -1108,6 +1271,32 @@ def _build_parser() -> argparse.ArgumentParser:
     import_review.add_argument("--pr", required=True, type=int, metavar="N")
     import_review.add_argument("--review", required=True, metavar="FILE", help="JSON review artifact")
     import_review.set_defaults(func=cmd_import_review)
+
+    retire_review = sub.add_parser(
+        "retire-review", help="durably retire one exact active review artifact"
+    )
+    retire_review.add_argument("--config", required=True, metavar="FILE")
+    retire_review.add_argument("--pr", required=True, type=int, metavar="N")
+    retire_review.add_argument("--commit", required=True, metavar="40-HEX")
+    retire_review.add_argument("--review-id", required=True, metavar="ID")
+    retire_review.add_argument("--retirement-id", required=True, metavar="ID")
+    retire_review.add_argument("--reason", required=True, metavar="REASON")
+    retire_review.add_argument("--policy-id", required=True, metavar="ID")
+    retire_review.add_argument("--expected-sha256", required=True, metavar="64-HEX")
+    retire_review.set_defaults(func=cmd_retire_review)
+
+    activate = sub.add_parser(
+        "check-policy-activation",
+        help="prove staged policy eligibility for one projected enforced config",
+    )
+    activate.add_argument("--config", required=True, metavar="FILE")
+    activate.add_argument("--pr", required=True, type=int, metavar="N")
+    activate.add_argument(
+        "--projected-config",
+        metavar="FILE",
+        help="optional enforced config; otherwise derive it by changing only mode",
+    )
+    activate.set_defaults(func=cmd_check_policy_activation)
 
     record_verification = sub.add_parser(
         "record-verification", help="run the local review-ready gate under the heavy-job lease"

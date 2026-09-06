@@ -98,6 +98,237 @@
         "pattern": "\\S"
       },
       "uniqueItems": true
+    },
+    "model_routes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/modelRoute"
+      }
+    },
+    "review_policy": {
+      "$ref": "#/$defs/reviewPolicy"
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "model_routes": {
+          "maxItems": 0
+        },
+        "review_policy": {
+          "properties": {
+            "mode": {
+              "type": "null"
+            },
+            "owner_authorization": {
+              "type": "null"
+            },
+            "forbidden_reviewer_families": {
+              "maxItems": 0
+            },
+            "same_family_exceptions": {
+              "maxItems": 0
+            }
+          }
+        }
+      }
+    },
+    {
+      "required": [
+        "model_routes",
+        "review_policy"
+      ],
+      "properties": {
+        "model_routes": {
+          "minItems": 1
+        },
+        "review_policy": {
+          "required": [
+            "mode",
+            "owner_authorization"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "staged",
+                "enforced"
+              ]
+            },
+            "owner_authorization": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\S"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "modelRoute": {
+      "type": "object",
+      "required": [
+        "id",
+        "implementer_invocation_model",
+        "implementer_model",
+        "implementer_runner",
+        "launcher_registry_version",
+        "registry_version",
+        "reviewer_invocation_model",
+        "reviewer_model",
+        "reviewer_runner",
+        "same_family_policy_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]*$"
+        },
+        "registry_version": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "launcher_registry_version": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "implementer_model": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9.-]*$"
+        },
+        "implementer_runner": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "implementer_invocation_model": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "reviewer_model": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9.-]*$"
+        },
+        "reviewer_runner": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "reviewer_invocation_model": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "same_family_policy_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9._-]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "reviewPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "staged",
+                "enforced"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "owner_authorization": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\S"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "forbidden_reviewer_families": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "uniqueItems": true
+        },
+        "same_family_exceptions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/sameFamilyException"
+          }
+        }
+      }
+    },
+    "sameFamilyException": {
+      "type": "object",
+      "required": [
+        "id",
+        "implementer_family",
+        "owner_authorization",
+        "rationale",
+        "registry_version",
+        "required_for_authorized_family",
+        "reviewer_model"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]*$"
+        },
+        "registry_version": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "implementer_family": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "reviewer_model": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9.-]*$"
+        },
+        "required_for_authorized_family": {
+          "type": "boolean"
+        },
+        "owner_authorization": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        }
+      }
     }
   }
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 import re
@@ -8,7 +9,16 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Mapping, NamedTuple, Optional, Tuple
 
-from pr_closure.model import Disposition, ProjectConfig, Severity, Verdict
+from pr_closure.model import (
+    Disposition,
+    ModelRoute,
+    ProjectConfig,
+    ReviewPolicy,
+    ReviewPolicyMode,
+    SameFamilyReviewException,
+    Severity,
+    Verdict,
+)
 
 
 class ReviewValidationError(ValueError):
@@ -121,11 +131,15 @@ PROJECT_CONFIG_FIELDS = (
     _f("verification_command_timeout_seconds", "integer", {"minimum": 1}),
     _f("tracking_projection", "nullable_text"),
     _f("ci_required_checks", "check_name_array"),
+    _f("model_routes", "policy_routes"),
+    _f("review_policy", "review_policy"),
 )
 
 PROJECT_CONFIG_ALLOWED_KEYS = tuple(field.name for field in PROJECT_CONFIG_FIELDS)
 PROJECT_CONFIG_REQUIRED_KEYS = tuple(
-    field.name for field in PROJECT_CONFIG_FIELDS if field.name != "ci_required_checks"
+    field.name
+    for field in PROJECT_CONFIG_FIELDS
+    if field.name not in ("ci_required_checks", "model_routes", "review_policy")
 )
 
 CONFIG_SEMANTIC_ASYMMETRIES = (
@@ -300,6 +314,17 @@ def command_sequence_digest(sequence, verification_command_timeout_seconds: int 
     return hashlib.sha256(payload).hexdigest()
 
 
+def configuration_digest(record: Mapping) -> str:
+    """Return the stable digest used to bind policy activation evidence."""
+    try:
+        payload = json.dumps(
+            record, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+    except (TypeError, ValueError) as error:
+        raise ConfigValidationError("configuration cannot be canonically serialized") from error
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _check_string_array(name: str, raw, min_items: int) -> Tuple[str, ...]:
     items = require_list(raw, name)
     if not all(isinstance(item, str) and item.strip() for item in items):
@@ -378,6 +403,181 @@ def _check_nullable_text(name: str, raw) -> Optional[str]:
     return _check_text(name, raw)
 
 
+_SAFE_POLICY_ID = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+_POLICY_KEYS = frozenset({
+    "mode",
+    "owner_authorization",
+    "forbidden_reviewer_families",
+    "same_family_exceptions",
+})
+_EXCEPTION_KEYS = frozenset({
+    "id",
+    "registry_version",
+    "implementer_family",
+    "reviewer_model",
+    "required_for_authorized_family",
+    "owner_authorization",
+    "rationale",
+})
+_ROUTE_KEYS = frozenset({
+    "id",
+    "registry_version",
+    "launcher_registry_version",
+    "implementer_model",
+    "implementer_runner",
+    "implementer_invocation_model",
+    "reviewer_model",
+    "reviewer_runner",
+    "reviewer_invocation_model",
+    "same_family_policy_id",
+})
+
+
+def _policy_id(name: str, raw) -> str:
+    value = _check_text(name, raw)
+    if _SAFE_POLICY_ID.fullmatch(value) is None:
+        raise ReviewValidationError(f"{name} must be a path-safe lowercase identifier")
+    return value
+
+
+def _known_family(raw) -> str:
+    from pr_closure import families
+
+    return families.resolve_family(_check_text("model family", raw))
+
+
+def _parse_same_family_exception(raw) -> SameFamilyReviewException:
+    from pr_closure.registries import RegistryValidationError, require_model
+
+    item = require_mapping(raw, "same-family exception")
+    reject_unknown_keys(item, _EXCEPTION_KEYS, "same-family exception")
+    require_present(item, _EXCEPTION_KEYS, "same-family exception")
+    exception_id = _policy_id("same-family exception id", item["id"])
+    registry_version = _check_text("registry_version", item["registry_version"])
+    implementer_family = _known_family(item["implementer_family"])
+    reviewer_model = _check_text("reviewer_model", item["reviewer_model"])
+    try:
+        reviewer_family = require_model(registry_version, reviewer_model)
+    except RegistryValidationError as error:
+        raise ReviewValidationError(str(error)) from error
+    if reviewer_family != implementer_family:
+        raise ReviewValidationError(
+            "same-family exception implementer and reviewer families must match"
+        )
+    required = item["required_for_authorized_family"]
+    if not isinstance(required, bool):
+        raise ReviewValidationError("required_for_authorized_family must be a boolean")
+    return SameFamilyReviewException(
+        id=exception_id,
+        registry_version=registry_version,
+        implementer_family=implementer_family,
+        reviewer_model=reviewer_model,
+        required_for_authorized_family=required,
+        owner_authorization=_check_text(
+            "same-family exception owner_authorization", item["owner_authorization"]
+        ),
+        rationale=_check_text("same-family exception rationale", item["rationale"]),
+    )
+
+
+def _parse_review_policy(raw) -> ReviewPolicy:
+    item = require_mapping(raw, "review_policy")
+    reject_unknown_keys(item, _POLICY_KEYS, "review_policy")
+    mode_raw = item.get("mode")
+    owner_raw = item.get("owner_authorization")
+    forbidden_raw = item.get("forbidden_reviewer_families", [])
+    exceptions_raw = item.get("same_family_exceptions", [])
+
+    forbidden_items = require_list(forbidden_raw, "forbidden_reviewer_families")
+    forbidden = tuple(_known_family(value) for value in forbidden_items)
+    if len(set(forbidden)) != len(forbidden):
+        raise ReviewValidationError("forbidden_reviewer_families must be unique")
+    exception_items = require_list(exceptions_raw, "same_family_exceptions")
+    exceptions = tuple(_parse_same_family_exception(value) for value in exception_items)
+    exception_ids = [value.id for value in exceptions]
+    if len(set(exception_ids)) != len(exception_ids):
+        raise ReviewValidationError("same-family exception ids must be unique")
+
+    has_content = (
+        mode_raw is not None
+        or owner_raw is not None
+        or len(forbidden) > 0
+        or len(exceptions) > 0
+    )
+    if not has_content:
+        return ReviewPolicy()
+    if not isinstance(mode_raw, str) or mode_raw not in tuple(ReviewPolicyMode):
+        raise ReviewValidationError("review_policy mode must be staged or enforced")
+    owner = _check_text("review_policy owner_authorization", owner_raw)
+    return ReviewPolicy(
+        mode=ReviewPolicyMode(mode_raw),
+        owner_authorization=owner,
+        forbidden_reviewer_families=forbidden,
+        same_family_exceptions=exceptions,
+    )
+
+
+def _parse_model_route(raw) -> ModelRoute:
+    from pr_closure.registries import RegistryValidationError, require_launcher, require_model
+
+    item = require_mapping(raw, "model route")
+    reject_unknown_keys(item, _ROUTE_KEYS, "model route")
+    require_present(item, _ROUTE_KEYS, "model route")
+    registry_version = _check_text("registry_version", item["registry_version"])
+    launcher_version = _check_text(
+        "launcher_registry_version", item["launcher_registry_version"]
+    )
+    implementer_model = _check_text("implementer_model", item["implementer_model"])
+    reviewer_model = _check_text("reviewer_model", item["reviewer_model"])
+    implementer_runner = _check_text("implementer_runner", item["implementer_runner"])
+    implementer_invocation = _check_text(
+        "implementer_invocation_model", item["implementer_invocation_model"]
+    )
+    reviewer_runner = _check_text("reviewer_runner", item["reviewer_runner"])
+    reviewer_invocation = _check_text(
+        "reviewer_invocation_model", item["reviewer_invocation_model"]
+    )
+    try:
+        require_model(registry_version, implementer_model)
+        require_model(registry_version, reviewer_model)
+        require_launcher(
+            registry_version,
+            launcher_version,
+            implementer_model,
+            implementer_runner,
+            implementer_invocation,
+        )
+        require_launcher(
+            registry_version,
+            launcher_version,
+            reviewer_model,
+            reviewer_runner,
+            reviewer_invocation,
+        )
+    except RegistryValidationError as error:
+        raise ReviewValidationError(str(error)) from error
+    policy_id_raw = item["same_family_policy_id"]
+    policy_id = None
+    if policy_id_raw is not None:
+        policy_id = _policy_id("same_family_policy_id", policy_id_raw)
+    return ModelRoute(
+        id=_policy_id("model route id", item["id"]),
+        registry_version=registry_version,
+        launcher_registry_version=launcher_version,
+        implementer_model=implementer_model,
+        implementer_runner=implementer_runner,
+        implementer_invocation_model=implementer_invocation,
+        reviewer_model=reviewer_model,
+        reviewer_runner=reviewer_runner,
+        reviewer_invocation_model=reviewer_invocation,
+        same_family_policy_id=policy_id,
+    )
+
+
+def _parse_model_routes(raw) -> Tuple[ModelRoute, ...]:
+    return tuple(_parse_model_route(value) for value in require_list(raw, "model_routes"))
+
+
 def check(fields, record: Mapping, parsers: Optional[Dict] = None) -> Dict:
     """Validate every declared field present in ``record``.
 
@@ -423,9 +623,87 @@ def check(fields, record: Mapping, parsers: Optional[Dict] = None) -> Dict:
             values[name] = _check_command_array(name, raw, params.get("min_items", 0))
         elif kind == "nullable_text":
             values[name] = _check_nullable_text(name, raw)
+        elif kind == "policy_routes":
+            values[name] = _parse_model_routes(raw)
+        elif kind == "review_policy":
+            values[name] = _parse_review_policy(raw)
         else:
             raise AssertionError(f"unknown contract kind: {kind!r}")
     return values
+
+
+def _validate_policy_routes(policy: ReviewPolicy, routes: Tuple[ModelRoute, ...]) -> None:
+    from pr_closure.registries import require_model
+
+    if policy.mode is None:
+        if len(routes) > 0:
+            raise ReviewValidationError("a disabled review_policy requires empty model_routes")
+        return
+    if len(routes) == 0:
+        raise ReviewValidationError("an active review_policy requires non-empty model_routes")
+
+    route_ids = [route.id for route in routes]
+    implementer_models = [route.implementer_model for route in routes]
+    if len(set(route_ids)) != len(route_ids):
+        raise ReviewValidationError("model route ids must be unique")
+    if len(set(implementer_models)) != len(implementer_models):
+        raise ReviewValidationError("model route implementer models must be unique")
+
+    exceptions = {exception.id: exception for exception in policy.same_family_exceptions}
+    for exception in policy.same_family_exceptions:
+        reviewer_family = require_model(exception.registry_version, exception.reviewer_model)
+        if reviewer_family in policy.forbidden_reviewer_families:
+            raise ReviewValidationError(
+                "same-family exception reviewer family is forbidden: {0}".format(
+                    reviewer_family
+                )
+            )
+
+    for route in routes:
+        implementer_family = require_model(route.registry_version, route.implementer_model)
+        reviewer_family = require_model(route.registry_version, route.reviewer_model)
+        if route.implementer_model == route.reviewer_model:
+            raise ReviewValidationError("a model route cannot authorize model self-review")
+        if reviewer_family in policy.forbidden_reviewer_families:
+            raise ReviewValidationError(
+                "model route reviewer family is forbidden: {0}".format(reviewer_family)
+            )
+        if implementer_family == reviewer_family:
+            exception = exceptions.get(route.same_family_policy_id)
+            if exception is None:
+                raise ReviewValidationError(
+                    "same-family model route requires a configured exception"
+                )
+            if (
+                exception.registry_version != route.registry_version
+                or exception.implementer_family != implementer_family
+                or exception.reviewer_model != route.reviewer_model
+            ):
+                raise ReviewValidationError(
+                    "same-family model route does not match its configured exception"
+                )
+        elif route.same_family_policy_id is not None:
+            raise ReviewValidationError(
+                "cross-family model route must not claim a same-family exception"
+            )
+
+    for exception in policy.same_family_exceptions:
+        if not exception.required_for_authorized_family:
+            continue
+        for route in routes:
+            implementer_family = require_model(
+                route.registry_version, route.implementer_model
+            )
+            if implementer_family != exception.implementer_family:
+                continue
+            if (
+                route.registry_version != exception.registry_version
+                or route.reviewer_model != exception.reviewer_model
+                or route.same_family_policy_id != exception.id
+            ):
+                raise ReviewValidationError(
+                    "required same-family exception is missing from an authorized family route"
+                )
 
 
 def check_follow_up(record, disposition) -> Optional[int]:
@@ -458,6 +736,9 @@ def validate_project_config(record: Mapping) -> ProjectConfig:
         reject_unknown_keys(record, PROJECT_CONFIG_ALLOWED_KEYS, "project config")
         require_present(record, PROJECT_CONFIG_REQUIRED_KEYS, "project config")
         values = check(PROJECT_CONFIG_FIELDS, record)
+        review_policy = values.get("review_policy", ReviewPolicy())
+        model_routes = values.get("model_routes", ())
+        _validate_policy_routes(review_policy, model_routes)
     except ReviewValidationError as error:
         raise ConfigValidationError(str(error)) from error
     return ProjectConfig(
@@ -475,6 +756,8 @@ def validate_project_config(record: Mapping) -> ProjectConfig:
         verification_command_timeout_seconds=values["verification_command_timeout_seconds"],
         tracking_projection=values["tracking_projection"],
         ci_required_checks=values.get("ci_required_checks", ()),
+        model_routes=model_routes,
+        review_policy=review_policy,
     )
 
 
@@ -529,6 +812,10 @@ def _property_schema(name: str, kind: str, params: Dict) -> Dict:
         return schema
     if kind == "nullable_text":
         return {"type": ["string", "null"], **NON_BLANK}
+    if kind == "policy_routes":
+        return {"type": "array", "items": {"$ref": "#/$defs/modelRoute"}}
+    if kind == "review_policy":
+        return {"$ref": "#/$defs/reviewPolicy"}
     raise AssertionError(f"unknown contract kind: {kind!r}")
 
 
@@ -570,6 +857,82 @@ def json_schema() -> Dict:
     }
 
 
+def review_json_schema_v2() -> Dict:
+    schema = copy.deepcopy(json_schema())
+    schema["$id"] = "https://ai-orchestration-playbook/schemas/review-record-v2.json"
+    schema["title"] = "Structured Exact-Model Adversarial Review Record"
+    schema["description"] = (
+        "Machine authority for a registry-pinned review with both implementer "
+        "and reviewer provenance. Policy and family comparisons are enforced in Python."
+    )
+    schema["properties"]["schema_version"] = {"type": "integer", "const": 2}
+    schema["properties"].update({
+        "implementer_model": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9.-]*$",
+        },
+        "reviewer_model": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9.-]*$",
+        },
+        "review_exception": {"$ref": "#/$defs/reviewException"},
+        "provenance": {"$ref": "#/$defs/provenance"},
+    })
+    schema["required"].extend([
+        "implementer_model",
+        "reviewer_model",
+        "provenance",
+    ])
+    participant = {
+        "type": "object",
+        "required": sorted((
+            "model_id",
+            "runner",
+            "invocation_model",
+            "run_ref",
+            "durable_path",
+            "sha256",
+        )),
+        "additionalProperties": False,
+        "properties": {
+            "model_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9.-]*$"},
+            "runner": dict({"type": "string"}, **NON_BLANK),
+            "invocation_model": dict({"type": "string"}, **NON_BLANK),
+            "run_ref": dict({"type": "string"}, **NON_BLANK),
+            "durable_path": {"type": "string", "pattern": "^/\\S"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        },
+    }
+    schema["$defs"].update({
+        "reviewException": {
+            "type": "object",
+            "required": ["policy_id"],
+            "additionalProperties": False,
+            "properties": {
+                "policy_id": dict({"type": "string"}, **NON_BLANK),
+            },
+        },
+        "provenance": {
+            "type": "object",
+            "required": [
+                "registry_version",
+                "launcher_registry_version",
+                "implementer",
+                "reviewer",
+            ],
+            "additionalProperties": False,
+            "properties": {
+                "registry_version": dict({"type": "string"}, **NON_BLANK),
+                "launcher_registry_version": dict({"type": "string"}, **NON_BLANK),
+                "implementer": {"$ref": "#/$defs/provenanceParticipant"},
+                "reviewer": {"$ref": "#/$defs/provenanceParticipant"},
+            },
+        },
+        "provenanceParticipant": participant,
+    })
+    return schema
+
+
 def _comment() -> str:
     return (
         "Generated from tools/pr_closure/contract.py by "
@@ -597,6 +960,64 @@ def _project_comment() -> str:
 
 
 def project_json_schema() -> Dict:
+    policy_id = {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$"}
+    model_id = {"type": "string", "pattern": "^[a-z0-9][a-z0-9.-]*$"}
+    non_blank = dict({"type": "string"}, **NON_BLANK)
+    exception_def = {
+        "type": "object",
+        "required": sorted(_EXCEPTION_KEYS),
+        "additionalProperties": False,
+        "properties": {
+            "id": policy_id,
+            "registry_version": non_blank,
+            "implementer_family": non_blank,
+            "reviewer_model": model_id,
+            "required_for_authorized_family": {"type": "boolean"},
+            "owner_authorization": non_blank,
+            "rationale": non_blank,
+        },
+    }
+    route_def = {
+        "type": "object",
+        "required": sorted(_ROUTE_KEYS),
+        "additionalProperties": False,
+        "properties": {
+            "id": policy_id,
+            "registry_version": non_blank,
+            "launcher_registry_version": non_blank,
+            "implementer_model": model_id,
+            "implementer_runner": non_blank,
+            "implementer_invocation_model": non_blank,
+            "reviewer_model": model_id,
+            "reviewer_runner": non_blank,
+            "reviewer_invocation_model": non_blank,
+            "same_family_policy_id": {"anyOf": [policy_id, {"type": "null"}]},
+        },
+    }
+    review_policy_def = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "mode": {
+                "anyOf": [
+                    {"type": "string", "enum": [item.value for item in ReviewPolicyMode]},
+                    {"type": "null"},
+                ]
+            },
+            "owner_authorization": {
+                "anyOf": [non_blank, {"type": "null"}],
+            },
+            "forbidden_reviewer_families": {
+                "type": "array",
+                "items": non_blank,
+                "uniqueItems": True,
+            },
+            "same_family_exceptions": {
+                "type": "array",
+                "items": {"$ref": "#/$defs/sameFamilyException"},
+            },
+        },
+    }
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://ai-orchestration-playbook/schemas/project-closure-v1.json",
@@ -611,6 +1032,42 @@ def project_json_schema() -> Dict:
         "required": list(PROJECT_CONFIG_REQUIRED_KEYS),
         "additionalProperties": False,
         "properties": {field.name: _property_schema(*field) for field in PROJECT_CONFIG_FIELDS},
+        "oneOf": [
+            {
+                "properties": {
+                    "model_routes": {"maxItems": 0},
+                    "review_policy": {
+                        "properties": {
+                            "mode": {"type": "null"},
+                            "owner_authorization": {"type": "null"},
+                            "forbidden_reviewer_families": {"maxItems": 0},
+                            "same_family_exceptions": {"maxItems": 0},
+                        }
+                    },
+                }
+            },
+            {
+                "required": ["model_routes", "review_policy"],
+                "properties": {
+                    "model_routes": {"minItems": 1},
+                    "review_policy": {
+                        "required": ["mode", "owner_authorization"],
+                        "properties": {
+                            "mode": {
+                                "type": "string",
+                                "enum": [item.value for item in ReviewPolicyMode],
+                            },
+                            "owner_authorization": non_blank,
+                        },
+                    },
+                },
+            },
+        ],
+        "$defs": {
+            "modelRoute": route_def,
+            "reviewPolicy": review_policy_def,
+            "sameFamilyException": exception_def,
+        },
     }
 
 
@@ -622,9 +1079,17 @@ def render_project_schema() -> str:
     return json.dumps(project_json_schema(), indent=2) + "\n"
 
 
+def render_review_schema_v2() -> str:
+    return json.dumps(review_json_schema_v2(), indent=2) + "\n"
+
+
 if __name__ == "__main__":
     project_schema_path = (
         Path(__file__).resolve().parent.parent / "schemas" / "project-closure-v1.json"
     )
     project_schema_path.write_text(render_project_schema())
+    review_v2_schema_path = (
+        Path(__file__).resolve().parent.parent / "schemas" / "review-record-v2.json"
+    )
+    review_v2_schema_path.write_text(render_review_schema_v2())
     sys.stdout.write(render_schema())

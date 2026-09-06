@@ -156,8 +156,8 @@ curl -fsSL https://raw.githubusercontent.com/radandevist/ai-orchestration-playbo
 ## Mechanical PR closure gate
 
 Since §2.6, pull-request closure is a mandatory state machine, not a prose claim. The repo ships one
-self-contained CLI (`tools/pr-closure`) and two machine schemas (`tools/schemas/review-record-v1.json`,
-`tools/schemas/project-closure-v1.json`). The CLI derives one state per pull request from Git, GitHub,
+self-contained CLI (`tools/pr-closure`) and generated machine schemas (`tools/schemas/review-record-v1.json`,
+`tools/schemas/review-record-v2.json`, and `tools/schemas/project-closure-v1.json`). The CLI derives one state per pull request from Git, GitHub,
 durable verification, and durable review records, and refuses invalid transitions.
 
 ### Install
@@ -226,6 +226,36 @@ each legacy verdict into the structured review schema once, then import it:
 
 Imported reviews are validated (schema version, verdict, finding IDs, follow-up issues) and fail
 closed on anything unknown or malformed.
+
+### Exact-model review policy migration
+
+Projects that need an owner-authorized model route add `model_routes` and `review_policy` to the
+project configuration. Routes are exact canonical model/runner/invocation identities; they are not
+inferred from adapter prose or a global same-family switch. Schema-v2 reviews carry independent
+implementer and reviewer provenance envelopes, pinned registry versions, immutable run manifests,
+and byte digests. Both provenance halves are required before import or status can treat the review
+as evidence.
+
+Use `mode: "staged"` while migrating. Staged imports may add compliant schema-v2 evidence and the
+retirement command may move legacy evidence, but ordinary `status` remains `UNVERIFIED`. Retire an
+active legacy artifact only with its exact digest and a policy-scoped reason:
+
+```bash
+PYTHONPATH="$HOME/ai-orchestration-playbook/tools" \
+  "$HOME/ai-orchestration-playbook/tools/pr-closure" retire-review \
+  --config /absolute/project-closure.json --pr 123 --commit <40-hex> \
+  --review-id legacy-review --retirement-id retire-123-v1 \
+  --reason "policy-migration: schema-v2-provenance-required" \
+  --policy-id <policy-id> --expected-sha256 <64-hex>
+```
+
+Retirement is append-only and crash-safe: publication immediately revokes the old artifact, while
+only a complete `ACTIVE -> PREPARED -> COPIED -> COMMITTED -> FINALIZED` relation can remove it from
+active reads. After every active tip has a compliant v2 review and finalized retirements, run
+`check-policy-activation`; it returns only `ELIGIBLE` or a refusal bound to the exact tip and staged
+and projected-enforced configuration digests. Change only the policy mode to `enforced`, then run a
+fresh `status`. Rollback is another staged/enforced, owner-authorized policy that keeps Anthropic
+forbidden; removing the policy or reviving retired evidence is not a rollback.
 
 ### Project migration and preflight
 

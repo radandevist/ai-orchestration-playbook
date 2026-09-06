@@ -1,0 +1,337 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-orchestration-playbook/schemas/review-record-v2.json",
+  "title": "Structured Exact-Model Adversarial Review Record",
+  "description": "Machine authority for a registry-pinned review with both implementer and reviewer provenance. Policy and family comparisons are enforced in Python.",
+  "$comment": "Generated from tools/pr_closure/contract.py by PYTHONPATH=tools python3 -m pr_closure.contract - never hand-edit. Residual semantics JSON Schema cannot express are enforced in Python and are documented verbatim: duplicate_finding_ids: duplicate finding IDs cannot be forbidden here: JSON Schema has no uniqueness keyword over object properties, so the Python gate rejects duplicate ids and this schema deliberately declares none.; unknown_model_family: unknown model family (e.g. wizard-9000) is rejected only by the Python resolver: model lineage is not representable as a JSON Schema pattern, so this schema accepts any non-blank spelling.; third_party_lookalike: third-party lookalike (claude-killer) is rejected only by the Python resolver: a product name attached to a vendor prefix is not expressible in this schema, so the schema accepts it.; same_model_family: same family under different spellings is rejected only by the Python gate: JSON Schema cannot compare implementer_family with reviewer_family, so this schema accepts families that resolve to the same lineage.; exact_integer_types: integer-valued JSON numbers such as schema_version 1.0, pr_number 42.0, or follow_up_issue 900.0 satisfy JSON Schema integer/const semantics, while the Python gate requires exact int values and rejects floats and booleans.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "repository",
+    "pr_number",
+    "reviewed_branch",
+    "reviewed_commit",
+    "implementer_family",
+    "reviewer_family",
+    "local_evidence",
+    "ci_evidence",
+    "verdict",
+    "findings",
+    "intentionally_not_findings",
+    "implementer_model",
+    "reviewer_model",
+    "provenance"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 2
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^[^/\\s]+/[^/\\s]+(?![\\s\\S])"
+    },
+    "pr_number": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "reviewed_branch": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "reviewed_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}(?![\\s\\S])",
+      "minLength": 40,
+      "maxLength": 40
+    },
+    "base_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}(?![\\s\\S])",
+      "minLength": 40,
+      "maxLength": 40
+    },
+    "comparison_range": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "implementer_family": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "reviewer_family": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "local_evidence": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      },
+      "minItems": 1
+    },
+    "ci_evidence": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      },
+      "minItems": 1
+    },
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "CHANGES_REQUIRED",
+        "APPROVED_WITH_FOLLOW_UPS",
+        "APPROVED",
+        "INCONCLUSIVE"
+      ]
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    },
+    "intentionally_not_findings": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      }
+    },
+    "implementer_model": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9.-]*$"
+    },
+    "reviewer_model": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9.-]*$"
+    },
+    "review_exception": {
+      "$ref": "#/$defs/reviewException"
+    },
+    "provenance": {
+      "$ref": "#/$defs/provenance"
+    }
+  },
+  "oneOf": [
+    {
+      "required": [
+        "base_commit"
+      ]
+    },
+    {
+      "required": [
+        "comparison_range"
+      ]
+    }
+  ],
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "required": [
+        "id",
+        "root_cause",
+        "severity",
+        "disposition",
+        "scope",
+        "summary",
+        "evidence"
+      ],
+      "additionalProperties": false,
+      "dependentRequired": {
+        "bad_case_evidence": [
+          "good_case_evidence"
+        ],
+        "good_case_evidence": [
+          "bad_case_evidence"
+        ]
+      },
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "root_cause": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "CRITICAL",
+            "MAJOR",
+            "MEDIUM",
+            "MINOR",
+            "NOTE"
+          ]
+        },
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "BLOCKS_PR",
+            "FOLLOW_UP_ISSUE",
+            "NOTE_ONLY"
+          ]
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          }
+        },
+        "follow_up_issue": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "bad_case_evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "minItems": 1
+        },
+        "good_case_evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "minItems": 1
+        }
+      },
+      "if": {
+        "properties": {
+          "disposition": {
+            "const": "FOLLOW_UP_ISSUE"
+          }
+        },
+        "required": [
+          "disposition"
+        ]
+      },
+      "then": {
+        "required": [
+          "follow_up_issue"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "follow_up_issue"
+          ]
+        }
+      }
+    },
+    "reviewException": {
+      "type": "object",
+      "required": [
+        "policy_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "policy_id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": [
+        "registry_version",
+        "launcher_registry_version",
+        "implementer",
+        "reviewer"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "registry_version": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "launcher_registry_version": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "implementer": {
+          "$ref": "#/$defs/provenanceParticipant"
+        },
+        "reviewer": {
+          "$ref": "#/$defs/provenanceParticipant"
+        }
+      }
+    },
+    "provenanceParticipant": {
+      "type": "object",
+      "required": [
+        "durable_path",
+        "invocation_model",
+        "model_id",
+        "run_ref",
+        "runner",
+        "sha256"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "model_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9.-]*$"
+        },
+        "runner": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "invocation_model": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "run_ref": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "durable_path": {
+          "type": "string",
+          "pattern": "^/\\S"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}

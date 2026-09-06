@@ -61,6 +61,9 @@ def derive_state(snapshot, now) -> StateDecision:
         else MergeableState(snapshot.mergeable)
     ) if snapshot.mergeable is not None else None
 
+    if snapshot.review_policy_reason is not None:
+        return _decision(ClosureState.UNVERIFIED, (snapshot.review_policy_reason,))
+
     if mergeable is MergeableState.CONFLICTING:
         return _decision(
             ClosureState.NEEDS_RESOLUTION,
@@ -292,6 +295,7 @@ def _validate(snapshot, now) -> None:
         ("checked_out_branch", snapshot.checked_out_branch),
         ("pr_state", snapshot.pr_state),
         ("repeated_root_cause", snapshot.repeated_root_cause),
+        ("review_policy_reason", snapshot.review_policy_reason),
         ("mergeable", snapshot.mergeable),
         ("merge_state_status", snapshot.merge_state_status),
     ):

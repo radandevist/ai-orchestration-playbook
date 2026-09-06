@@ -55,6 +55,21 @@ def approved_snapshot():
 
 
 class StateDerivationTests(unittest.TestCase):
+    def test_staged_review_policy_never_approves(self):
+        snap = replace(approved_snapshot(), review_policy_reason="review_policy_staged")
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+        self.assertEqual(("review_policy_staged",), decision.reasons)
+
+    def test_legacy_review_under_policy_never_approves(self):
+        snap = replace(
+            approved_snapshot(),
+            review_policy_reason="schema_v1_review_requires_retirement",
+        )
+        decision = derive_state(snap, NOW)
+        self.assertEqual(ClosureState.UNVERIFIED, decision.state)
+        self.assertEqual(("schema_v1_review_requires_retirement",), decision.reasons)
+
     def test_branch_ci_failure_wins_over_review(self):
         snap = replace(
             review_ready(),
