@@ -51,7 +51,13 @@ from pr_closure.model import (
     ReviewPolicyMode,
 )
 from pr_closure.provenance import ProvenanceValidationError, verify_review_provenance
-from pr_closure.policy_lifecycle import authorize_retirement, validate_activation_projection
+from pr_closure.policy_lifecycle import (
+    authorize_retirement,
+    policy_identity,
+    policy_transition_kind,
+    validate_activation_projection,
+    validate_adopted_policy_context,
+)
 from pr_closure.dispatch import select_model_route
 from pr_closure.review import require_live_binding, validate_review
 from pr_closure.sources import (
@@ -348,17 +354,35 @@ def _contradictions_of(snapshot) -> Tuple[str, ...]:
     return tuple(out)
 
 
-def _status_snapshot(config, pr_number, *, require_activation=True):
+def _status_snapshot(
+    config, pr_number, *, require_activation=True, require_policy_adoption=True
+):
     """Derive the live fail-closed state from Git/GitHub plus durable records.
 
     Strictly read-only: no commit, verification, review, or projection write
     is ever made here. Missing, malformed, or contradictory evidence raises a
-    typed source error so the caller fails closed.
+    typed source error so the caller fails closed. The only caller that sets
+    ``require_policy_adoption=False`` is the activation command's proposed
+    target snapshot; that snapshot is not authority and is followed by the
+    durable adoption write before activation can succeed.
     """
     store = RunStore(config.closure_state_dir, config.project, pr_number)
     _github, pr, git = _resolve_pr_sources(config, pr_number)
     facts = git.facts()
     events = store.read_events()
+    adopted_policy = store.current_policy_adoption(config.repository)
+    policy_adoption_valid = True
+    policy_adoption_reason = None
+    if require_policy_adoption:
+        if config.review_policy.mode is ReviewPolicyMode.ENFORCED and adopted_policy is None:
+            policy_adoption_valid = False
+            policy_adoption_reason = "policy_adoption_required"
+        elif adopted_policy is not None:
+            try:
+                validate_adopted_policy_context(config, adopted_policy)
+            except ConfigValidationError:
+                policy_adoption_valid = False
+                policy_adoption_reason = "policy_adoption_requires_matching_policy"
 
     durable_tip = None
     last_progress_at = None
@@ -421,12 +445,14 @@ def _status_snapshot(config, pr_number, *, require_activation=True):
     follow_up_issue_numbers = set()
     verdicts = set()
     review_policy_reason = None
-    if (
+    if not policy_adoption_valid:
+        review_policy_reason = policy_adoption_reason
+    if review_policy_reason is None and (
         config.review_policy.mode is not None
         and config.review_policy.mode.value == "staged"
     ):
         review_policy_reason = "review_policy_staged"
-    elif (
+    elif review_policy_reason is None and (
         require_activation
         and config.review_policy.mode is ReviewPolicyMode.ENFORCED
     ):
@@ -441,7 +467,12 @@ def _status_snapshot(config, pr_number, *, require_activation=True):
             if activation is None:
                 review_policy_reason = "policy_activation_missing_or_stale"
     for _stem, data in store.bound_reviews(facts.local_commit):
-        if config.review_policy.mode is not None and data.get("schema_version") == 1:
+        if not policy_adoption_valid:
+            continue
+        if (
+            (config.review_policy.mode is not None or adopted_policy is not None)
+            and data.get("schema_version") == 1
+        ):
             review_policy_reason = "schema_v1_review_requires_retirement"
             continue
         try:
@@ -647,6 +678,18 @@ def cmd_import_review(config, args) -> int:
     store = RunStore(config.closure_state_dir, config.project, args.pr)
     github = GitHubSource(config.repository, args.pr)
     pr = _require_live_pr(github, config)
+    adopted_policy = store.current_policy_adoption(config.repository)
+    if config.review_policy.mode is ReviewPolicyMode.ENFORCED and adopted_policy is None:
+        raise CliInputError("enforced policy requires project policy adoption")
+    if adopted_policy is not None:
+        try:
+            validate_adopted_policy_context(config, adopted_policy)
+        except ConfigValidationError as error:
+            raise CliInputError(
+                "review policy does not match the project's adopted policy: {0}".format(
+                    error
+                )
+            ) from error
     try:
         raw = Path(args.review).read_bytes()
     except OSError as error:
@@ -769,9 +812,18 @@ def cmd_check_policy_activation(config, args) -> int:
         raise CliInputError("projected policy must be enforced")
     staged_digest = configuration_digest(current_data)
     projected_digest = configuration_digest(projected_data)
+    store = RunStore(config.closure_state_dir, config.project, args.pr)
+    previous_adoption = store.current_policy_adoption(config.repository)
+    try:
+        transition_kind = policy_transition_kind(config, previous_adoption)
+    except ConfigValidationError as error:
+        raise CliInputError(str(error)) from error
     try:
         snapshot, decision = _status_snapshot(
-            projected_config, args.pr, require_activation=False
+            projected_config,
+            args.pr,
+            require_activation=False,
+            require_policy_adoption=False,
         )
     except (SourceMalformed, SourceUnavailable, MalformedEvidence) as error:
         payload = _activation_refusal(
@@ -781,7 +833,6 @@ def cmd_check_policy_activation(config, args) -> int:
         )
         sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
         return EXIT_TRANSITION_DENIED
-    store = RunStore(config.closure_state_dir, config.project, args.pr)
     reasons = []
     if snapshot.ci_state.value != "PASSING":
         reasons.append("non_review_ci_not_passing")
@@ -842,6 +893,18 @@ def cmd_check_policy_activation(config, args) -> int:
     if payload["result"] == "ELIGIBLE":
         event = store.record_policy_activation(
             snapshot.local_commit, staged_digest, projected_digest
+        )
+        policy_id, policy_digest = policy_identity(projected_config)
+        store.record_policy_adoption(
+            config.repository,
+            snapshot.local_commit,
+            policy_id=policy_id,
+            policy_digest=policy_digest,
+            staged_config_digest=staged_digest,
+            enforced_config_digest=projected_digest,
+            activation_event_id=event["event_id"],
+            transition_kind=transition_kind,
+            previous_adoption=previous_adoption,
         )
         payload["activation_event_id"] = event["event_id"]
     sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")

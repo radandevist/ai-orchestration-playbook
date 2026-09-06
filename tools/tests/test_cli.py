@@ -14,7 +14,9 @@ from pathlib import Path
 from unittest import mock
 
 from pr_closure.cli import ProjectionFailure, _invoke_adapter
+from pr_closure.contract import configuration_digest, validate_project_config
 from pr_closure.lease import HeavyJobLease
+from pr_closure.policy_lifecycle import policy_identity
 from pr_closure.store import REPAIR_STRATEGY_EVENT, RunStore, StoreError
 from tools.tests.test_policy_config import active_policy_config
 from tools.tests.test_review_policy import v2_record
@@ -510,6 +512,44 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(0, proc.returncode, proc.stderr)
         return config
 
+    def adopt_active_policy_at_tip_a(self):
+        """Exercise the public staged import/activation path at COMMIT_A."""
+        self.set_git(head=COMMIT_A, local=COMMIT_A, remote=COMMIT_A)
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        policy = active_policy_config()
+        config = self.write_config(
+            overrides={
+                "model_routes": policy["model_routes"],
+                "review_policy": policy["review_policy"],
+            }
+        )
+        verification = self.run_cli(
+            "record-verification", "--config", config, "--pr", str(PR)
+        )
+        self.assertEqual(0, verification.returncode, verification.stderr)
+        record = v2_record()
+        record.update(
+            {
+                "repository": REPOSITORY,
+                "pr_number": PR,
+                "reviewed_branch": BRANCH,
+                "reviewed_commit": COMMIT_A,
+            }
+        )
+        self.write_authoritative_v2_provenance(record)
+        review_path = os.path.join(self.root, "adoption-v2.json")
+        self._write_json(review_path, record)
+        imported = self.run_cli(
+            "import-review", "--config", config, "--pr", str(PR), "--review", review_path
+        )
+        self.assertEqual(0, imported.returncode, imported.stderr)
+        activation = self.run_cli(
+            "check-policy-activation", "--config", config, "--pr", str(PR)
+        )
+        self.assertEqual(0, activation.returncode, activation.stderr)
+        self.assertEqual("ELIGIBLE", json.loads(activation.stdout)["result"])
+        return policy, config
+
     def write_follow_up_review(self, verdict="APPROVED_WITH_FOLLOW_UPS", issue_numbers=(101,)):
         findings = [
             {
@@ -726,7 +766,6 @@ class CliExitCodeTests(CliTestCase):
         self.set_git()
         self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
         policy = active_policy_config()
-        policy["review_policy"]["mode"] = "enforced"
         config = self.write_config(
             overrides={
                 "model_routes": policy["model_routes"],
@@ -746,26 +785,62 @@ class CliExitCodeTests(CliTestCase):
         self.assertEqual(0, status.returncode, status.stderr)
         self.assertEqual("UNVERIFIED", json.loads(status.stdout)["state"])
         config_data = json.loads(Path(config).read_text(encoding="utf-8"))
-        projected_digest = hashlib.sha256(
+        staged_digest = hashlib.sha256(
             json.dumps(
                 config_data, sort_keys=True, separators=(",", ":"), ensure_ascii=False
             ).encode("utf-8")
         ).hexdigest()
-        store = RunStore(self.state_dir, PROJECT, PR)
-        store.record_policy_activation(COMMIT_A, "1" * 64, projected_digest)
-        stale_activation = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
-        self.assertEqual("UNVERIFIED", json.loads(stale_activation.stdout)["state"])
-        staged_data = json.loads(json.dumps(config_data))
-        staged_data["review_policy"]["mode"] = "staged"
-        staged_digest = hashlib.sha256(
+        projected_data = json.loads(json.dumps(config_data))
+        projected_data["review_policy"]["mode"] = "enforced"
+        projected_digest = hashlib.sha256(
             json.dumps(
-                staged_data, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                projected_data, sort_keys=True, separators=(",", ":"), ensure_ascii=False
             ).encode("utf-8")
         ).hexdigest()
+        enforced_config = self.write_config(
+            overrides={
+                "model_routes": projected_data["model_routes"],
+                "review_policy": projected_data["review_policy"],
+            },
+            path=os.path.join(self.root, "direct-enforced.json"),
+        )
+        store = RunStore(self.state_dir, PROJECT, PR)
+        store.record_policy_activation(COMMIT_A, "1" * 64, projected_digest)
+        stale_activation = self.run_cli(
+            "status", "--config", enforced_config, "--pr", str(PR), "--json"
+        )
+        self.assertEqual("UNVERIFIED", json.loads(stale_activation.stdout)["state"])
         store.record_policy_activation(COMMIT_A, staged_digest, projected_digest)
-        activated = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        activated_without_adoption = self.run_cli(
+            "status", "--config", enforced_config, "--pr", str(PR), "--json"
+        )
+        self.assertEqual(
+            "UNVERIFIED", json.loads(activated_without_adoption.stdout)["state"]
+        )
+        self.assertIn(
+            "policy_adoption_required",
+            json.loads(activated_without_adoption.stdout)["reasons"],
+        )
+        normalized = validate_project_config(projected_data)
+        policy_id, policy_digest = policy_identity(normalized)
+        activation = store.matching_policy_activation(
+            COMMIT_A, staged_digest, projected_digest
+        )
+        store.record_policy_adoption(
+            REPOSITORY,
+            COMMIT_A,
+            policy_id=policy_id,
+            policy_digest=policy_digest,
+            staged_config_digest=staged_digest,
+            enforced_config_digest=projected_digest,
+            activation_event_id=activation["event_id"],
+            transition_kind="initial-adoption",
+        )
+        activated = self.run_cli(
+            "status", "--config", enforced_config, "--pr", str(PR), "--json"
+        )
         self.assertEqual("APPROVED", json.loads(activated.stdout)["state"])
-        changed_data = json.loads(json.dumps(config_data))
+        changed_data = json.loads(json.dumps(projected_data))
         changed_data["review_policy"]["owner_authorization"] += " changed"
         changed_config = self.write_config(
             overrides={
@@ -778,8 +853,130 @@ class CliExitCodeTests(CliTestCase):
         self.assertEqual("UNVERIFIED", json.loads(changed.stdout)["state"])
         self.set_git(head=COMMIT_B)
         self.set_gh(headRefOid=COMMIT_B, statusCheckRollup=PASSING_ROLLUP)
-        changed_tip = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        changed_tip = self.run_cli(
+            "status", "--config", enforced_config, "--pr", str(PR), "--json"
+        )
         self.assertEqual(3, changed_tip.returncode)
+
+    def test_enforced_import_requires_project_policy_adoption(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        policy = active_policy_config()
+        policy["review_policy"]["mode"] = "enforced"
+        config = self.write_config(
+            overrides={
+                "model_routes": policy["model_routes"],
+                "review_policy": policy["review_policy"],
+            }
+        )
+        verification = self.run_cli(
+            "record-verification", "--config", config, "--pr", str(PR)
+        )
+        self.assertEqual(0, verification.returncode, verification.stderr)
+        record = v2_record()
+        record.update(
+            {
+                "repository": REPOSITORY,
+                "pr_number": PR,
+                "reviewed_branch": BRANCH,
+                "reviewed_commit": COMMIT_A,
+            }
+        )
+        self.write_authoritative_v2_provenance(record)
+        review_path = os.path.join(self.root, "enforced-without-adoption.json")
+        self._write_json(review_path, record)
+
+        imported = self.run_cli(
+            "import-review", "--config", config, "--pr", str(PR), "--review", review_path
+        )
+        self.assertEqual(2, imported.returncode)
+
+    def test_enforced_policy_requires_the_adopted_enforced_config_digest(self):
+        policy, staged_config = self.adopt_active_policy_at_tip_a()
+        self.set_git(head=COMMIT_A, local=COMMIT_A, remote=COMMIT_A)
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+
+        changed_staged = json.loads(Path(staged_config).read_text(encoding="utf-8"))
+        changed_staged["closure_acceptance_commands"] = ["true # changed policy context"]
+        changed_staged_config = self.write_config(
+            overrides={
+                "model_routes": changed_staged["model_routes"],
+                "review_policy": changed_staged["review_policy"],
+                "closure_acceptance_commands": changed_staged[
+                    "closure_acceptance_commands"
+                ],
+            },
+            path=os.path.join(self.root, "changed-staged.json"),
+        )
+        changed_enforced = json.loads(json.dumps(changed_staged))
+        changed_enforced["review_policy"]["mode"] = "enforced"
+        changed_enforced_config = self.write_config(
+            overrides={
+                "model_routes": changed_enforced["model_routes"],
+                "review_policy": changed_enforced["review_policy"],
+                "closure_acceptance_commands": changed_enforced[
+                    "closure_acceptance_commands"
+                ],
+            },
+            path=os.path.join(self.root, "changed-enforced-context.json"),
+        )
+        verification = self.run_cli(
+            "record-verification", "--config", changed_staged_config, "--pr", str(PR)
+        )
+        self.assertEqual(0, verification.returncode, verification.stderr)
+        store = RunStore(self.state_dir, PROJECT, PR)
+        store.record_policy_activation(
+            COMMIT_A,
+            configuration_digest(changed_staged),
+            configuration_digest(changed_enforced),
+        )
+
+        status = self.run_cli(
+            "status", "--config", changed_enforced_config, "--pr", str(PR), "--json"
+        )
+        self.assertEqual(0, status.returncode, status.stderr)
+        self.assertEqual("UNVERIFIED", json.loads(status.stdout)["state"])
+
+    def test_policy_removal_rejects_legacy_claude_import_after_public_adoption(self):
+        self.adopt_active_policy_at_tip_a()
+        self.set_git(head=COMMIT_B, local=COMMIT_B, remote=COMMIT_B)
+        self.set_gh(headRefOid=COMMIT_B, statusCheckRollup=PASSING_ROLLUP)
+        disabled_config = self.write_config()
+        verification = self.run_cli(
+            "record-verification", "--config", disabled_config, "--pr", str(PR)
+        )
+        self.assertEqual(0, verification.returncode, verification.stderr)
+        legacy_path = self.write_review(commit=COMMIT_B)
+        imported = self.run_cli(
+            "import-review",
+            "--config", disabled_config,
+            "--pr", str(PR),
+            "--review", legacy_path,
+        )
+        self.assertEqual(2, imported.returncode, imported.stderr)
+        self.assertFalse(
+            Path(self.state_dir, PROJECT, str(PR), "reviews", COMMIT_B, "review.json").exists()
+        )
+
+    def test_policy_removal_cannot_make_preexisting_legacy_claude_review_approved(self):
+        self.adopt_active_policy_at_tip_a()
+        self.set_git(head=COMMIT_B, local=COMMIT_B, remote=COMMIT_B)
+        self.set_gh(headRefOid=COMMIT_B, statusCheckRollup=PASSING_ROLLUP)
+        disabled_config = self.write_config()
+        verification = self.run_cli(
+            "record-verification", "--config", disabled_config, "--pr", str(PR)
+        )
+        self.assertEqual(0, verification.returncode, verification.stderr)
+        legacy_path = self.write_review(commit=COMMIT_B)
+        store = RunStore(self.state_dir, PROJECT, PR)
+        store.write_review(COMMIT_B, "legacy", json.loads(Path(legacy_path).read_text()))
+        status = self.run_cli(
+            "status", "--config", disabled_config, "--pr", str(PR), "--json"
+        )
+        self.assertEqual(0, status.returncode, status.stderr)
+        payload = json.loads(status.stdout)
+        self.assertEqual("UNVERIFIED", payload["state"])
+        self.assertNotEqual("APPROVED", payload["review_verdict"])
 
     def test_activation_consumes_projected_state_and_rejects_blocking_review(self):
         self.set_git()
@@ -881,7 +1078,7 @@ class CliExitCodeTests(CliTestCase):
         activation_payload = json.loads(activation.stdout)
         self.assertEqual("ELIGIBLE", activation_payload["result"])
         self.assertEqual(COMMIT_A, activation_payload["commit"])
-        self.assertEqual("policy_activation", self.read_events()[-1]["event_type"])
+        self.assertEqual("policy_adoption", self.read_events()[-1]["event_type"])
         staged = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
         self.assertEqual(0, staged.returncode, staged.stderr)
         staged_payload = json.loads(staged.stdout)
