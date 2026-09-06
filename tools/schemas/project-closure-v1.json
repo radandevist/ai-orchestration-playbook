@@ -3,7 +3,7 @@
   "$id": "https://ai-orchestration-playbook/schemas/project-closure-v1.json",
   "title": "PR Closure Project Configuration",
   "description": "Fail-closed versioned project configuration for the PR closure gate. Path safety and component rules JSON Schema cannot express are enforced in Python.",
-  "$comment": "Generated from tools/pr_closure/contract.py by PYTHONPATH=tools python3 -m pr_closure.contract - never hand-edit. Residual semantics JSON Schema cannot express are enforced in Python and are documented verbatim: exact_integer_types: integer-valued JSON numbers such as schema_version 1.0, infra_retry_budget 1.0, heavy_job_limit 1.0, or verification_command_timeout_seconds 1.0 satisfy JSON Schema integer/const semantics, while the Python gate requires exact int values and rejects floats and booleans.; forbidden_temporary_paths: repo_path and closure_state_dir must resolve to durable absolute paths outside /tmp and the session job area; JSON Schema can only express the leading-slash requirement, so this schema accepts /tmp roots the Python gate rejects.; unsafe_project_component: the project name must be a single safe path component (no slash, backslash, NUL, or surrounding whitespace, and not '.' or '..'); JSON Schema cannot exclude '.'/'..'/NUL, so this schema accepts spellings the Python gate rejects.; nul_command_string: configured command strings must not contain NUL bytes because the subprocess argv contract cannot carry them; JSON Schema's \\S pattern accepts NUL, so this schema accepts spellings the Python gate rejects.; project_model_registry: canonical model and launcher-registry membership for project routes is a Python registry lookup; JSON Schema can constrain exact spelling shape but cannot reject an unknown model or endpoint identity.; project_route_policy: project route uniqueness, same-family exception concordance, forbidden reviewer families, and staged/enforced cross-object policy relations are Python checks; JSON Schema cannot compare those normalized values.",
+  "$comment": "Generated from tools/pr_closure/contract.py by PYTHONPATH=tools python3 -m pr_closure.contract - never hand-edit. Residual semantics JSON Schema cannot express are enforced in Python and are documented verbatim: exact_integer_types: integer-valued JSON numbers such as schema_version 1.0, infra_retry_budget 1.0, heavy_job_limit 1.0, or verification_command_timeout_seconds 1.0 satisfy JSON Schema integer/const semantics, while the Python gate requires exact int values and rejects floats and booleans.; forbidden_temporary_paths: repo_path and closure_state_dir must resolve to durable absolute paths outside /tmp and the session job area; JSON Schema can only express the leading-slash requirement, so this schema accepts /tmp roots the Python gate rejects.; unsafe_project_component: the project name must be a single safe path component (no slash, backslash, NUL, or surrounding whitespace, and not '.' or '..'); JSON Schema cannot exclude '.'/'..'/NUL, so this schema accepts spellings the Python gate rejects.; nul_command_string: configured command strings must not contain NUL bytes because the subprocess argv contract cannot carry them; JSON Schema's \\S pattern accepts NUL, so this schema accepts spellings the Python gate rejects.; project_model_registry: canonical model and launcher-registry membership for project routes is a Python registry lookup; JSON Schema can constrain exact spelling shape but cannot reject an unknown model or endpoint identity.; project_route_policy: project route uniqueness, same-family exception concordance, forbidden reviewer families, and staged/enforced cross-object policy relations are Python checks; JSON Schema cannot compare those normalized values.; ci_live_checks_subset: ci_live_pr_checks must be a subset of ci_required_checks; JSON Schema cannot express a dynamic array-subset relationship, so it validates the member shape and uniqueness while Python enforces the cross-field subset.",
   "type": "object",
   "required": [
     "schema_version",
@@ -18,7 +18,10 @@
     "stagnation_budget_minutes",
     "heavy_job_limit",
     "verification_command_timeout_seconds",
-    "tracking_projection"
+    "tracking_projection",
+    "ci_live_pr_checks",
+    "ci_required_checks_source",
+    "ci_live_pr_workflow"
   ],
   "additionalProperties": false,
   "properties": {
@@ -98,6 +101,51 @@
         "pattern": "\\S"
       },
       "uniqueItems": true
+    },
+    "ci_live_pr_checks": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      },
+      "uniqueItems": true
+    },
+    "ci_required_checks_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pull_request",
+        "merge_group",
+        "push"
+      ],
+      "properties": {
+        "pull_request": {
+          "const": "candidate_tip"
+        },
+        "merge_group": {
+          "const": "event_tip"
+        },
+        "push": {
+          "const": "event_tip"
+        }
+      }
+    },
+    "ci_live_pr_workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "action"
+      ],
+      "properties": {
+        "path": {
+          "const": ".github/workflows/ci.yml"
+        },
+        "action": {
+          "const": "pull_request"
+        }
+      }
     },
     "model_routes": {
       "type": "array",

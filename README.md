@@ -171,6 +171,16 @@ expose it on `PATH`:
 ln -s "$HOME/ai-orchestration-playbook/tools/pr-closure" ~/.local/bin/pr-closure
 ```
 
+For pull-request closure, the project config is resolved from
+`.ai/project-closure-v1.json` at the live `headRefOid` through GitHub Contents API and
+bound to the matching git-tree blob. Its `ci_required_checks`, `ci_live_pr_checks`, exact
+candidate-tip/event-tip source mapping, and fixed live workflow identity are authoritative;
+the checked-out or default-branch config is never a fallback. Required check-runs are read
+from every page of the exact-head `filter=all` collection and must carry GitHub Actions
+workflow provenance. Live checks additionally require the run-scoped
+`ci-pr-snapshot-<run>-<attempt>` artifact to match the current PR head, base, potential
+merge commit, body hash, draft state, workflow, run, and attempt.
+
 ### Status
 
 ```bash

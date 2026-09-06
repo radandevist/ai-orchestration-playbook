@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
 import subprocess
+import tempfile
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
+from pathlib import Path
 from enum import StrEnum
 from typing import Callable, Mapping, Optional, Sequence, Tuple
 
@@ -517,7 +522,7 @@ class WorktreeResolver:
 
 PR_JSON_FIELDS = (
     "number,headRefName,headRefOid,isDraft,state,mergeStateStatus,mergeable,"
-    "statusCheckRollup,url,baseRefName"
+    "statusCheckRollup,url,baseRefName,body,potentialMergeCommit"
 )
 _REQUIRED_PR_KEYS = (
     "number",
@@ -530,6 +535,8 @@ _REQUIRED_PR_KEYS = (
     "statusCheckRollup",
     "url",
     "baseRefName",
+    "body",
+    "potentialMergeCommit",
 )
 PR_STATES = frozenset({"OPEN", "CLOSED", "MERGED"})
 PR_CHECK_NODE_TYPES = frozenset({"CheckRun", "StatusContext", "CheckSuite"})
@@ -564,6 +571,77 @@ class CheckResult:
     conclusion: Optional[str]  # raw conclusion; None when not completed
     outcome: CheckOutcome
     details_url: Optional[str] = None
+    check_run_id: Optional[int] = None
+    head_sha: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    app_slug: Optional[str] = None
+    check_suite_id: Optional[int] = None
+    workflow_run_id: Optional[int] = None
+    workflow_id: Optional[int] = None
+    workflow_path: Optional[str] = None
+    workflow_action: Optional[str] = None
+    workflow_event: Optional[str] = None
+    run_attempt: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class CheckRunCandidate:
+    result: Optional[CheckResult]
+    name: Optional[str] = None
+    error: Optional[str] = None
+
+    def __post_init__(self):
+        if self.name is None and self.result is not None:
+            object.__setattr__(self, "name", self.result.name)
+
+
+@dataclass(frozen=True)
+class LivePrSnapshot:
+    pr_number: int
+    head_sha: str
+    base_ref_name: str
+    potential_merge_commit_oid: str
+    body_sha256: str
+    is_draft: bool
+    event_name: str
+    event_sha: str
+    workflow_path: str
+    workflow_id: int
+    workflow_action: str
+    run_id: int
+    run_attempt: int
+
+    def matches_live(
+        self,
+        *,
+        pr_number: int,
+        head_sha: str,
+        base_ref_name: str,
+        potential_merge_commit_oid: str,
+        body: str,
+        is_draft: bool,
+        workflow_path: str,
+        workflow_id: int,
+        workflow_action: str,
+        run_id: int,
+        run_attempt: int,
+    ) -> bool:
+        return (
+            self.pr_number == pr_number
+            and self.head_sha == head_sha
+            and self.base_ref_name == base_ref_name
+            and self.potential_merge_commit_oid == potential_merge_commit_oid
+            and self.body_sha256 == hashlib.sha256(body.encode("utf-8")).hexdigest()
+            and self.is_draft is is_draft
+            and self.event_name == "pull_request"
+            and self.event_sha == potential_merge_commit_oid
+            and self.workflow_path == workflow_path
+            and self.workflow_id == workflow_id
+            and self.workflow_action == workflow_action
+            and self.run_id == run_id
+            and self.run_attempt == run_attempt
+        )
 
 
 @dataclass(frozen=True)
@@ -579,6 +657,8 @@ class PullRequestFacts:
     mergeable: MergeableState
     url: str
     checks: Tuple[CheckResult, ...]
+    body: str = ""
+    potential_merge_commit_oid: Optional[str] = None
 
     def __post_init__(self):
         object.__setattr__(self, "checks", tuple(self.checks))
@@ -591,10 +671,145 @@ class CiFacts:
     ci_commit: str
     infra_job: Optional[str] = None
     reasons: Tuple[str, ...] = ()
+    check_run_id: Optional[int] = None
+    check_suite_id: Optional[int] = None
+    head_sha: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    app_slug: Optional[str] = None
+    base_ref_name: Optional[str] = None
+    potential_merge_commit_oid: Optional[str] = None
+    event_sha: Optional[str] = None
+    workflow_path: Optional[str] = None
+    workflow_id: Optional[int] = None
+    workflow_action: Optional[str] = None
+    workflow_event: Optional[str] = None
+    workflow_run_id: Optional[int] = None
+    run_attempt: Optional[int] = None
+    snapshot_body_sha256: Optional[str] = None
 
     def __post_init__(self):
         object.__setattr__(self, "checks", tuple(self.checks))
         object.__setattr__(self, "reasons", tuple(self.reasons))
+
+
+def _timestamp_key(value: str) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("timestamp must be a non-empty string")
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp must include a timezone")
+    return parsed
+
+
+def select_check_run_candidates(
+    candidates: Sequence[CheckRunCandidate],
+    required_checks: Sequence[str],
+    *,
+    head_oid: str,
+) -> CiFacts:
+    """Select exact-head check runs deterministically, fail closed on ambiguity."""
+    head_oid = _require_commit(head_oid, "PR head", ())
+    selected = []
+    failures = []
+    pending = []
+    reasons = []
+    for name in tuple(required_checks):
+        matching = [candidate for candidate in candidates if candidate.name == name]
+        if not matching:
+            reasons.append("required check {0} missing".format(name))
+            continue
+        malformed = [candidate.error for candidate in matching if candidate.error]
+        if malformed:
+            reasons.append(
+                "required check {0} has malformed candidate: {1}".format(
+                    name, "; ".join(str(error) for error in malformed)
+                )
+            )
+            continue
+        results = [candidate.result for candidate in matching]
+        if any(result is None for result in results):
+            reasons.append("required check {0} has malformed candidate".format(name))
+            continue
+        check_ids = [result.check_run_id for result in results]
+        if len(set(check_ids)) != len(check_ids):
+            reasons.append(
+                "required check {0} has duplicate check-run identity".format(name)
+            )
+            continue
+        try:
+            starts = [_timestamp_key(result.started_at) for result in results]
+        except (TypeError, ValueError) as error:
+            reasons.append("required check {0} has malformed candidate: {1}".format(name, error))
+            continue
+        latest_start = max(starts)
+        latest = [
+            result for result, started in zip(results, starts) if started == latest_start
+        ]
+        suites = {result.check_suite_id for result in latest}
+        if len(suites) > 1:
+            reasons.append(
+                "required check {0} has ambiguous concurrent runs".format(name)
+            )
+            continue
+        try:
+            selected_result = max(
+                latest,
+                key=lambda result: (
+                    _timestamp_key(result.completed_at)
+                    if result.completed_at is not None
+                    else datetime.min.replace(tzinfo=latest_start.tzinfo),
+                    result.check_run_id or -1,
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            reasons.append("required check {0} has malformed candidate: {1}".format(name, error))
+            continue
+        selected.append(selected_result)
+        if selected_result.head_sha != head_oid:
+            reasons.append(
+                "required check {0} candidate head does not match PR head".format(name)
+            )
+        elif selected_result.status != "COMPLETED":
+            pending.append(name)
+            reasons.append("required check {0} is pending".format(name))
+        elif selected_result.outcome is CheckOutcome.PASSING:
+            continue
+        elif selected_result.outcome is CheckOutcome.FAILURE:
+            failures.append(name)
+            reasons.append("required check {0} failed".format(name))
+        else:
+            reasons.append(
+                "required check {0} completed without SUCCESS".format(name)
+            )
+    if failures:
+        state = CiState.BRANCH_FAILURE
+    elif pending or reasons:
+        state = CiState.UNKNOWN
+    elif selected and len(selected) == len(tuple(required_checks)):
+        state = CiState.PASSING
+    else:
+        state = CiState.UNKNOWN
+    first = selected[0] if selected else None
+    return CiFacts(
+        ci_state=state,
+        checks=tuple(selected),
+        ci_commit=head_oid,
+        reasons=tuple(reasons) if reasons else ("all required checks passing",),
+        check_run_id=first.check_run_id if first else None,
+        check_suite_id=first.check_suite_id if first else None,
+        head_sha=first.head_sha if first else None,
+        started_at=first.started_at if first else None,
+        completed_at=first.completed_at if first else None,
+        app_slug=first.app_slug if first else None,
+        workflow_path=first.workflow_path if first else None,
+        workflow_id=first.workflow_id if first else None,
+        workflow_action=first.workflow_action if first else None,
+        workflow_event=first.workflow_event if first else None,
+        workflow_run_id=first.workflow_run_id if first else None,
+        run_attempt=first.run_attempt if first else None,
+    )
 
 
 def _classify_check(node_type: str, status: str, conclusion) -> CheckOutcome:
@@ -747,6 +962,77 @@ def _require_pr_url(value, repository: str, number: int, argv) -> str:
     return _require_github_url(value, repository, number, "pull", argv)
 
 
+def _require_positive_int(value, label: str, argv) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise SourceMalformed(
+            "{0} must be a positive integer for: {1}".format(label, _describe_command(argv))
+        )
+    return value
+
+
+def _flatten_api_pages(data, label: str, argv) -> Tuple[dict, ...]:
+    """Normalize gh api --paginate --slurp output to object pages."""
+    if isinstance(data, dict):
+        return (data,)
+    if not isinstance(data, list) or not data:
+        raise SourceMalformed(
+            "{0} must be a non-empty object/page array for: {1}".format(
+                label, _describe_command(argv)
+            )
+        )
+    if all(isinstance(page, dict) for page in data):
+        return tuple(data)
+    pages = []
+    for page in data:
+        if not isinstance(page, dict):
+            raise SourceMalformed(
+                "{0} page must be an object for: {1}".format(
+                    label, _describe_command(argv)
+                )
+            )
+        pages.append(page)
+    return tuple(pages)
+
+
+def _parse_actions_run_id(details_url: str, repository: str, argv) -> int:
+    if not isinstance(details_url, str) or not details_url.strip():
+        raise SourceMalformed(
+            "check-run details_url must be a non-empty string for: {0}".format(
+                _describe_command(argv)
+            )
+        )
+    try:
+        parsed = urllib.parse.urlsplit(details_url)
+    except ValueError as error:
+        raise SourceMalformed(
+            "check-run details_url is malformed for: {0}".format(_describe_command(argv))
+        ) from error
+    expected_prefix = "/{0}/actions/runs/".format(repository)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "github.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.startswith(expected_prefix)
+    ):
+        raise SourceMalformed(
+            "check-run details_url must identify one github actions workflow run for: {0}".format(
+                _describe_command(argv)
+            )
+        )
+    remainder = parsed.path[len(expected_prefix):]
+    match = re.fullmatch(r"([0-9]+)(?:/.*)?", remainder)
+    if match is None:
+        raise SourceMalformed(
+            "check-run details_url must carry a numeric workflow-run id for: {0}".format(
+                _describe_command(argv)
+            )
+        )
+    return _require_positive_int(int(match.group(1)), "workflow run id", argv)
+
+
 class GitHubSource:
     """Fail-closed reader for one pull request via ``gh pr view``.
 
@@ -756,7 +1042,14 @@ class GitHubSource:
     or a malformed status check rollup raises a typed source error.
     """
 
-    def __init__(self, repository, pr_number, runner: Optional[Runner] = None, timeout=None):
+    def __init__(
+        self,
+        repository,
+        pr_number,
+        runner: Optional[Runner] = None,
+        timeout=None,
+        artifact_reader: Optional[Callable[[int, str], Mapping]] = None,
+    ):
         if not isinstance(repository, str) or _REPOSITORY_RE.fullmatch(repository) is None:
             raise SourceMalformed("repository must look like owner/repo: {0!r}".format(repository))
         if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number < 1:
@@ -765,6 +1058,7 @@ class GitHubSource:
         self._pr_number = pr_number
         self._runner = runner or default_runner
         self._timeout = timeout
+        self._artifact_reader = artifact_reader
 
     @property
     def repository(self) -> str:
@@ -824,6 +1118,23 @@ class GitHubSource:
             raise SourceMalformed(
                 "statusCheckRollup must be a JSON array for: {0}".format(_describe_command(argv))
             )
+        body = data["body"]
+        if body is None:
+            body = ""
+        if not isinstance(body, str):
+            raise SourceMalformed(
+                "body must be a string or null for: {0}".format(_describe_command(argv))
+            )
+        potential_merge = data["potentialMergeCommit"]
+        if not isinstance(potential_merge, Mapping):
+            raise SourceMalformed(
+                "potentialMergeCommit must be a non-null object for: {0}".format(
+                    _describe_command(argv)
+                )
+            )
+        potential_merge_oid = _require_commit(
+            potential_merge.get("oid"), "potentialMergeCommit.oid", argv
+        )
         checks = tuple(parse_check(node, argv) for node in rollup)
         return PullRequestFacts(
             repository=self._repository,
@@ -837,6 +1148,466 @@ class GitHubSource:
             mergeable=mergeable,
             url=url,
             checks=checks,
+            body=body,
+            potential_merge_commit_oid=potential_merge_oid,
+        )
+
+    def _api_json(self, endpoint: str, *, paginate: bool = False, label: str = "gh api"):
+        argv = ["gh", "api", "--repo", self._repository]
+        if paginate:
+            argv.extend(["--paginate", "--slurp"])
+        argv.append(endpoint)
+        argv = tuple(argv)
+        _, stdout, _ = _invoke(argv, self._timeout, self._runner)
+        return _parse_json_object(stdout, argv, label) if not paginate else json.loads(
+            _require_non_blank(stdout, argv, label)
+        )
+
+    def read_candidate_tip_config(
+        self,
+        head_oid: str,
+        path: str = ".ai/project-closure-v1.json",
+    ) -> Mapping:
+        """Read and bind the closure config to one exact candidate-tip blob."""
+        head_oid = _require_commit(head_oid, "candidate tip", ())
+        if path != ".ai/project-closure-v1.json":
+            raise SourceMalformed("candidate-tip config path is fixed")
+        encoded_path = urllib.parse.quote(path, safe="/")
+        content_endpoint = (
+            "repos/{0}/contents/{1}?ref={2}".format(
+                self._repository, encoded_path, head_oid
+            )
+        )
+        content = self._api_json(content_endpoint, label="GitHub Contents API")
+        content_path = content.get("path")
+        if content_path != path:
+            raise SourceMalformed("candidate-tip Contents response path mismatch")
+        content_sha = _require_commit(content.get("sha"), "candidate-tip blob sha", ())
+        encoding = content.get("encoding")
+        encoded = content.get("content")
+        if encoding != "base64" or not isinstance(encoded, str) or not encoded.strip():
+            raise SourceMalformed("candidate-tip Contents response lacks base64 content")
+        try:
+            decoded = base64.b64decode("".join(encoded.split()), validate=True)
+            raw = json.loads(decoded.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise SourceMalformed("candidate-tip closure config is not valid JSON") from error
+        if not isinstance(raw, Mapping):
+            raise SourceMalformed("candidate-tip closure config must be a JSON object")
+
+        tree_endpoint = "repos/{0}/git/trees/{1}?recursive=1".format(
+            self._repository, head_oid
+        )
+        tree = self._api_json(tree_endpoint, label="GitHub git tree API")
+        entries = tree.get("tree")
+        if not isinstance(entries, list) or tree.get("truncated") is not False:
+            raise SourceMalformed("candidate-tip git tree is missing or truncated")
+        matches = [
+            entry
+            for entry in entries
+            if isinstance(entry, Mapping)
+            and entry.get("path") == path
+            and entry.get("type") == "blob"
+        ]
+        if len(matches) != 1:
+            raise SourceMalformed("candidate-tip git tree does not identify exactly one config blob")
+        tree_sha = _require_commit(matches[0].get("sha"), "candidate-tip tree blob sha", ())
+        if tree_sha != content_sha:
+            raise SourceMalformed("candidate-tip Contents/tree blob identity mismatch")
+        return raw
+
+    def _workflow_id(self, path: str) -> int:
+        endpoint = "repos/{0}/actions/workflows/{1}".format(
+            self._repository, urllib.parse.quote(path, safe="/")
+        )
+        data = self._api_json(endpoint, label="GitHub workflow API")
+        workflow_path = data.get("path")
+        if workflow_path != path:
+            raise SourceMalformed("configured workflow path does not match GitHub workflow")
+        return _require_positive_int(data.get("id"), "workflow id", ())
+
+    def _workflow_run(self, run_id: int) -> Mapping:
+        endpoint = "repos/{0}/actions/runs/{1}".format(self._repository, run_id)
+        data = self._api_json(endpoint, label="GitHub workflow-run API")
+        if _require_positive_int(data.get("id"), "workflow run id", ()) != run_id:
+            raise SourceMalformed("workflow-run identity mismatch")
+        return data
+
+    def _check_run_candidate(
+        self,
+        raw: Mapping,
+        *,
+        head_oid: str,
+        workflow_path: str,
+        workflow_action: str,
+        workflow_id: int,
+    ) -> CheckRunCandidate:
+        name = raw.get("name") if isinstance(raw.get("name"), str) else "<malformed>"
+        try:
+            check_id = _require_positive_int(raw.get("id"), "check-run id", ())
+            run_head = _require_commit(raw.get("head_sha"), "check-run head_sha", ())
+            status = raw.get("status")
+            if not isinstance(status, str):
+                raise SourceMalformed("check-run status is missing")
+            status = status.upper()
+            if status not in CHECK_RUN_STATUSES:
+                raise SourceMalformed("unsupported check-run status: {0!r}".format(status))
+            conclusion = raw.get("conclusion")
+            if conclusion is not None:
+                if not isinstance(conclusion, str):
+                    raise SourceMalformed("check-run conclusion is malformed")
+                conclusion = conclusion.upper()
+                if conclusion not in CHECK_CONCLUSIONS:
+                    raise SourceMalformed(
+                        "unsupported check-run conclusion: {0!r}".format(conclusion)
+                    )
+            if status == "COMPLETED" and conclusion is None:
+                raise SourceMalformed("completed check-run lacks conclusion")
+            started_at = raw.get("started_at")
+            _timestamp_key(started_at)
+            completed_at = raw.get("completed_at")
+            if status == "COMPLETED":
+                _timestamp_key(completed_at)
+            elif completed_at is not None:
+                _timestamp_key(completed_at)
+            details_url = raw.get("details_url")
+            run_id = _parse_actions_run_id(details_url, self._repository, ())
+            app = raw.get("app")
+            if not isinstance(app, Mapping) or app.get("slug") != "github-actions":
+                raise SourceMalformed("candidate app slug is not github-actions")
+            suite = raw.get("check_suite")
+            if not isinstance(suite, Mapping):
+                raise SourceMalformed("candidate check-suite identity is missing")
+            suite_id = _require_positive_int(suite.get("id"), "check-suite id", ())
+            workflow = self._workflow_run(run_id)
+            if _require_positive_int(workflow.get("workflow_id"), "workflow id", ()) != workflow_id:
+                raise SourceMalformed("workflow id mismatch")
+            if workflow.get("path") != workflow_path:
+                raise SourceMalformed("workflow path mismatch")
+            if workflow.get("event") != workflow_action:
+                raise SourceMalformed("workflow event/action mismatch")
+            workflow_head = _require_commit(workflow.get("head_sha"), "workflow-run head_sha", ())
+            if run_head != head_oid or workflow_head != head_oid:
+                raise SourceMalformed("workflow/check candidate head does not match PR head")
+            run_attempt = _require_positive_int(workflow.get("run_attempt"), "run attempt", ())
+            if _require_positive_int(workflow.get("id"), "workflow run id", ()) != run_id:
+                raise SourceMalformed("workflow-run id mismatch")
+            outcome = _classify_check("check_run", status, conclusion)
+            return CheckRunCandidate(
+                result=CheckResult(
+                    "check_run",
+                    name,
+                    status,
+                    conclusion,
+                    outcome,
+                    details_url,
+                    check_run_id=check_id,
+                    head_sha=run_head,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                    app_slug=app.get("slug"),
+                    check_suite_id=suite_id,
+                    workflow_run_id=run_id,
+                    workflow_id=workflow_id,
+                    workflow_path=workflow_path,
+                    workflow_action=workflow_action,
+                    workflow_event=workflow.get("event"),
+                    run_attempt=run_attempt,
+                )
+            )
+        except (SourceMalformed, TypeError, ValueError) as error:
+            return CheckRunCandidate(result=None, name=name, error=str(error))
+
+    def read_check_run_candidates(
+        self,
+        head_oid: str,
+        *,
+        workflow_path: str,
+        workflow_action: str,
+    ) -> Tuple[CheckRunCandidate, ...]:
+        head_oid = _require_commit(head_oid, "PR head", ())
+        workflow_id = self._workflow_id(workflow_path)
+        endpoint = (
+            "repos/{0}/commits/{1}/check-runs?filter=all&per_page=100".format(
+                self._repository, head_oid
+            )
+        )
+        argv = (
+            "gh",
+            "api",
+            "--repo",
+            self._repository,
+            "--paginate",
+            "--slurp",
+            endpoint,
+        )
+        _, stdout, _ = _invoke(argv, self._timeout, self._runner)
+        try:
+            pages = json.loads(_require_non_blank(stdout, argv, "GitHub check-runs API"))
+        except json.JSONDecodeError as error:
+            raise SourceMalformed("GitHub check-runs API returned malformed JSON") from error
+        if isinstance(pages, Mapping):
+            pages = [pages]
+        if not isinstance(pages, list) or not pages:
+            raise SourceMalformed("GitHub check-runs API returned no pages")
+        candidates = []
+        for page in pages:
+            if not isinstance(page, Mapping) or not isinstance(page.get("check_runs"), list):
+                raise SourceMalformed("GitHub check-runs API page is malformed")
+            for raw in page["check_runs"]:
+                if not isinstance(raw, Mapping):
+                    raise SourceMalformed("GitHub check-runs API contains a non-object candidate")
+                candidates.append(
+                    self._check_run_candidate(
+                        raw,
+                        head_oid=head_oid,
+                        workflow_path=workflow_path,
+                        workflow_action=workflow_action,
+                        workflow_id=workflow_id,
+                    )
+                )
+        return tuple(candidates)
+
+    def _read_run_artifacts(self, run_id: int) -> Tuple[Mapping, ...]:
+        endpoint = "repos/{0}/actions/runs/{1}/artifacts?per_page=100".format(
+            self._repository, run_id
+        )
+        argv = (
+            "gh",
+            "api",
+            "--repo",
+            self._repository,
+            "--paginate",
+            "--slurp",
+            endpoint,
+        )
+        _, stdout, _ = _invoke(argv, self._timeout, self._runner)
+        try:
+            pages = json.loads(_require_non_blank(stdout, argv, "GitHub artifacts API"))
+        except json.JSONDecodeError as error:
+            raise SourceMalformed("GitHub artifacts API returned malformed JSON") from error
+        if isinstance(pages, Mapping):
+            pages = [pages]
+        if not isinstance(pages, list) or not pages:
+            raise SourceMalformed("GitHub artifacts API returned no pages")
+        artifacts = []
+        for page in pages:
+            if not isinstance(page, Mapping) or not isinstance(page.get("artifacts"), list):
+                raise SourceMalformed("GitHub artifacts API page is malformed")
+            for artifact in page["artifacts"]:
+                if not isinstance(artifact, Mapping):
+                    raise SourceMalformed("GitHub artifacts API contains a non-object artifact")
+                artifacts.append(artifact)
+        return tuple(artifacts)
+
+    def _download_snapshot_record(self, run_id: int, artifact_name: str) -> Mapping:
+        if self._artifact_reader is not None:
+            record = self._artifact_reader(run_id, artifact_name)
+            if isinstance(record, str):
+                try:
+                    record = json.loads(record)
+                except json.JSONDecodeError as error:
+                    raise SourceMalformed("snapshot artifact contains malformed JSON") from error
+            if not isinstance(record, Mapping):
+                raise SourceMalformed("snapshot artifact must contain one JSON object")
+            return record
+        with tempfile.TemporaryDirectory(prefix="pr-closure-artifact-") as directory:
+            argv = (
+                "gh",
+                "run",
+                "download",
+                str(run_id),
+                "--repo",
+                self._repository,
+                "--name",
+                artifact_name,
+                "--dir",
+                directory,
+            )
+            _, stdout, _ = _invoke(argv, self._timeout, self._runner)
+            files = []
+            for root, _dirs, names in os.walk(directory):
+                for name in names:
+                    path = os.path.join(root, name)
+                    if os.path.isfile(path):
+                        files.append(path)
+            if not files and stdout.strip().startswith("{"):
+                try:
+                    record = json.loads(stdout)
+                except json.JSONDecodeError as error:
+                    raise SourceMalformed("snapshot artifact contains malformed JSON") from error
+                if not isinstance(record, Mapping):
+                    raise SourceMalformed("snapshot artifact must contain one JSON object")
+                return record
+            if len(files) != 1:
+                raise SourceMalformed("snapshot artifact must contain exactly one file")
+            try:
+                raw = Path(files[0]).read_text(encoding="utf-8")
+                record = json.loads(raw)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise SourceMalformed("snapshot artifact contains malformed JSON") from error
+            if not isinstance(record, Mapping):
+                raise SourceMalformed("snapshot artifact must contain one JSON object")
+            return record
+
+    def _read_snapshot(self, run_id: int, run_attempt: int) -> LivePrSnapshot:
+        name = "ci-pr-snapshot-{0}-{1}".format(run_id, run_attempt)
+        artifacts = self._read_run_artifacts(run_id)
+        matches = [
+            artifact
+            for artifact in artifacts
+            if artifact.get("name") == name
+        ]
+        if len(matches) != 1:
+            raise SourceMalformed(
+                "snapshot artifact {0} must resolve exactly once".format(name)
+            )
+        artifact_id = _require_positive_int(matches[0].get("id"), "artifact id", ())
+        if matches[0].get("expired") is True:
+            raise SourceMalformed("snapshot artifact {0} is expired".format(name))
+        record = self._download_snapshot_record(run_id, name)
+        expected = {
+            "pr_number",
+            "head_sha",
+            "base_ref_name",
+            "potential_merge_commit_oid",
+            "body_sha256",
+            "is_draft",
+            "event_name",
+            "event_sha",
+            "workflow_path",
+            "workflow_id",
+            "workflow_action",
+            "run_id",
+            "run_attempt",
+        }
+        if set(record) != expected:
+            raise SourceMalformed("snapshot artifact has an unexpected JSON shape")
+        if (
+            not isinstance(record["pr_number"], int)
+            or isinstance(record["pr_number"], bool)
+            or record["pr_number"] < 1
+        ):
+            raise SourceMalformed("snapshot pr_number is malformed")
+        head_sha = _require_commit(record["head_sha"], "snapshot head_sha", ())
+        merge_sha = _require_commit(
+            record["potential_merge_commit_oid"],
+            "snapshot potential_merge_commit_oid",
+            (),
+        )
+        event_sha = _require_commit(record["event_sha"], "snapshot event_sha", ())
+        if (
+            not isinstance(record["base_ref_name"], str)
+            or not record["base_ref_name"].strip()
+            or not isinstance(record["body_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", record["body_sha256"]) is None
+            or not isinstance(record["is_draft"], bool)
+            or record["event_name"] != "pull_request"
+            or not isinstance(record["workflow_path"], str)
+            or not record["workflow_path"].strip()
+            or not isinstance(record["workflow_action"], str)
+            or not record["workflow_action"].strip()
+        ):
+            raise SourceMalformed("snapshot artifact carries malformed identity fields")
+        workflow_id = _require_positive_int(record["workflow_id"], "snapshot workflow id", ())
+        snapshot_run_id = _require_positive_int(record["run_id"], "snapshot run id", ())
+        snapshot_attempt = _require_positive_int(
+            record["run_attempt"], "snapshot run attempt", ()
+        )
+        if snapshot_run_id != run_id or snapshot_attempt != run_attempt:
+            raise SourceMalformed("snapshot artifact run identity mismatch")
+        _ = artifact_id  # identity is validated before the record is trusted
+        return LivePrSnapshot(
+            pr_number=record["pr_number"],
+            head_sha=head_sha,
+            base_ref_name=record["base_ref_name"],
+            potential_merge_commit_oid=merge_sha,
+            body_sha256=record["body_sha256"],
+            is_draft=record["is_draft"],
+            event_name=record["event_name"],
+            event_sha=event_sha,
+            workflow_path=record["workflow_path"],
+            workflow_id=workflow_id,
+            workflow_action=record["workflow_action"],
+            run_id=snapshot_run_id,
+            run_attempt=snapshot_attempt,
+        )
+
+    def read_live_ci(
+        self,
+        pr: PullRequestFacts,
+        *,
+        required_checks: Sequence[str],
+        live_checks: Sequence[str],
+        workflow_path: str,
+        workflow_action: str,
+    ) -> CiFacts:
+        candidates = self.read_check_run_candidates(
+            pr.head_oid,
+            workflow_path=workflow_path,
+            workflow_action=workflow_action,
+        )
+        facts = select_check_run_candidates(
+            candidates,
+            required_checks,
+            head_oid=pr.head_oid,
+        )
+        selected = {check.name: check for check in facts.checks}
+        reasons = list(facts.reasons)
+        snapshots = []
+        for name in tuple(live_checks):
+            check = selected.get(name)
+            if check is None:
+                reasons.append("live PR check {0} has no selected run".format(name))
+                continue
+            try:
+                snapshot = self._read_snapshot(check.workflow_run_id, check.run_attempt)
+                if not snapshot.matches_live(
+                    pr_number=pr.number,
+                    head_sha=pr.head_oid,
+                    base_ref_name=pr.base_ref_name,
+                    potential_merge_commit_oid=pr.potential_merge_commit_oid,
+                    body=pr.body,
+                    is_draft=pr.is_draft,
+                    workflow_path=workflow_path,
+                    workflow_id=check.workflow_id,
+                    workflow_action=workflow_action,
+                    run_id=check.workflow_run_id,
+                    run_attempt=check.run_attempt,
+                ):
+                    reasons.append("live PR snapshot does not match current PR state")
+                else:
+                    snapshots.append(snapshot)
+            except (SourceMalformed, SourceUnavailable) as error:
+                reasons.append("live PR snapshot is unverified: {0}".format(error))
+        if any("snapshot" in reason or "live PR check" in reason for reason in reasons):
+            state = CiState.UNKNOWN if facts.ci_state is CiState.PASSING else facts.ci_state
+        else:
+            state = facts.ci_state
+        first_snapshot = snapshots[0] if snapshots else None
+        evidence_check = selected.get(tuple(live_checks)[0]) if live_checks else None
+        if evidence_check is None:
+            evidence_check = facts.checks[0] if facts.checks else None
+        return replace(
+            facts,
+            ci_state=state,
+            check_run_id=evidence_check.check_run_id if evidence_check else None,
+            check_suite_id=evidence_check.check_suite_id if evidence_check else None,
+            head_sha=evidence_check.head_sha if evidence_check else None,
+            started_at=evidence_check.started_at if evidence_check else None,
+            completed_at=evidence_check.completed_at if evidence_check else None,
+            app_slug=evidence_check.app_slug if evidence_check else None,
+            workflow_path=evidence_check.workflow_path if evidence_check else None,
+            workflow_id=evidence_check.workflow_id if evidence_check else None,
+            workflow_action=evidence_check.workflow_action if evidence_check else None,
+            workflow_event=evidence_check.workflow_event if evidence_check else None,
+            workflow_run_id=evidence_check.workflow_run_id if evidence_check else None,
+            run_attempt=evidence_check.run_attempt if evidence_check else None,
+            reasons=tuple(reasons),
+            base_ref_name=pr.base_ref_name,
+            potential_merge_commit_oid=pr.potential_merge_commit_oid,
+            event_sha=first_snapshot.event_sha if first_snapshot else None,
+            snapshot_body_sha256=first_snapshot.body_sha256 if first_snapshot else None,
         )
 
 

@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import os
 import shutil
@@ -16,9 +18,11 @@ from pr_closure.state import derive_state
 from pr_closure.sources import (
     CheckOutcome,
     CheckResult,
+    CheckRunCandidate,
     GitHubIssueSource,
     GitHubSource,
     GitSource,
+    LivePrSnapshot,
     PullRequestFacts,
     SourceMalformed,
     SourceUnavailable,
@@ -29,6 +33,7 @@ from pr_closure.sources import (
     parse_check,
     redact,
     require_infra_event,
+    select_check_run_candidates,
 )
 
 COMMIT_A = "a" * 40
@@ -36,7 +41,10 @@ COMMIT_B = "b" * 40
 COMMIT_C = "c" * 40
 NOW = datetime(2026, 8, 8, 12, 0, 0)
 
-PR_JSON_FIELDS = "number,headRefName,headRefOid,isDraft,state,mergeStateStatus,mergeable,statusCheckRollup,url,baseRefName"
+PR_JSON_FIELDS = (
+    "number,headRefName,headRefOid,isDraft,state,mergeStateStatus,mergeable,"
+    "statusCheckRollup,url,baseRefName,body,potentialMergeCommit"
+)
 GH_BASE = {
     "number": 42,
     "headRefName": "feature/close",
@@ -48,6 +56,8 @@ GH_BASE = {
     "mergeable": "MERGEABLE",
     "url": "https://github.com/owner/repo/pull/42",
     "statusCheckRollup": [],
+    "body": "",
+    "potentialMergeCommit": {"oid": COMMIT_B},
 }
 VALID_INFRA_EVENT = {
     "schema_version": 1,
@@ -101,6 +111,35 @@ def worktree_lines(path, head, branch=None, detached=False, extra=()):
         lines.append("detached")
     lines.extend(extra)
     return lines
+
+
+def candidate_config():
+    return {
+        "schema_version": 1,
+        "project": "publyapp",
+        "repository": "owner/repo",
+        "repo_path": "/var/tmp/repo",
+        "default_branch": "develop",
+        "closure_state_dir": "/var/tmp/state",
+        "local_review_ready_commands": ["true"],
+        "closure_acceptance_commands": ["true"],
+        "infra_retry_budget": 1,
+        "stagnation_budget_minutes": 30,
+        "heavy_job_limit": 1,
+        "verification_command_timeout_seconds": 30,
+        "tracking_projection": None,
+        "ci_required_checks": ["ci-final-gate"],
+        "ci_live_pr_checks": ["ci-final-gate"],
+        "ci_required_checks_source": {
+            "pull_request": "candidate_tip",
+            "merge_group": "event_tip",
+            "push": "event_tip",
+        },
+        "ci_live_pr_workflow": {
+            "path": ".github/workflows/ci.yml",
+            "action": "pull_request",
+        },
+    }
 
 
 class RecordingRunner:
@@ -724,6 +763,314 @@ class GitHubPrTests(TempDirTestCase):
         )
 
 
+class GitHubCandidateTipTests(TempDirTestCase):
+    def test_candidate_config_is_read_at_exact_head_and_blob_bound_to_tree(self):
+        raw = json.dumps(candidate_config()).encode()
+        encoded = base64.b64encode(raw).decode()
+        content_key = (
+            "gh api --repo owner/repo repos/owner/repo/contents/"
+            ".ai/project-closure-v1.json?ref=" + COMMIT_A
+        )
+        tree_key = (
+            "gh api --repo owner/repo repos/owner/repo/git/trees/"
+            + COMMIT_A
+            + "?recursive=1"
+        )
+        runner = RecordingRunner(
+            {
+                content_key: (
+                    0,
+                    json.dumps({
+                        "path": ".ai/project-closure-v1.json",
+                        "sha": "d" * 40,
+                        "encoding": "base64",
+                        "content": encoded,
+                    }),
+                    "",
+                ),
+                tree_key: (
+                    0,
+                    json.dumps({
+                        "truncated": False,
+                        "tree": [{
+                            "path": ".ai/project-closure-v1.json",
+                            "type": "blob",
+                            "sha": "d" * 40,
+                        }],
+                    }),
+                    "",
+                ),
+            }
+        )
+        source = GitHubSource("owner/repo", 42, runner=runner)
+        self.assertEqual(candidate_config(), source.read_candidate_tip_config(COMMIT_A))
+        self.assertEqual(
+            [
+                tuple(content_key.split()),
+                tuple(tree_key.split()),
+            ],
+            runner.calls,
+        )
+
+    def test_candidate_config_blob_tree_mismatch_fails_closed(self):
+        raw = base64.b64encode(json.dumps(candidate_config()).encode()).decode()
+        content_key = (
+            "gh api --repo owner/repo repos/owner/repo/contents/"
+            ".ai/project-closure-v1.json?ref=" + COMMIT_A
+        )
+        tree_key = (
+            "gh api --repo owner/repo repos/owner/repo/git/trees/"
+            + COMMIT_A
+            + "?recursive=1"
+        )
+        runner = RecordingRunner({
+            content_key: (
+                0,
+                json.dumps({
+                    "path": ".ai/project-closure-v1.json",
+                    "sha": "d" * 40,
+                    "encoding": "base64",
+                    "content": raw,
+                }),
+                "",
+            ),
+            tree_key: (
+                0,
+                json.dumps({
+                    "truncated": False,
+                    "tree": [{
+                        "path": ".ai/project-closure-v1.json",
+                        "type": "blob",
+                        "sha": "e" * 40,
+                    }],
+                }),
+                "",
+            ),
+        })
+        with self.assertRaisesRegex(SourceMalformed, "blob identity"):
+            GitHubSource("owner/repo", 42, runner=runner).read_candidate_tip_config(COMMIT_A)
+
+    def test_check_run_reads_all_pages_and_validates_workflow_provenance(self):
+        workflow_key = (
+            "gh api --repo owner/repo repos/owner/repo/actions/workflows/"
+            ".github/workflows/ci.yml"
+        )
+        check_key = (
+            "gh api --repo owner/repo --paginate --slurp repos/owner/repo/commits/"
+            + COMMIT_A
+            + "/check-runs?filter=all&per_page=100"
+        )
+        run_key = "gh api --repo owner/repo repos/owner/repo/actions/runs/201"
+        run = {
+            "id": 201,
+            "workflow_id": 77,
+            "path": ".github/workflows/ci.yml",
+            "event": "pull_request",
+            "run_attempt": 2,
+            "head_sha": COMMIT_A,
+        }
+        raw = {
+            "id": 101,
+            "name": "ci-final-gate",
+            "head_sha": COMMIT_A,
+            "status": "completed",
+            "conclusion": "success",
+            "started_at": "2026-09-05T10:00:00Z",
+            "completed_at": "2026-09-05T10:01:00Z",
+            "details_url": "https://github.com/owner/repo/actions/runs/201/job/9",
+            "app": {"slug": "github-actions"},
+            "check_suite": {"id": 301},
+        }
+        runner = RecordingRunner({
+            workflow_key: (0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), ""),
+            check_key: (
+                0,
+                json.dumps([
+                    {"check_runs": [raw]},
+                    {"check_runs": []},
+                ]),
+                "",
+            ),
+            run_key: (0, json.dumps(run), ""),
+        })
+        candidates = GitHubSource("owner/repo", 42, runner=runner).read_check_run_candidates(
+            COMMIT_A,
+            workflow_path=".github/workflows/ci.yml",
+            workflow_action="pull_request",
+        )
+        self.assertEqual(1, len(candidates))
+        self.assertEqual(101, candidates[0].result.check_run_id)
+        self.assertEqual(201, candidates[0].result.workflow_run_id)
+        self.assertEqual(2, candidates[0].result.run_attempt)
+        self.assertIn("filter=all", check_key)
+
+
+class GitHubLiveCiTests(TempDirTestCase):
+    def pr(self, body="body", draft=False):
+        return PullRequestFacts(
+            repository="owner/repo",
+            number=42,
+            head_branch="feature/close",
+            base_ref_name="develop",
+            head_oid=COMMIT_A,
+            is_draft=draft,
+            state="OPEN",
+            merge_state_status="CLEAN",
+            mergeable="MERGEABLE",
+            url="https://github.com/owner/repo/pull/42",
+            checks=(),
+            body=body,
+            potential_merge_commit_oid=COMMIT_B,
+        )
+
+    def runner(self, artifacts, extra_raw=()):
+        workflow_key = (
+            "gh api --repo owner/repo repos/owner/repo/actions/workflows/"
+            ".github/workflows/ci.yml"
+        )
+        check_key = (
+            "gh api --repo owner/repo --paginate --slurp repos/owner/repo/commits/"
+            + COMMIT_A
+            + "/check-runs?filter=all&per_page=100"
+        )
+        run_key = "gh api --repo owner/repo repos/owner/repo/actions/runs/201"
+        artifacts_key = (
+            "gh api --repo owner/repo --paginate --slurp "
+            "repos/owner/repo/actions/runs/201/artifacts?per_page=100"
+        )
+        raw = {
+            "id": 101,
+            "name": "ci-final-gate",
+            "head_sha": COMMIT_A,
+            "status": "completed",
+            "conclusion": "success",
+            "started_at": "2026-09-05T10:00:00Z",
+            "completed_at": "2026-09-05T10:01:00Z",
+            "details_url": "https://github.com/owner/repo/actions/runs/201/job/9",
+            "app": {"slug": "github-actions"},
+            "check_suite": {"id": 301},
+        }
+        responses = {
+            workflow_key: (0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), ""),
+            check_key: (
+                0,
+                json.dumps([{"check_runs": [*extra_raw, raw]}]),
+                "",
+            ),
+            run_key: (
+                0,
+                json.dumps({
+                    "id": 201,
+                    "workflow_id": 77,
+                    "path": ".github/workflows/ci.yml",
+                    "event": "pull_request",
+                    "run_attempt": 1,
+                    "head_sha": COMMIT_A,
+                }),
+                "",
+            ),
+            artifacts_key: (
+                0,
+                json.dumps([{"artifacts": artifacts}]),
+                "",
+            ),
+        }
+        return RecordingRunner(responses)
+
+    def snapshot(self, body="body", event_sha=COMMIT_B):
+        return {
+            "pr_number": 42,
+            "head_sha": COMMIT_A,
+            "base_ref_name": "develop",
+            "potential_merge_commit_oid": COMMIT_B,
+            "body_sha256": hashlib.sha256(body.encode()).hexdigest(),
+            "is_draft": False,
+            "event_name": "pull_request",
+            "event_sha": event_sha,
+            "workflow_path": ".github/workflows/ci.yml",
+            "workflow_id": 77,
+            "workflow_action": "pull_request",
+            "run_id": 201,
+            "run_attempt": 1,
+        }
+
+    def test_realistic_head_and_merge_event_pair_passes(self):
+        reader = lambda _run, _name: self.snapshot()
+        source = GitHubSource(
+            "owner/repo",
+            42,
+            runner=self.runner([{"id": 501, "name": "ci-pr-snapshot-201-1", "expired": False}]),
+            artifact_reader=reader,
+        )
+        facts = source.read_live_ci(
+            self.pr(),
+            required_checks=("ci-final-gate",),
+            live_checks=("ci-final-gate",),
+            workflow_path=".github/workflows/ci.yml",
+            workflow_action="pull_request",
+        )
+        self.assertEqual(CiState.PASSING, facts.ci_state)
+        self.assertEqual(101, facts.check_run_id)
+        self.assertEqual(201, facts.workflow_run_id)
+        self.assertEqual(COMMIT_A, facts.head_sha)
+        self.assertEqual(COMMIT_B, facts.event_sha)
+
+    def test_live_provenance_uses_the_live_context_not_first_required_check(self):
+        older_required = {
+            "id": 100,
+            "name": "legacy-gate",
+            "head_sha": COMMIT_A,
+            "status": "completed",
+            "conclusion": "success",
+            "started_at": "2026-09-05T09:00:00Z",
+            "completed_at": "2026-09-05T09:01:00Z",
+            "details_url": "https://github.com/owner/repo/actions/runs/201/job/8",
+            "app": {"slug": "github-actions"},
+            "check_suite": {"id": 301},
+        }
+        source = GitHubSource(
+            "owner/repo",
+            42,
+            runner=self.runner(
+                [{"id": 501, "name": "ci-pr-snapshot-201-1", "expired": False}],
+                extra_raw=(older_required,),
+            ),
+            artifact_reader=lambda _run, _name: self.snapshot(),
+        )
+        facts = source.read_live_ci(
+            self.pr(),
+            required_checks=("legacy-gate", "ci-final-gate"),
+            live_checks=("ci-final-gate",),
+            workflow_path=".github/workflows/ci.yml",
+            workflow_action="pull_request",
+        )
+        self.assertEqual(CiState.PASSING, facts.ci_state)
+        self.assertEqual(101, facts.check_run_id)
+        self.assertEqual(201, facts.workflow_run_id)
+
+    def test_missing_or_duplicate_snapshot_is_unverified(self):
+        for artifacts in ([], [
+            {"id": 501, "name": "ci-pr-snapshot-201-1", "expired": False},
+            {"id": 502, "name": "ci-pr-snapshot-201-1", "expired": False},
+        ]):
+            with self.subTest(artifacts=artifacts):
+                source = GitHubSource(
+                    "owner/repo",
+                    42,
+                    runner=self.runner(artifacts),
+                    artifact_reader=lambda _run, _name: self.snapshot(),
+                )
+                facts = source.read_live_ci(
+                    self.pr(),
+                    required_checks=("ci-final-gate",),
+                    live_checks=("ci-final-gate",),
+                    workflow_path=".github/workflows/ci.yml",
+                    workflow_action="pull_request",
+                )
+                self.assertEqual(CiState.UNKNOWN, facts.ci_state)
+                self.assertTrue(any("snapshot" in reason for reason in facts.reasons))
+
+
 class WorktreeResolverTests(TempDirTestCase):
     def resolver(self, anchor, blocks, **kwargs):
         responses = {
@@ -1217,6 +1564,168 @@ class CiClassificationTests(TempDirTestCase):
         ci = classify_ci(checks, COMMIT_A, infra_event=VALID_INFRA_EVENT)
         self.assertEqual(CiState.BRANCH_FAILURE, ci.ci_state)
         self.assertIsNone(ci.infra_job)
+
+
+class LiveCheckRunSelectionTests(TempDirTestCase):
+    def candidate(
+        self,
+        check_id,
+        suite_id,
+        run_id,
+        name="ci-final-gate",
+        status="COMPLETED",
+        conclusion="SUCCESS",
+        started_at="2026-09-05T10:00:00Z",
+        completed_at="2026-09-05T10:01:00Z",
+    ):
+        outcome = CheckOutcome.PASSING if conclusion == "SUCCESS" else CheckOutcome.FAILURE
+        return CheckRunCandidate(
+            result=CheckResult(
+                "check_run",
+                name,
+                status,
+                conclusion,
+                outcome,
+                "https://github.com/owner/repo/actions/runs/{0}/job/9".format(run_id),
+                check_run_id=check_id,
+                head_sha=COMMIT_A,
+                started_at=started_at,
+                completed_at=completed_at,
+                app_slug="github-actions",
+                check_suite_id=suite_id,
+                workflow_run_id=run_id,
+                workflow_id=77,
+                workflow_path=".github/workflows/ci.yml",
+                workflow_action="pull_request",
+                workflow_event="pull_request",
+                run_attempt=1,
+            )
+        )
+
+    def test_selects_latest_by_start_completion_then_check_run_id(self):
+        selected = select_check_run_candidates(
+            [
+                self.candidate(101, 1, 201, completed_at="2026-09-05T10:02:00Z"),
+                self.candidate(
+                    103,
+                    1,
+                    203,
+                    started_at="2026-09-05T10:01:00Z",
+                    completed_at="2026-09-05T10:01:30Z",
+                ),
+                self.candidate(
+                    102,
+                    1,
+                    202,
+                    started_at="2026-09-05T10:01:00Z",
+                    completed_at="2026-09-05T10:01:30Z",
+                ),
+            ],
+            ("ci-final-gate",),
+            head_oid=COMMIT_A,
+        )
+        self.assertEqual(103, selected.checks[0].check_run_id)
+        self.assertEqual(203, selected.checks[0].workflow_run_id)
+
+    def test_tied_latest_start_across_suites_is_unverified(self):
+        facts = select_check_run_candidates(
+            [self.candidate(101, 1, 201), self.candidate(102, 2, 202)],
+            ("ci-final-gate",),
+            head_oid=COMMIT_A,
+        )
+        self.assertEqual(CiState.UNKNOWN, facts.ci_state)
+        self.assertTrue(any("ambiguous concurrent runs" in reason for reason in facts.reasons))
+
+    def test_malformed_homonymous_candidate_invalidates_green_candidate(self):
+        malformed = CheckRunCandidate(
+            result=None,
+            name="ci-final-gate",
+            error="candidate app slug is not github-actions",
+        )
+        facts = select_check_run_candidates(
+            [self.candidate(101, 1, 201), malformed],
+            ("ci-final-gate",),
+            head_oid=COMMIT_A,
+        )
+        self.assertEqual(CiState.UNKNOWN, facts.ci_state)
+        self.assertTrue(any("malformed candidate" in reason for reason in facts.reasons))
+
+    def test_pending_and_failure_are_not_passing_evidence(self):
+        pending = CheckRunCandidate(
+            result=CheckResult(
+                "check_run",
+                "ci-final-gate",
+                "IN_PROGRESS",
+                None,
+                CheckOutcome.PENDING,
+                "https://github.com/owner/repo/actions/runs/201/job/9",
+                check_run_id=101,
+                head_sha=COMMIT_A,
+                started_at="2026-09-05T10:00:00Z",
+                completed_at=None,
+                app_slug="github-actions",
+                check_suite_id=1,
+                workflow_run_id=201,
+                workflow_id=77,
+                workflow_path=".github/workflows/ci.yml",
+                workflow_action="pull_request",
+                workflow_event="pull_request",
+                run_attempt=1,
+            )
+        )
+        pending_facts = select_check_run_candidates(
+            [pending], ("ci-final-gate",), head_oid=COMMIT_A
+        )
+        self.assertEqual(CiState.UNKNOWN, pending_facts.ci_state)
+        self.assertTrue(any("pending" in reason for reason in pending_facts.reasons))
+        failed = self.candidate(102, 1, 202, conclusion="FAILURE")
+        failed_facts = select_check_run_candidates(
+            [failed], ("ci-final-gate",), head_oid=COMMIT_A
+        )
+        self.assertEqual(CiState.BRANCH_FAILURE, failed_facts.ci_state)
+
+    def test_push_name_is_not_an_authoritative_pr_result(self):
+        push = self.candidate(100, 1, 200, name="ci-push-check")
+        pr = self.candidate(101, 1, 201)
+        facts = select_check_run_candidates(
+            [push, pr],
+            ("ci-final-gate",),
+            head_oid=COMMIT_A,
+        )
+        self.assertEqual(CiState.PASSING, facts.ci_state)
+        self.assertEqual(101, facts.checks[0].check_run_id)
+
+    def test_snapshot_compares_event_sha_to_potential_merge_not_head(self):
+        snapshot = LivePrSnapshot(
+            pr_number=42,
+            head_sha=COMMIT_A,
+            base_ref_name="develop",
+            potential_merge_commit_oid=COMMIT_B,
+            body_sha256=hashlib.sha256(b"").hexdigest(),
+            is_draft=False,
+            event_name="pull_request",
+            event_sha=COMMIT_B,
+            workflow_path=".github/workflows/ci.yml",
+            workflow_id=77,
+            workflow_action="pull_request",
+            run_id=201,
+            run_attempt=1,
+        )
+        self.assertTrue(
+            snapshot.matches_live(
+                pr_number=42,
+                head_sha=COMMIT_A,
+                base_ref_name="develop",
+                potential_merge_commit_oid=COMMIT_B,
+                body="",
+                is_draft=False,
+                workflow_path=".github/workflows/ci.yml",
+                workflow_id=77,
+                workflow_action="pull_request",
+                run_id=201,
+                run_attempt=1,
+            )
+        )
 
 
 class InfraEvidenceTests(TempDirTestCase):

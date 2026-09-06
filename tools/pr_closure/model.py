@@ -202,6 +202,19 @@ class ReviewProvenance:
 
 
 @dataclass(frozen=True)
+class CiRequiredChecksSource:
+    pull_request: str
+    merge_group: str
+    push: str
+
+
+@dataclass(frozen=True)
+class CiLiveWorkflow:
+    path: str
+    action: str
+
+
+@dataclass(frozen=True)
 class ProjectConfig:
     """Validated version-1 project closure configuration.
 
@@ -223,6 +236,9 @@ class ProjectConfig:
     verification_command_timeout_seconds: int
     tracking_projection: Optional[str]
     ci_required_checks: Tuple[str, ...] = ()
+    ci_live_pr_checks: Tuple[str, ...] = ()
+    ci_required_checks_source: Optional[CiRequiredChecksSource] = None
+    ci_live_pr_workflow: Optional[CiLiveWorkflow] = None
     model_routes: Tuple[ModelRoute, ...] = ()
     review_policy: ReviewPolicy = field(default_factory=ReviewPolicy)
     config_digest: Optional[str] = None
@@ -236,6 +252,7 @@ class ProjectConfig:
             self, "closure_acceptance_commands", _as_tuple(self.closure_acceptance_commands)
         )
         object.__setattr__(self, "ci_required_checks", _as_tuple(self.ci_required_checks))
+        object.__setattr__(self, "ci_live_pr_checks", _as_tuple(self.ci_live_pr_checks))
         object.__setattr__(self, "model_routes", _as_tuple(self.model_routes))
 
 

@@ -51,6 +51,17 @@ BASE_CONFIG = {
     "heavy_job_limit": 1,
     "verification_command_timeout_seconds": 2,
     "tracking_projection": None,
+    "ci_required_checks": [],
+    "ci_live_pr_checks": [],
+    "ci_required_checks_source": {
+        "pull_request": "candidate_tip",
+        "merge_group": "event_tip",
+        "push": "event_tip",
+    },
+    "ci_live_pr_workflow": {
+        "path": ".github/workflows/ci.yml",
+        "action": "pull_request",
+    },
 }
 
 FAKE_GIT = r'''#!/usr/bin/env python3
@@ -110,9 +121,12 @@ sys.exit(main())
 '''
 
 FAKE_GH = r'''#!/usr/bin/env python3
+import base64
+import hashlib
 import json
 import os
 import sys
+from pathlib import Path
 
 
 def main():
@@ -135,6 +149,8 @@ def main():
         data.setdefault("mergeable", "MERGEABLE")
         data.setdefault("url", "https://github.com/{0}/pull/{1}".format(repository, number))
         data.setdefault("statusCheckRollup", [])
+        data.setdefault("body", "")
+        data.setdefault("potentialMergeCommit", {"oid": "b" * 40})
         sys.stdout.write(json.dumps(data))
         return 0
     if len(args) >= 6 and args[:2] == ["issue", "view"]:
@@ -153,6 +169,120 @@ def main():
         data.setdefault("state", "OPEN")
         data.setdefault("url", "https://github.com/{0}/issues/{1}".format(repository, number))
         sys.stdout.write(json.dumps(data))
+        return 0
+    if len(args) >= 2 and args[0] == "api":
+        endpoint = args[-1]
+        repository = args[args.index("--repo") + 1] if "--repo" in args else "owner/repo"
+        custom = control.get("api", {}).get(endpoint)
+        if custom is not None:
+            sys.stdout.write(json.dumps(custom))
+            return 0
+        config_path = os.environ.get("FAKE_CONFIG_PATH")
+        candidate = control.get("candidate_config")
+        if candidate is None:
+            candidate = json.load(open(config_path)) if config_path else {}
+        data = control.get("data", {})
+        head = data.get("headRefOid", "a" * 40)
+        if "/contents/.ai/project-closure-v1.json?ref=" in endpoint:
+            raw = json.dumps(candidate).encode()
+            sys.stdout.write(json.dumps({
+                "path": ".ai/project-closure-v1.json",
+                "sha": "d" * 40,
+                "encoding": "base64",
+                "content": base64.b64encode(raw).decode(),
+            }))
+            return 0
+        if "/git/trees/" in endpoint:
+            sys.stdout.write(json.dumps({
+                "truncated": False,
+                "tree": [{
+                    "path": ".ai/project-closure-v1.json",
+                    "type": "blob",
+                    "sha": "d" * 40,
+                }],
+            }))
+            return 0
+        if "/actions/workflows/" in endpoint:
+            sys.stdout.write(json.dumps({
+                "id": 77,
+                "path": ".github/workflows/ci.yml",
+            }))
+            return 0
+        if "/commits/" in endpoint and "/check-runs?" in endpoint:
+            rollup = data.get("statusCheckRollup", [])
+            runs = []
+            for index, item in enumerate(rollup, start=1):
+                if item.get("__typename") != "CheckRun":
+                    continue
+                status = item.get("status", "COMPLETED").lower()
+                conclusion = item.get("conclusion")
+                run_id = 200 + index
+                runs.append({
+                    "id": 100 + index,
+                    "name": item.get("name"),
+                    "head_sha": head,
+                    "status": status,
+                    "conclusion": conclusion.lower() if isinstance(conclusion, str) else None,
+                    "started_at": "2026-09-05T10:{:02d}:00Z".format(index),
+                    "completed_at": "2026-09-05T10:{:02d}:30Z".format(index),
+                    "details_url": "https://github.com/{}/actions/runs/{}/job/9".format(repository, run_id),
+                    "app": {"slug": "github-actions"},
+                    "check_suite": {"id": 300 + index},
+                })
+            sys.stdout.write(json.dumps([{"check_runs": runs}]))
+            return 0
+        if (
+            "/actions/runs/" in endpoint
+            and endpoint.rsplit("/", 1)[-1].isdigit()
+        ):
+            run_id = int(endpoint.rsplit("/", 1)[1])
+            sys.stdout.write(json.dumps({
+                "id": run_id,
+                "workflow_id": 77,
+                "path": ".github/workflows/ci.yml",
+                "event": "pull_request",
+                "run_attempt": 1,
+                "head_sha": head,
+            }))
+            return 0
+        if "/actions/runs/" in endpoint and "/artifacts" in endpoint:
+            artifacts = []
+            for index, item in enumerate(data.get("statusCheckRollup", []), start=1):
+                if item.get("__typename") == "CheckRun":
+                    run_id = 200 + index
+                    artifacts.append({
+                        "id": 500 + index,
+                        "name": "ci-pr-snapshot-{}-1".format(run_id),
+                        "expired": False,
+                    })
+            sys.stdout.write(json.dumps([{"artifacts": artifacts}]))
+            return 0
+        sys.stderr.write("fake gh: unscripted api endpoint\n")
+        return 127
+    if len(args) >= 2 and args[0:2] == ["run", "download"]:
+        run_id = int(args[2])
+        directory = args[args.index("--dir") + 1]
+        os.makedirs(directory, exist_ok=True)
+        data = control.get("data", {})
+        event_sha = data.get("potentialMergeCommit", {}).get("oid", "b" * 40)
+        record = {
+            "pr_number": data.get("number", 42),
+            "head_sha": data.get("headRefOid", "a" * 40),
+            "base_ref_name": data.get("baseRefName", "develop"),
+            "potential_merge_commit_oid": event_sha,
+            "body_sha256": hashlib.sha256(data.get("body", "").encode()).hexdigest(),
+            "is_draft": data.get("isDraft", False),
+            "event_name": "pull_request",
+            "event_sha": event_sha,
+            "workflow_path": ".github/workflows/ci.yml",
+            "workflow_id": 77,
+            "workflow_action": "pull_request",
+            "run_id": run_id,
+            "run_attempt": 1,
+        }
+        if isinstance(data.get("snapshot"), dict):
+            record = dict(data["snapshot"])
+        Path(directory, "snapshot.json").write_text(json.dumps(record))
         return 0
     sys.stderr.write("fake gh: unscripted command\n")
     return 127
@@ -336,9 +466,12 @@ class CliTestCase(unittest.TestCase):
 
     def set_gh(self, **overrides):
         issues = overrides.pop("issues", None)
+        candidate_config = overrides.pop("candidate_config", None)
         control = {"data": overrides}
         if issues is not None:
             control["issues"] = issues
+        if candidate_config is not None:
+            control["candidate_config"] = candidate_config
         self._write_json(self.gh_control, control)
 
     def set_gh_issues(self, issues, issue_stderr=None, issue_exit=1):
@@ -427,6 +560,8 @@ class CliTestCase(unittest.TestCase):
         env["FAKE_GIT_CONTROL"] = self.git_control
         env["FAKE_GH_CONTROL"] = self.gh_control
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        if "--config" in args:
+            env["FAKE_CONFIG_PATH"] = args[args.index("--config") + 1]
         if extra_env:
             env.update(extra_env)
         proc = subprocess.run(
@@ -1408,7 +1543,11 @@ class StatusCommandTests(CliTestCase):
         config = self.write_config(overrides={"ci_required_checks": ["ci"]})
         proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
         self.assertEqual(0, proc.returncode, proc.stderr)
-        self.assertEqual("PASSING", json.loads(proc.stdout)["ci_state"])
+        payload = json.loads(proc.stdout)
+        self.assertEqual("PASSING", payload["ci_state"])
+        self.assertEqual(101, payload["ci_check_run_id"])
+        self.assertEqual(201, payload["ci_workflow_run_id"])
+        self.assertEqual(COMMIT_A, payload["commit"])
 
     def test_status_without_policy_keeps_all_rollup_strict_behavior(self):
         self.set_git()
@@ -1422,6 +1561,51 @@ class StatusCommandTests(CliTestCase):
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertEqual("UNKNOWN", json.loads(proc.stdout)["ci_state"])
 
+    def test_status_uses_candidate_tip_policy_over_checked_out_config(self):
+        self.set_git()
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            candidate_config=dict(
+                BASE_CONFIG,
+                ci_required_checks=["ci"],
+                ci_live_pr_checks=[],
+            ),
+        )
+        config = self.write_config(
+            overrides={"ci_required_checks": ["local-only"], "ci_live_pr_checks": []}
+        )
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual("PASSING", json.loads(proc.stdout)["ci_state"])
+
+    def test_status_requires_fresh_live_pr_snapshot_for_live_check(self):
+        self.set_git()
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            body="current body",
+        )
+        config = self.write_config(
+            overrides={"ci_required_checks": ["ci"], "ci_live_pr_checks": ["ci"]}
+        )
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual("PASSING", json.loads(proc.stdout)["ci_state"])
+
+    def test_status_rejects_candidate_default_branch_override(self):
+        self.set_git()
+        remote = dict(BASE_CONFIG, default_branch="main")
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            candidate_config=remote,
+        )
+        config = self.write_config()
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR))
+        self.assertEqual(3, proc.returncode)
+        self.assertIn("default branch mismatch", proc.stderr)
+
     def test_status_text_reports_state(self):
         self.set_git()
         self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
@@ -1432,6 +1616,70 @@ class StatusCommandTests(CliTestCase):
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertIn("state: REVIEW_READY", proc.stdout)
         self.assertIn("dispatch_review", proc.stdout)
+
+    def _snapshot(self, *, body="", head=COMMIT_A, base="develop", merge=COMMIT_B, draft=False, event=COMMIT_B):
+        return {
+            "pr_number": PR,
+            "head_sha": head,
+            "base_ref_name": base,
+            "potential_merge_commit_oid": merge,
+            "body_sha256": hashlib.sha256(body.encode()).hexdigest(),
+            "is_draft": draft,
+            "event_name": "pull_request",
+            "event_sha": event,
+            "workflow_path": ".github/workflows/ci.yml",
+            "workflow_id": 77,
+            "workflow_action": "pull_request",
+            "run_id": 201,
+            "run_attempt": 1,
+        }
+
+    def test_old_green_snapshot_is_invalid_after_body_edit(self):
+        self.set_git()
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            body="new body",
+            snapshot=self._snapshot(body="old body"),
+        )
+        config = self.write_config(
+            overrides={"ci_required_checks": ["ci"], "ci_live_pr_checks": ["ci"]}
+        )
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual("UNKNOWN", payload["ci_state"])
+        self.assertIn("UNVERIFIED", payload["state"])
+
+    def test_ready_transition_rejects_old_draft_snapshot(self):
+        self.set_git()
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            isDraft=False,
+            snapshot=self._snapshot(draft=True),
+        )
+        config = self.write_config(
+            overrides={"ci_required_checks": ["ci"], "ci_live_pr_checks": ["ci"]}
+        )
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual("UNKNOWN", json.loads(proc.stdout)["ci_state"])
+
+    def test_comment_or_label_only_change_does_not_invalidate_snapshot(self):
+        self.set_git()
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            body="same body",
+            snapshot=self._snapshot(body="same body"),
+        )
+        config = self.write_config(
+            overrides={"ci_required_checks": ["ci"], "ci_live_pr_checks": ["ci"]}
+        )
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual("PASSING", json.loads(proc.stdout)["ci_state"])
 
     def test_status_never_approves_on_missing_or_contradictory_evidence(self):
         self.set_git()
@@ -3370,6 +3618,10 @@ class ConfigValidationTests(CliTestCase):
             "infra_retry_budget", "stagnation_budget_minutes", "heavy_job_limit",
             "verification_command_timeout_seconds",
             "tracking_projection",
+            "ci_required_checks",
+            "ci_live_pr_checks",
+            "ci_required_checks_source",
+            "ci_live_pr_workflow",
         ):
             with self.subTest(key=key):
                 config = dict(BASE_CONFIG)
