@@ -619,6 +619,65 @@ class CliExitCodeTests(CliTestCase):
         self.assertTrue(os.path.exists(review_path))
         self.assertIn("staged", proc.stderr)
 
+    def test_retire_review_cli_replays_after_committed_source_move(self):
+        self.set_git(head=COMMIT_A, local=COMMIT_A, remote=COMMIT_A)
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        policy = active_policy_config()
+        config = self.write_config(
+            overrides={
+                "model_routes": policy["model_routes"],
+                "review_policy": policy["review_policy"],
+            }
+        )
+        self.assertEqual(
+            0,
+            self.run_cli("record-verification", "--config", config, "--pr", str(PR)).returncode,
+        )
+        review_input = self.write_review()
+        store = RunStore(self.state_dir, PROJECT, PR)
+        store.write_review(COMMIT_A, "legacy", json.loads(Path(review_input).read_text()))
+        source = store.review_path(COMMIT_A, "legacy")
+        source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        retirement_id = "retire-cli-replay"
+        policy_id = policy["review_policy"]["same_family_exceptions"][0]["id"]
+        original_append = store.append_event
+
+        def stop_after_committed(event_type, *args, **kwargs):
+            result = original_append(event_type, *args, **kwargs)
+            if event_type == "review_retirement_committed":
+                raise RuntimeError("crash after committed")
+            return result
+
+        with mock.patch.object(store, "append_event", side_effect=stop_after_committed):
+            with self.assertRaises(RuntimeError):
+                store.retire_review(
+                    repository=REPOSITORY,
+                    commit=COMMIT_A,
+                    review_id="legacy",
+                    retirement_id=retirement_id,
+                    reason="policy-migration: claude-reviewer-forbidden",
+                    policy_id=policy_id,
+                    expected_sha256=source_digest,
+                )
+        store._move_no_replace(
+            source,
+            store.retirement_final_path(COMMIT_A, retirement_id),
+            source_digest,
+        )
+        replay = self.run_cli(
+            "retire-review",
+            "--config", config,
+            "--pr", str(PR),
+            "--commit", COMMIT_A,
+            "--review-id", "legacy",
+            "--retirement-id", retirement_id,
+            "--reason", "policy-migration: claude-reviewer-forbidden",
+            "--policy-id", policy_id,
+            "--expected-sha256", source_digest,
+        )
+        self.assertEqual(0, replay.returncode, replay.stderr)
+        self.assertEqual("FINALIZED", json.loads(replay.stdout)["state"])
+
     def test_staged_retirement_requires_matching_policy_and_reason(self):
         self.set_git()
         self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)

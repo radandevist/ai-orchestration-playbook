@@ -1,7 +1,7 @@
 # Same-Family Review Policy Design
 
-**Date:** 2026-09-05  
-**Status:** Design specification  
+**Date:** 2026-09-05
+**Status:** Design specification
 **Scope:** Shared `tools/pr_closure` gate, with the PublyApp policy as the first adopter
 
 ## Goal

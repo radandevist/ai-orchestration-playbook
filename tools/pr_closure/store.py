@@ -1136,9 +1136,6 @@ class RunStore:
                 )
             ):
                 raise EvidenceConflict("retirement id already has different immutable arguments")
-            state, _ = self._retirement_state(commit, retirement_id)
-            if state == "FINALIZED":
-                return self.retirement_status(commit, retirement_id)
             return self.recover_retirement(retirement_id, commit)
         if not source.exists():
             raise MalformedEvidence("retirement source review does not exist")
@@ -1221,52 +1218,78 @@ class RunStore:
         if len(original_review_events) != 1:
             raise MalformedEvidence("retirement must bind exactly one original REVIEW_EVENT")
         source = Path(envelope["source_path"])
-        if source.exists():
-            raw, digest = self._read_bound_bytes(source, "active review record")
-            if digest != envelope["expected_sha256"]:
-                raise MalformedEvidence("retirement source digest does not match its envelope")
-        else:
-            raw = None
+        staging = self.retirement_staging_path(commit, retirement_id)
+        final = self.retirement_final_path(commit, retirement_id)
+
+        def read_optional(path, label):
+            if not path.exists() and not path.is_symlink():
+                return None
+            raw_value, digest_value = self._read_bound_bytes(path, label)
+            if digest_value != envelope["expected_sha256"]:
+                raise MalformedEvidence("{0} digest does not match its envelope".format(label))
+            return raw_value
+
+        raw = read_optional(source, "active review record")
+        staging_raw = read_optional(staging, "retirement staging proof")
+        read_optional(final, "retired review record")
         selected = self._retirement_events(commit, retirement_id, events)
         event_types = [event["event_type"] for event in selected]
-        if not event_types:
-            staging_path = self.retirement_staging_path(commit, retirement_id)
-            if staging_path.exists() or staging_path.is_symlink():
-                raise EvidenceConflict(
-                    "retirement staging cannot be adopted before PREPARED"
+        allowed_prefixes = [
+            [],
+            [RETIREMENT_PREPARED_EVENT],
+            [RETIREMENT_PREPARED_EVENT, RETIREMENT_COPIED_EVENT],
+            [RETIREMENT_PREPARED_EVENT, RETIREMENT_COPIED_EVENT, RETIREMENT_COMMITTED_EVENT],
+            list(RETIREMENT_EVENT_TYPES),
+        ]
+        if event_types not in allowed_prefixes:
+            raise MalformedEvidence("retirement events are not a valid state-machine prefix")
+        for event_type, event in zip(event_types, selected):
+            self._validate_retirement_event(event, envelope, event_type)
+
+        if RETIREMENT_PREPARED_EVENT not in event_types:
+            if raw is None and staging_raw is None:
+                raise MalformedEvidence(
+                    "retirement recovery lacks both active source and immutable staging bytes"
                 )
-            # The envelope is the durable intent record.  A crash after its
-            # no-replace publication but before PREPARED must be recoverable.
             self._append_retirement_transition(
                 RETIREMENT_PREPARED_EVENT, envelope, commit, events
             )
             events = self.read_events()
-            selected = self._retirement_events(commit, retirement_id, events)
-            event_types = [event["event_type"] for event in selected]
-        if RETIREMENT_PREPARED_EVENT in event_types and RETIREMENT_COPIED_EVENT not in event_types:
-            staging = self.retirement_staging_path(commit, retirement_id)
-            if staging.exists():
-                _staging_raw, staging_digest = self._read_bound_bytes(
-                    staging, "retirement staging proof"
-                )
-                if staging_digest != envelope["expected_sha256"]:
-                    raise MalformedEvidence("retirement staging digest does not match")
-                self._append_retirement_transition(
-                    RETIREMENT_COPIED_EVENT, envelope, commit, self.read_events()
-                )
-        state, _ = self._retirement_state(commit, retirement_id, self.read_events())
-        if state == "FINALIZED":
-            return self.retirement_status(commit, retirement_id)
-        if state == "PREPARED" and raw is not None:
-            staging = self.retirement_staging_path(commit, retirement_id)
-            if not staging.exists():
+            event_types.append(RETIREMENT_PREPARED_EVENT)
+
+        if RETIREMENT_COPIED_EVENT not in event_types:
+            if staging_raw is None:
+                if raw is None:
+                    raise MalformedEvidence(
+                        "retirement recovery lacks bytes for the staging proof"
+                    )
                 self._atomic_create(staging, raw)
-            self._append_retirement_transition(RETIREMENT_COPIED_EVENT, envelope, commit, self.read_events())
-        events = self.read_events()
-        if not any(event["event_type"] == RETIREMENT_COMMITTED_EVENT for event in events if event.get("retirement_id") == retirement_id):
-            self._append_retirement_transition(RETIREMENT_COMMITTED_EVENT, envelope, commit, events)
-        self._move_no_replace(source, self.retirement_final_path(commit, retirement_id), envelope["expected_sha256"])
-        self._append_retirement_transition(RETIREMENT_FINALIZED_EVENT, envelope, commit, self.read_events())
+                staging_raw = raw
+            self._append_retirement_transition(
+                RETIREMENT_COPIED_EVENT, envelope, commit, self.read_events()
+            )
+            event_types.append(RETIREMENT_COPIED_EVENT)
+
+        if RETIREMENT_COMMITTED_EVENT not in event_types:
+            if final.exists() or final.is_symlink():
+                raise EvidenceConflict(
+                    "retirement final exists before its matching COMMITTED event"
+                )
+            self._append_retirement_transition(
+                RETIREMENT_COMMITTED_EVENT, envelope, commit, self.read_events()
+            )
+            event_types.append(RETIREMENT_COMMITTED_EVENT)
+
+        if RETIREMENT_FINALIZED_EVENT not in event_types:
+            if not final.exists() and not final.is_symlink():
+                if not source.exists():
+                    raise MalformedEvidence(
+                        "COMMITTED retirement has neither active source nor final artifact"
+                    )
+                self._move_no_replace(source, final, envelope["expected_sha256"])
+            self._append_retirement_transition(
+                RETIREMENT_FINALIZED_EVENT, envelope, commit, self.read_events()
+            )
         return self.retirement_status(commit, retirement_id)
 
     # -- event/artifact relation (T6L-F5) ---------------------------------

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import secrets
 import stat
 from typing import Tuple
@@ -9,6 +10,9 @@ from typing import Tuple
 
 class SecurePathError(OSError):
     """Raised when a contained path cannot be opened without following links."""
+
+
+_PUBLICATION_TEMP_RE = re.compile(r"^\.tmp-[0-9a-f]{32}$")
 
 
 def _absolute_components(value, label: str) -> Tuple[str, Tuple[str, ...]]:
@@ -222,7 +226,77 @@ def atomic_create(path, raw: bytes) -> bool:
                 follow_symlinks=False,
             )
         except FileExistsError:
-            return False
+            target_fd = None
+            try:
+                nofollow = getattr(os, "O_NOFOLLOW", None)
+                if nofollow is None:
+                    raise SecurePathError("platform does not provide O_NOFOLLOW for record recovery")
+                target_fd = os.open(
+                    components[-1],
+                    os.O_RDONLY | nofollow,
+                    dir_fd=parent_fd,
+                )
+                target_stat = os.fstat(target_fd)
+                if not stat.S_ISREG(target_stat.st_mode):
+                    raise SecurePathError("existing record target is not a regular file")
+                target_bytes = bytearray()
+                while True:
+                    chunk = os.read(target_fd, 65536)
+                    if not chunk:
+                        break
+                    target_bytes.extend(chunk)
+                if bytes(target_bytes) != raw:
+                    return False
+                if target_stat.st_nlink != 1:
+                    matching = []
+                    for candidate in os.listdir(parent_fd):
+                        if not _PUBLICATION_TEMP_RE.fullmatch(candidate):
+                            continue
+                        if candidate == temp_name:
+                            continue
+                        candidate_fd = None
+                        try:
+                            candidate_fd = os.open(
+                                candidate,
+                                os.O_RDONLY | nofollow,
+                                dir_fd=parent_fd,
+                            )
+                            candidate_stat = os.fstat(candidate_fd)
+                            if not stat.S_ISREG(candidate_stat.st_mode):
+                                raise SecurePathError(
+                                    "publication temporary entry is not a regular file"
+                                )
+                            candidate_bytes = bytearray()
+                            while True:
+                                chunk = os.read(candidate_fd, 65536)
+                                if not chunk:
+                                    break
+                                candidate_bytes.extend(chunk)
+                            same_identity = (
+                                candidate_stat.st_dev == target_stat.st_dev
+                                and candidate_stat.st_ino == target_stat.st_ino
+                            )
+                            same_bytes = bytes(candidate_bytes) == raw
+                            if same_identity and same_bytes:
+                                matching.append(candidate)
+                            elif same_identity or same_bytes:
+                                raise SecurePathError(
+                                    "publication temporary entry collides with existing target"
+                                )
+                        finally:
+                            if candidate_fd is not None:
+                                os.close(candidate_fd)
+                    if target_stat.st_nlink != 2 or len(matching) != 1:
+                        raise SecurePathError(
+                            "publication target has an ambiguous stale temporary link"
+                        )
+                    os.unlink(matching[0], dir_fd=parent_fd)
+                    _fsync_directory_fd(parent_fd, "record recovery")
+                    return True
+                return False
+            finally:
+                if target_fd is not None:
+                    os.close(target_fd)
         os.unlink(temp_name, dir_fd=parent_fd)
         temp_name = None
         _fsync_directory_fd(parent_fd, "record")

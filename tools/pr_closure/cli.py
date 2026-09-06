@@ -52,6 +52,7 @@ from pr_closure.model import (
 )
 from pr_closure.provenance import ProvenanceValidationError, verify_review_provenance
 from pr_closure.policy_lifecycle import authorize_retirement, validate_activation_projection
+from pr_closure.dispatch import select_model_route
 from pr_closure.review import require_live_binding, validate_review
 from pr_closure.sources import (
     INFRA_FAILURE_EVENT,
@@ -687,7 +688,14 @@ def cmd_retire_review(config, args) -> int:
     if durable_tip != args.commit:
         raise CliInputError("retirement commit must match the durably recorded tip")
     authorize_retirement(
-        config, store, args.commit, args.review_id, args.reason, args.policy_id
+        config,
+        store,
+        args.commit,
+        args.review_id,
+        args.reason,
+        args.policy_id,
+        args.retirement_id,
+        args.expected_sha256,
     )
     result = store.retire_review(
         repository=config.repository,
@@ -699,6 +707,27 @@ def cmd_retire_review(config, args) -> int:
         expected_sha256=args.expected_sha256,
     )
     sys.stdout.write(json.dumps(result, sort_keys=True) + "\n")
+    return EXIT_OK
+
+
+def cmd_select_model_route(config, args) -> int:
+    try:
+        route = select_model_route(config, args.implementer_model)
+    except ValueError as error:
+        raise CliInputError(str(error)) from error
+    payload = {
+        "id": route.id,
+        "registry_version": route.registry_version,
+        "launcher_registry_version": route.launcher_registry_version,
+        "implementer_model": route.implementer_model,
+        "implementer_runner": route.implementer_runner,
+        "implementer_invocation_model": route.implementer_invocation_model,
+        "reviewer_model": route.reviewer_model,
+        "reviewer_runner": route.reviewer_runner,
+        "reviewer_invocation_model": route.reviewer_invocation_model,
+        "same_family_policy_id": route.same_family_policy_id,
+    }
+    sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
     return EXIT_OK
 
 
@@ -1320,6 +1349,14 @@ def _build_parser() -> argparse.ArgumentParser:
     retire_review.add_argument("--policy-id", required=True, metavar="ID")
     retire_review.add_argument("--expected-sha256", required=True, metavar="64-HEX")
     retire_review.set_defaults(func=cmd_retire_review)
+
+    select_route = sub.add_parser(
+        "select-model-route",
+        help="select the normalized project implementation/review launcher route",
+    )
+    select_route.add_argument("--config", required=True, metavar="FILE")
+    select_route.add_argument("--implementer-model", required=True, metavar="MODEL")
+    select_route.set_defaults(func=cmd_select_model_route)
 
     activate = sub.add_parser(
         "check-policy-activation",

@@ -3,7 +3,7 @@
   "$id": "https://ai-orchestration-playbook/schemas/project-closure-v1.json",
   "title": "PR Closure Project Configuration",
   "description": "Fail-closed versioned project configuration for the PR closure gate. Path safety and component rules JSON Schema cannot express are enforced in Python.",
-  "$comment": "Generated from tools/pr_closure/contract.py by PYTHONPATH=tools python3 -m pr_closure.contract - never hand-edit. Residual semantics JSON Schema cannot express are enforced in Python and are documented verbatim: exact_integer_types: integer-valued JSON numbers such as schema_version 1.0, infra_retry_budget 1.0, heavy_job_limit 1.0, or verification_command_timeout_seconds 1.0 satisfy JSON Schema integer/const semantics, while the Python gate requires exact int values and rejects floats and booleans.; forbidden_temporary_paths: repo_path and closure_state_dir must resolve to durable absolute paths outside /tmp and the session job area; JSON Schema can only express the leading-slash requirement, so this schema accepts /tmp roots the Python gate rejects.; unsafe_project_component: the project name must be a single safe path component (no slash, backslash, NUL, or surrounding whitespace, and not '.' or '..'); JSON Schema cannot exclude '.'/'..'/NUL, so this schema accepts spellings the Python gate rejects.; nul_command_string: configured command strings must not contain NUL bytes because the subprocess argv contract cannot carry them; JSON Schema's \\S pattern accepts NUL, so this schema accepts spellings the Python gate rejects.",
+  "$comment": "Generated from tools/pr_closure/contract.py by PYTHONPATH=tools python3 -m pr_closure.contract - never hand-edit. Residual semantics JSON Schema cannot express are enforced in Python and are documented verbatim: exact_integer_types: integer-valued JSON numbers such as schema_version 1.0, infra_retry_budget 1.0, heavy_job_limit 1.0, or verification_command_timeout_seconds 1.0 satisfy JSON Schema integer/const semantics, while the Python gate requires exact int values and rejects floats and booleans.; forbidden_temporary_paths: repo_path and closure_state_dir must resolve to durable absolute paths outside /tmp and the session job area; JSON Schema can only express the leading-slash requirement, so this schema accepts /tmp roots the Python gate rejects.; unsafe_project_component: the project name must be a single safe path component (no slash, backslash, NUL, or surrounding whitespace, and not '.' or '..'); JSON Schema cannot exclude '.'/'..'/NUL, so this schema accepts spellings the Python gate rejects.; nul_command_string: configured command strings must not contain NUL bytes because the subprocess argv contract cannot carry them; JSON Schema's \\S pattern accepts NUL, so this schema accepts spellings the Python gate rejects.; project_model_registry: canonical model and launcher-registry membership for project routes is a Python registry lookup; JSON Schema can constrain exact spelling shape but cannot reject an unknown model or endpoint identity.; project_route_policy: project route uniqueness, same-family exception concordance, forbidden reviewer families, and staged/enforced cross-object policy relations are Python checks; JSON Schema cannot compare those normalized values.",
   "type": "object",
   "required": [
     "schema_version",
@@ -184,7 +184,7 @@
       "properties": {
         "id": {
           "type": "string",
-          "pattern": "^[a-z0-9][a-z0-9._-]*$"
+          "pattern": "^[a-z0-9][a-z0-9._-]*(?![\\s\\S])"
         },
         "registry_version": {
           "type": "string",
@@ -198,7 +198,7 @@
         },
         "implementer_model": {
           "type": "string",
-          "pattern": "^[a-z0-9][a-z0-9.-]*$"
+          "pattern": "^[a-z0-9][a-z0-9.-]*(?![\\s\\S])"
         },
         "implementer_runner": {
           "type": "string",
@@ -212,7 +212,7 @@
         },
         "reviewer_model": {
           "type": "string",
-          "pattern": "^[a-z0-9][a-z0-9.-]*$"
+          "pattern": "^[a-z0-9][a-z0-9.-]*(?![\\s\\S])"
         },
         "reviewer_runner": {
           "type": "string",
@@ -228,7 +228,7 @@
           "anyOf": [
             {
               "type": "string",
-              "pattern": "^[a-z0-9][a-z0-9._-]*$"
+              "pattern": "^[a-z0-9][a-z0-9._-]*(?![\\s\\S])"
             },
             {
               "type": "null"
@@ -299,7 +299,7 @@
       "properties": {
         "id": {
           "type": "string",
-          "pattern": "^[a-z0-9][a-z0-9._-]*$"
+          "pattern": "^[a-z0-9][a-z0-9._-]*(?![\\s\\S])"
         },
         "registry_version": {
           "type": "string",
@@ -313,7 +313,7 @@
         },
         "reviewer_model": {
           "type": "string",
-          "pattern": "^[a-z0-9][a-z0-9.-]*$"
+          "pattern": "^[a-z0-9][a-z0-9.-]*(?![\\s\\S])"
         },
         "required_for_authorized_family": {
           "type": "boolean"

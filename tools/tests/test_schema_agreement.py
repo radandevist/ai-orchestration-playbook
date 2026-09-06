@@ -1,3 +1,4 @@
+import copy
 import importlib.metadata
 import json
 import unittest
@@ -870,6 +871,29 @@ def config_agreement_corpus():
     cases = []
 
     add("valid config", lambda c: None, True, True)
+    add(
+        "valid active review policy",
+        lambda c: c.update({
+            "model_routes": copy.deepcopy(active_policy_config()["model_routes"]),
+            "review_policy": copy.deepcopy(active_policy_config()["review_policy"]),
+        }),
+        True,
+        True,
+    )
+    add(
+        "valid explicit disabled review policy",
+        lambda c: c.update({
+            "model_routes": [],
+            "review_policy": {
+                "mode": None,
+                "owner_authorization": None,
+                "forbidden_reviewer_families": [],
+                "same_family_exceptions": [],
+            },
+        }),
+        True,
+        True,
+    )
     add("null tracking_projection", lambda c: c.update({"tracking_projection": None}), True, True)
     add(
         "valid ci_required_checks",
@@ -1036,6 +1060,202 @@ def config_agreement_corpus():
     add(
         "non-string tracking_projection",
         lambda c: c.update({"tracking_projection": 42}),
+        False,
+        False,
+    )
+
+    add(
+        "unknown review policy field",
+        lambda c: c.update({
+            "model_routes": copy.deepcopy(active_policy_config()["model_routes"]),
+            "review_policy": dict(active_policy_config()["review_policy"], rogue=True),
+        }),
+        False,
+        False,
+    )
+    add(
+        "unknown model route field",
+        lambda c: c.update({
+            "model_routes": [
+                dict(active_policy_config()["model_routes"][0], rogue=True),
+                *copy.deepcopy(active_policy_config()["model_routes"][1:]),
+            ],
+            "review_policy": copy.deepcopy(active_policy_config()["review_policy"]),
+        }),
+        False,
+        False,
+    )
+    add(
+        "unknown same-family exception field",
+        lambda c: c.update({
+            "model_routes": copy.deepcopy(active_policy_config()["model_routes"]),
+            "review_policy": dict(
+                active_policy_config()["review_policy"],
+                same_family_exceptions=[
+                    dict(
+                        active_policy_config()["review_policy"]["same_family_exceptions"][0],
+                        rogue=True,
+                    )
+                ],
+            ),
+        }),
+        False,
+        False,
+    )
+    add(
+        "unknown route model registry membership",
+        lambda c: (
+            c.update({
+                "model_routes": copy.deepcopy(active_policy_config()["model_routes"]),
+                "review_policy": copy.deepcopy(active_policy_config()["review_policy"]),
+            }),
+            c["model_routes"][0].update({"implementer_model": "gpt-5.6-unknown"}),
+        ),
+        True,
+        False,
+        "project_model_registry",
+    )
+    add(
+        "route model trailing newline",
+        lambda c: (
+            c.update({
+                "model_routes": copy.deepcopy(active_policy_config()["model_routes"]),
+                "review_policy": copy.deepcopy(active_policy_config()["review_policy"]),
+            }),
+            c["model_routes"][0].update({"implementer_model": "gpt-5.6-luna\n"}),
+        ),
+        False,
+        False,
+    )
+    add(
+        "route launcher identity trailing newline",
+        lambda c: (
+            c.update({
+                "model_routes": copy.deepcopy(active_policy_config()["model_routes"]),
+                "review_policy": copy.deepcopy(active_policy_config()["review_policy"]),
+            }),
+            c["model_routes"][1].update({"implementer_runner": "opencode\n"}),
+        ),
+        True,
+        False,
+        "project_model_registry",
+    )
+    add(
+        "unknown exception reviewer registry membership",
+        lambda c: (
+            c.update({
+                "model_routes": copy.deepcopy(active_policy_config()["model_routes"]),
+                "review_policy": copy.deepcopy(active_policy_config()["review_policy"]),
+            }),
+            c["review_policy"]["same_family_exceptions"][0].update({
+                "reviewer_model": "gpt-5.6-unknown"
+            }),
+        ),
+        True,
+        False,
+        "project_model_registry",
+    )
+    add(
+        "same-family route missing exception",
+        lambda c: (
+            c.update({
+                "model_routes": copy.deepcopy(active_policy_config()["model_routes"]),
+                "review_policy": copy.deepcopy(active_policy_config()["review_policy"]),
+            }),
+            c["model_routes"][0].update({"same_family_policy_id": None}),
+        ),
+        True,
+        False,
+        "project_route_policy",
+    )
+    add(
+        "cross-family route claims exception",
+        lambda c: (
+            c.update({
+                "model_routes": copy.deepcopy(active_policy_config()["model_routes"]),
+                "review_policy": copy.deepcopy(active_policy_config()["review_policy"]),
+            }),
+            c["model_routes"][1].update({
+                "same_family_policy_id": "publyapp-gpt-implementation-sol-review-v1"
+            }),
+        ),
+        True,
+        False,
+        "project_route_policy",
+    )
+    add(
+        "duplicate route implementer",
+        lambda c: (
+            c.update({
+                "model_routes": copy.deepcopy(active_policy_config()["model_routes"]),
+                "review_policy": copy.deepcopy(active_policy_config()["review_policy"]),
+            }),
+            c["model_routes"].append(copy.deepcopy(c["model_routes"][0])),
+            c["model_routes"][-1].update({"id": "duplicate-route"}),
+        ),
+        True,
+        False,
+        "project_route_policy",
+    )
+    add(
+        "staged policy missing mode",
+        lambda c: (
+            c.update({
+                "model_routes": copy.deepcopy(active_policy_config()["model_routes"]),
+                "review_policy": copy.deepcopy(active_policy_config()["review_policy"]),
+            }),
+            c["review_policy"].pop("mode"),
+        ),
+        False,
+        False,
+    )
+    add(
+        "enforced policy missing owner authorization",
+        lambda c: (
+            c.update({
+                "model_routes": copy.deepcopy(active_policy_config()["model_routes"]),
+                "review_policy": dict(
+                    copy.deepcopy(active_policy_config()["review_policy"]), mode="enforced"
+                ),
+            }),
+            c["review_policy"].pop("owner_authorization"),
+        ),
+        False,
+        False,
+    )
+    add(
+        "active policy missing routes",
+        lambda c: c.update({
+            "review_policy": copy.deepcopy(active_policy_config()["review_policy"]),
+        }),
+        False,
+        False,
+    )
+    add(
+        "disabled policy has forbidden content",
+        lambda c: c.update({
+            "model_routes": [],
+            "review_policy": {
+                "mode": None,
+                "owner_authorization": None,
+                "forbidden_reviewer_families": ["anthropic"],
+                "same_family_exceptions": [],
+            },
+        }),
+        False,
+        False,
+    )
+    add(
+        "policy identifier trailing newline",
+        lambda c: (
+            c.update({
+                "model_routes": copy.deepcopy(active_policy_config()["model_routes"]),
+                "review_policy": copy.deepcopy(active_policy_config()["review_policy"]),
+            }),
+            c["model_routes"][0].update({
+                "same_family_policy_id": "publyapp-gpt-implementation-sol-review-v1\n"
+            }),
+        ),
         False,
         False,
     )
@@ -1220,8 +1440,8 @@ class ConfigCorpusShapeTests(unittest.TestCase):
                 "null_projection": 1,
                 "required_valid": 1,
                 "required_empty": 1,
-                "structural": 38,
-                "asymmetric": 9,
+                "structural": 49,
+                "asymmetric": 15,
             },
             counts,
         )
