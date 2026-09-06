@@ -891,6 +891,60 @@ class CliExitCodeTests(CliTestCase):
         )
         self.assertEqual(2, imported.returncode)
 
+    def test_event_stream_substitution_blocks_public_status_and_import(self):
+        self.set_git(head=COMMIT_A, local=COMMIT_A, remote=COMMIT_A)
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config()
+        verification = self.run_cli(
+            "record-verification", "--config", config, "--pr", str(PR)
+        )
+        self.assertEqual(0, verification.returncode, verification.stderr)
+        legacy_path = self.write_review()
+        imported = self.run_cli(
+            "import-review", "--config", config, "--pr", str(PR), "--review", legacy_path
+        )
+        self.assertEqual(0, imported.returncode, imported.stderr)
+
+        store = RunStore(self.state_dir, PROJECT, PR)
+        pre_adoption_bytes = store.events_path.read_bytes()
+        activation = store.record_policy_activation(COMMIT_A, "1" * 64, "2" * 64)
+        store.record_policy_adoption(
+            REPOSITORY,
+            COMMIT_A,
+            policy_id="policy-v1",
+            policy_digest="3" * 64,
+            staged_config_digest="1" * 64,
+            enforced_config_digest="2" * 64,
+            activation_event_id=activation["event_id"],
+            transition_kind="initial-adoption",
+        )
+        before = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(0, before.returncode, before.stderr)
+        self.assertNotEqual("APPROVED", json.loads(before.stdout)["state"])
+
+        archived = Path(self.state_dir) / "adopted-events.jsonl"
+        store.events_path.replace(archived)
+        legacy_only = Path(self.state_dir) / "legacy-only-events.jsonl"
+        legacy_only.write_bytes(pre_adoption_bytes)
+        store.events_path.symlink_to(legacy_only)
+
+        status = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(3, status.returncode, status.stdout + status.stderr)
+        new_review = dict(json.loads(Path(legacy_path).read_text()), reviewed_commit=COMMIT_A)
+        new_review_path = Path(self.root) / "new-legacy.json"
+        self._write_json(str(new_review_path), new_review)
+        imported_after_substitution = self.run_cli(
+            "import-review",
+            "--config", config,
+            "--pr", str(PR),
+            "--review", str(new_review_path),
+        )
+        self.assertEqual(3, imported_after_substitution.returncode)
+        self.assertFalse(
+            Path(self.state_dir, PROJECT, str(PR), "reviews", COMMIT_A, "new-legacy.json").exists()
+        )
+        self.assertEqual(pre_adoption_bytes, legacy_only.read_bytes())
+
     def test_enforced_policy_requires_the_adopted_enforced_config_digest(self):
         policy, staged_config = self.adopt_active_policy_at_tip_a()
         self.set_git(head=COMMIT_A, local=COMMIT_A, remote=COMMIT_A)

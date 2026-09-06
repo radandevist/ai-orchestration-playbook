@@ -2,7 +2,9 @@ import hashlib
 import json
 import shutil
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -80,6 +82,63 @@ class ReviewRetirementTests(unittest.TestCase):
                 RETIREMENT_FINALIZED_EVENT,
             ],
             event_types,
+        )
+
+    def test_concurrent_identical_retirements_are_exactly_once_and_replayable(self):
+        retirement_id = "retire-concurrent"
+        barrier = threading.Barrier(2)
+        original_transition = self.store._append_retirement_transition
+
+        def synchronize_prepared(event_type, *args, **kwargs):
+            if event_type == RETIREMENT_PREPARED_EVENT:
+                try:
+                    barrier.wait(timeout=0.1)
+                except threading.BrokenBarrierError:
+                    pass
+            return original_transition(event_type, *args, **kwargs)
+
+        retirement_args = {
+            "repository": "owner/repo",
+            "commit": COMMIT,
+            "review_id": "legacy",
+            "retirement_id": retirement_id,
+            "reason": "policy-migration: schema-v2-provenance-required",
+            "policy_id": "policy-v1",
+            "expected_sha256": self.source_digest,
+        }
+        with mock.patch.object(
+            self.store,
+            "_append_retirement_transition",
+            side_effect=synchronize_prepared,
+        ):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [
+                    pool.submit(self.store.retire_review, **retirement_args)
+                    for _ in range(2)
+                ]
+                results = [future.result(timeout=10) for future in futures]
+
+        self.assertEqual(["FINALIZED", "FINALIZED"], [result["state"] for result in results])
+        self.assertEqual(results[0], results[1])
+        self.assertFalse(self.source.exists())
+        self.assertEqual(
+            self.source_digest,
+            digest(self.store.retirement_final_path(COMMIT, retirement_id).read_bytes()),
+        )
+        self.assertEqual((), self.store.bound_reviews(COMMIT))
+        self.assertEqual(
+            [
+                COMMIT_EVENT,
+                REVIEW_EVENT,
+                RETIREMENT_PREPARED_EVENT,
+                RETIREMENT_COPIED_EVENT,
+                RETIREMENT_COMMITTED_EVENT,
+                RETIREMENT_FINALIZED_EVENT,
+            ],
+            [event["event_type"] for event in self.store.read_events()],
+        )
+        self.assertEqual(
+            results[0], self.store.retire_review(**retirement_args)
         )
 
     def test_prepared_retirement_revokes_authority_and_recovery_is_idempotent(self):

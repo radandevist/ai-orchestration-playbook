@@ -478,6 +478,97 @@ class AppendOnlyEventTests(StoreTestCase):
         self.assertEqual((legacy,), store.read_events())
 
 
+class AuthoritativeEventStreamTests(StoreTestCase):
+    def _adopted_store(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip"))
+        store.write_review(COMMIT_A, "legacy", _review_record())
+        pre_adoption_bytes = store.events_path.read_bytes()
+        activation = store.record_policy_activation(COMMIT_A, "1" * 64, "2" * 64)
+        adoption = store.record_policy_adoption(
+            "owner/repo",
+            COMMIT_A,
+            policy_id="policy-v1",
+            policy_digest="3" * 64,
+            staged_config_digest="1" * 64,
+            enforced_config_digest="2" * 64,
+            activation_event_id=activation["event_id"],
+            transition_kind="initial-adoption",
+        )
+        self.assertEqual(adoption["event_id"], store.current_policy_adoption("owner/repo")["event_id"])
+        return store, pre_adoption_bytes
+
+    def test_event_stream_symlink_substitution_cannot_hide_adoption_or_append(self):
+        store, pre_adoption_bytes = self._adopted_store()
+        archived = self.root / "adopted-events.jsonl"
+        store.events_path.replace(archived)
+        legacy_only = self.root / "legacy-only-events.jsonl"
+        legacy_only.write_bytes(pre_adoption_bytes)
+        store.events_path.symlink_to(legacy_only)
+
+        with self.assertRaises(MalformedEvidence):
+            store.read_events()
+        with self.assertRaises(MalformedEvidence):
+            store.current_policy_adoption("owner/repo")
+        with self.assertRaises(MalformedEvidence):
+            store.append_event("commit", COMMIT_B, self.durable_file("new-tip"))
+        self.assertEqual(pre_adoption_bytes, legacy_only.read_bytes())
+        self.assertTrue(archived.exists())
+
+    def test_event_stream_hardlink_substitution_is_not_authoritative(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip"))
+        archived = self.root / "archived-events.jsonl"
+        store.events_path.replace(archived)
+        os.link(archived, store.events_path)
+
+        with self.assertRaises(MalformedEvidence):
+            store.read_events()
+
+    def test_event_stream_nonregular_substitution_is_not_authoritative(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip"))
+        store.events_path.unlink()
+        os.mkfifo(store.events_path)
+
+        with self.assertRaises(MalformedEvidence):
+            store.read_events()
+        with self.assertRaises(MalformedEvidence):
+            store.append_event("commit", COMMIT_B, self.durable_file("new-tip"))
+
+    def test_event_stream_rename_away_is_not_treated_as_no_evidence(self):
+        store = RunStore(self.root, "proj", 42)
+        store.record_commit(COMMIT_A, self.durable_file("tip"))
+        store.write_review(COMMIT_A, "review", _review_record())
+        store.events_path.rename(self.root / "archived-events.jsonl")
+
+        with self.assertRaises(MalformedEvidence):
+            store.read_events()
+
+    def test_adopted_event_stream_rename_away_is_not_unadopted(self):
+        store = RunStore(self.root, "proj", 42)
+        activation = store.record_policy_activation(COMMIT_A, "1" * 64, "2" * 64)
+        store.record_policy_adoption(
+            "owner/repo",
+            COMMIT_A,
+            policy_id="policy-v1",
+            policy_digest="3" * 64,
+            staged_config_digest="1" * 64,
+            enforced_config_digest="2" * 64,
+            activation_event_id=activation["event_id"],
+            transition_kind="initial-adoption",
+        )
+        store.events_path.rename(self.root / "archived-events.jsonl")
+
+        with self.assertRaises(MalformedEvidence):
+            store.current_policy_adoption("owner/repo")
+
+    def test_project_that_has_never_been_adopted_remains_unadopted(self):
+        store = RunStore(self.root, "never-adopted", 42)
+
+        self.assertIsNone(store.current_policy_adoption("owner/repo"))
+
+
 class AtomicRecordWriteTests(StoreTestCase):
     def test_verification_lives_at_commit_config_attempt_path(self):
         store = RunStore(self.root, "proj", 42)

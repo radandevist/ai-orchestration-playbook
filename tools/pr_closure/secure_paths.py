@@ -396,6 +396,8 @@ def read_contained_file(path, root, label: str) -> Tuple[bytes, str]:
         flags = os.O_RDONLY | nofollow
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
         for component in relative_components[:-1]:
             next_fd = os.open(
                 component,
@@ -443,6 +445,123 @@ def read_contained_file(path, root, label: str) -> Tuple[bytes, str]:
             label,
         )
         return raw, hashlib.sha256(raw).hexdigest()
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd != root_fd:
+            os.close(directory_fd)
+        os.close(root_fd)
+
+
+def append_contained_file(path, root, raw: bytes, label: str, *, create=True) -> None:
+    """Append bytes to one contained regular file without following links.
+
+    The target is opened through a descriptor-relative no-follow chain, pinned
+    to a single-link regular inode before and after the append, and the file
+    and parent directory are fsynced before returning.  ``create=False`` is
+    used when a caller has already established that the append-only stream
+    must already exist; a missing target then fails closed instead of being
+    recreated after a rename.
+    """
+    if not isinstance(raw, bytes):
+        raise SecurePathError("{0} bytes must be bytes".format(label))
+    root_absolute, root_components = _absolute_components(root, label + " root")
+    path_absolute, _path_components = _absolute_components(path, label)
+    try:
+        if os.path.commonpath((root_absolute, path_absolute)) != root_absolute:
+            raise SecurePathError("{0} path escapes the closure root".format(label))
+    except ValueError as error:
+        raise SecurePathError("{0} path is not contained by the closure root".format(label)) from error
+    relative = os.path.relpath(path_absolute, root_absolute)
+    relative_components = tuple(component for component in relative.split(os.sep) if component)
+    if not relative_components:
+        raise SecurePathError("{0} path must name a file below the closure root".format(label))
+
+    parent = os.path.dirname(path_absolute)
+    ensure_directory(parent)
+    root_fd, root_identities = _open_directory_chain_with_identities(
+        root_components, label + " root"
+    )
+    directory_fd = root_fd
+    file_fd = None
+    relative_identities = [root_identities[-1]]
+    try:
+        try:
+            entry = os.lstat(path_absolute)
+        except FileNotFoundError:
+            entry = None
+        if entry is not None and (
+            not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1
+        ):
+            raise SecurePathError("{0} must be a single-link regular file".format(label))
+
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise SecurePathError("platform does not provide O_NOFOLLOW for {0}".format(label))
+        for component in relative_components[:-1]:
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | nofollow,
+                dir_fd=directory_fd,
+            )
+            try:
+                entry = os.fstat(next_fd)
+            except BaseException:
+                os.close(next_fd)
+                raise
+            relative_identities.append((entry.st_dev, entry.st_ino))
+            if directory_fd != root_fd:
+                os.close(directory_fd)
+            directory_fd = next_fd
+
+        flags = os.O_WRONLY | os.O_APPEND | nofollow
+        if create:
+            flags |= os.O_CREAT
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        file_fd = os.open(
+            relative_components[-1], flags, 0o600, dir_fd=directory_fd
+        )
+        opened = os.fstat(file_fd)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise SecurePathError("{0} must be a single-link regular file".format(label))
+        try:
+            entry = os.lstat(path_absolute)
+        except OSError as error:
+            raise SecurePathError("{0} changed identity before append".format(label)) from error
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or entry.st_nlink != 1
+            or (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise SecurePathError("{0} changed identity before append".format(label))
+
+        view = memoryview(raw)
+        while view:
+            written = os.write(file_fd, view)
+            view = view[written:]
+        os.fsync(file_fd)
+        _fsync_directory_fd(directory_fd, label + " parent")
+
+        try:
+            entry = os.lstat(path_absolute)
+        except OSError as error:
+            raise SecurePathError("{0} changed identity during append".format(label)) from error
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or entry.st_nlink != 1
+            or (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise SecurePathError("{0} changed identity during append".format(label))
+        _verify_directory_chain(root_components, root_identities, label + " root")
+        _verify_relative_chain(
+            root_fd,
+            relative_components,
+            tuple(relative_identities + [(opened.st_dev, opened.st_ino)]),
+            label,
+        )
     finally:
         if file_fd is not None:
             os.close(file_fd)
