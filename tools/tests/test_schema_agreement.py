@@ -9,12 +9,14 @@ from pr_closure.contract import (
     CONFIG_FORBIDDEN_ROOT_SPECS,
     CONFIG_SEMANTIC_ASYMMETRIES,
     SEMANTIC_ASYMMETRIES,
+    V2_SEMANTIC_ASYMMETRIES,
     ConfigValidationError,
     project_json_schema,
     review_json_schema_v2,
     validate_project_config,
 )
 from pr_closure.review import ReviewValidationError, validate_review
+from tools.tests.test_policy_config import active_policy_config
 
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "review-record-v1.json"
 SCHEMA_V2_PATH = Path(__file__).resolve().parent.parent / "schemas" / "review-record-v2.json"
@@ -24,6 +26,10 @@ REQUIREMENTS_PATH = Path(__file__).resolve().parent / "requirements-test.txt"
 
 def _schema():
     return json.loads(SCHEMA_PATH.read_text())
+
+
+def _schema_v2():
+    return json.loads(SCHEMA_V2_PATH.read_text())
 
 
 def _valid_record():
@@ -51,6 +57,57 @@ def _valid_record():
         }],
         "intentionally_not_findings": [],
     }
+
+
+def _valid_v2_record():
+    record = _valid_record()
+    record.update({
+        "schema_version": 2,
+        "implementer_family": "openai",
+        "reviewer_family": "openai",
+        "implementer_model": "gpt-5.6-luna",
+        "reviewer_model": "gpt-5.6-sol",
+        "review_exception": {
+            "policy_id": "publyapp-gpt-implementation-sol-review-v1",
+        },
+        "provenance": {
+            "registry_version": "models-v1",
+            "launcher_registry_version": "launchers-v1",
+            "implementer": {
+                "model_id": "gpt-5.6-luna",
+                "runner": "codex",
+                "invocation_model": "gpt-5.6-luna",
+                "run_ref": "orchestration://run/2026-09-05/luna-123",
+                "durable_path": "/var/tmp/durable/luna-123.json",
+                "sha256": "0" * 64,
+            },
+            "reviewer": {
+                "model_id": "gpt-5.6-sol",
+                "runner": "codex",
+                "invocation_model": "gpt-5.6-sol",
+                "run_ref": "orchestration://run/2026-09-05/sol-456",
+                "durable_path": "/var/tmp/durable/sol-456.json",
+                "sha256": "1" * 64,
+            },
+        },
+    })
+    return record
+
+
+def _valid_v2_cross_family_record():
+    record = _valid_v2_record()
+    record["implementer_family"] = "deepseek"
+    record["implementer_model"] = "deepseek-v4-flash"
+    record["provenance"]["implementer"] = {
+        "model_id": "deepseek-v4-flash",
+        "runner": "opencode",
+        "invocation_model": "cline-pass/cline-pass/deepseek-v4-flash",
+        "run_ref": "orchestration://run/2026-09-05/deepseek-789",
+        "durable_path": "/var/tmp/durable/deepseek-789.json",
+        "sha256": "2" * 64,
+    }
+    record.pop("review_exception")
+    return record
 
 
 def _swap_range(record):
@@ -291,6 +348,386 @@ def agreement_corpus():
         True,
         False,
         "exact_integer_types",
+    )
+
+    return cases
+
+
+def v2_agreement_corpus():
+    """(label, record, config, schema_valid, python_valid, asymmetry_id) tuples.
+
+    The schema and Python validator receive the same record.  A config is either
+    the normalized active PublyApp policy or ``None`` for the policy-disabled
+    compatibility path.  Cases where JSON Schema cannot express a Python
+    registry or route decision name the published v2 asymmetry that permits it.
+    """
+
+    active_config = validate_project_config(active_policy_config())
+    cases = []
+
+    def add(
+        label,
+        mutate,
+        schema_ok,
+        python_ok,
+        asymmetry_id=None,
+        *,
+        active=True,
+        cross_family=False,
+    ):
+        record = (
+            _valid_v2_record()
+            if not cross_family
+            else _valid_v2_cross_family_record()
+        )
+        mutate(record)
+        cases.append(
+            (
+                label,
+                record,
+                active_config if active else None,
+                schema_ok,
+                python_ok,
+                asymmetry_id,
+            )
+        )
+
+    add("v2 valid exact same-family route", lambda r: None, True, True)
+    add(
+        "v2 valid cross-family route",
+        lambda r: None,
+        True,
+        True,
+        cross_family=True,
+    )
+    add(
+        "v2 valid paired finding proof",
+        lambda r: r["findings"][0].update({
+            "bad_case_evidence": ["mutation-before"],
+            "good_case_evidence": ["mutation-after"],
+        }),
+        True,
+        True,
+    )
+
+    for field in (
+        "implementer_model",
+        "reviewer_model",
+        "provenance",
+    ):
+        add("v2 required top-level field: " + field, lambda r, f=field: r.pop(f), False, False)
+    for field in ("registry_version", "launcher_registry_version", "implementer", "reviewer"):
+        add(
+            "v2 required provenance field: " + field,
+            lambda r, f=field: r["provenance"].pop(f),
+            False,
+            False,
+        )
+    for field in (
+        "model_id",
+        "runner",
+        "invocation_model",
+        "run_ref",
+        "durable_path",
+        "sha256",
+    ):
+        add(
+            "v2 required implementer participant field: " + field,
+            lambda r, f=field: r["provenance"]["implementer"].pop(f),
+            False,
+            False,
+        )
+
+    add("v2 unknown top-level field", lambda r: r.update({"rogue": True}), False, False)
+    add(
+        "v2 unknown provenance field",
+        lambda r: r["provenance"].update({"rogue": True}),
+        False,
+        False,
+    )
+    add(
+        "v2 unknown participant field",
+        lambda r: r["provenance"]["reviewer"].update({"rogue": True}),
+        False,
+        False,
+    )
+    add(
+        "v2 unknown exception field",
+        lambda r: r["review_exception"].update({"rogue": True}),
+        False,
+        False,
+    )
+    add(
+        "v2 unknown finding field",
+        lambda r: r["findings"][0].update({"rogue": True}),
+        False,
+        False,
+    )
+
+    add(
+        "v2 unknown implementer model",
+        lambda r: (
+            r.update({"implementer_model": "gpt-5.6-unknown"}),
+            r["provenance"]["implementer"].update({"model_id": "gpt-5.6-unknown"}),
+        ),
+        True,
+        False,
+        "canonical_model_registry",
+        active=False,
+        cross_family=True,
+    )
+    add(
+        "v2 family-only reviewer model",
+        lambda r: (
+            r.update({"reviewer_model": "openai"}),
+            r["provenance"]["reviewer"].update({"model_id": "openai"}),
+        ),
+        True,
+        False,
+        "canonical_model_registry",
+        active=False,
+        cross_family=True,
+    )
+    add(
+        "v2 unknown model registry version",
+        lambda r: r["provenance"].update({"registry_version": "models-v2"}),
+        True,
+        False,
+        "canonical_model_registry",
+        active=False,
+        cross_family=True,
+    )
+    add(
+        "v2 model registry version trailing newline",
+        lambda r: r["provenance"].update({"registry_version": "models-v1\n"}),
+        True,
+        False,
+        "canonical_model_registry",
+        active=False,
+        cross_family=True,
+    )
+    add(
+        "v2 declared family disagrees with canonical model",
+        lambda r: r.update({"implementer_family": "deepseek"}),
+        True,
+        False,
+        "canonical_model_registry",
+        active=False,
+    )
+    add(
+        "v2 unknown implementer runner",
+        lambda r: r["provenance"]["implementer"].update({"runner": "jcode"}),
+        True,
+        False,
+        "launcher_provenance_membership",
+        active=False,
+        cross_family=True,
+    )
+    add(
+        "v2 invocation alias is not launcher identity",
+        lambda r: r["provenance"]["implementer"].update({"invocation_model": "luna"}),
+        True,
+        False,
+        "launcher_provenance_membership",
+        active=False,
+        cross_family=True,
+    )
+    add(
+        "v2 runner trailing newline is not launcher identity",
+        lambda r: r["provenance"]["implementer"].update({"runner": "opencode\n"}),
+        True,
+        False,
+        "launcher_provenance_membership",
+        active=False,
+        cross_family=True,
+    )
+    add(
+        "v2 invocation trailing newline is not launcher identity",
+        lambda r: r["provenance"]["implementer"].update({
+            "invocation_model": "cline-pass/cline-pass/deepseek-v4-flash\n",
+        }),
+        True,
+        False,
+        "launcher_provenance_membership",
+        active=False,
+        cross_family=True,
+    )
+    add(
+        "v2 unknown launcher registry version",
+        lambda r: r["provenance"].update({"launcher_registry_version": "launchers-v2"}),
+        True,
+        False,
+        "launcher_provenance_membership",
+        active=False,
+        cross_family=True,
+    )
+    add(
+        "v2 launcher registry version trailing newline",
+        lambda r: r["provenance"].update({"launcher_registry_version": "launchers-v1\n"}),
+        True,
+        False,
+        "launcher_provenance_membership",
+        active=False,
+        cross_family=True,
+    )
+    add(
+        "v2 participant model differs from review model",
+        lambda r: r["provenance"]["reviewer"].update({"model_id": "gpt-5.6-luna"}),
+        True,
+        False,
+        "launcher_provenance_membership",
+        active=False,
+        cross_family=True,
+    )
+
+    add(
+        "v2 blank run reference",
+        lambda r: r["provenance"]["reviewer"].update({"run_ref": " "}),
+        False,
+        False,
+    )
+    add(
+        "v2 relative durable path",
+        lambda r: r["provenance"]["reviewer"].update({"durable_path": "relative.json"}),
+        False,
+        False,
+    )
+    add(
+        "v2 root durable path",
+        lambda r: r["provenance"]["reviewer"].update({"durable_path": "/"}),
+        False,
+        False,
+    )
+    add(
+        "v2 whitespace durable path",
+        lambda r: r["provenance"]["reviewer"].update({"durable_path": "/ "}),
+        False,
+        False,
+    )
+    add(
+        "v2 digest wrong length",
+        lambda r: r["provenance"]["reviewer"].update({"sha256": "0" * 63}),
+        False,
+        False,
+    )
+    add(
+        "v2 digest uppercase",
+        lambda r: r["provenance"]["reviewer"].update({"sha256": "A" * 64}),
+        False,
+        False,
+    )
+    add(
+        "v2 model id uppercase",
+        lambda r: r.update({"reviewer_model": "GPT-5.6-SOL"}),
+        False,
+        False,
+    )
+    add(
+        "v2 model id trailing newline",
+        lambda r: (
+            r.update({"reviewer_model": "gpt-5.6-sol\n"}),
+            r["provenance"]["reviewer"].update({"model_id": "gpt-5.6-sol\n"}),
+        ),
+        False,
+        False,
+    )
+    add(
+        "v2 schema version float",
+        lambda r: r.update({"schema_version": 2.0}),
+        True,
+        False,
+        "exact_integer_types",
+    )
+    add(
+        "v2 pr number float",
+        lambda r: r.update({"pr_number": 42.0}),
+        True,
+        False,
+        "exact_integer_types",
+    )
+    add(
+        "v2 follow-up issue float",
+        lambda r: r["findings"][0].update({"follow_up_issue": 900.0}),
+        True,
+        False,
+        "exact_integer_types",
+    )
+
+    add("v2 unknown verdict", lambda r: r.update({"verdict": "LOOKS_FINE"}), False, False)
+    add(
+        "v2 missing finding summary",
+        lambda r: r["findings"][0].pop("summary"),
+        False,
+        False,
+    )
+    add("v2 findings not array", lambda r: r.update({"findings": {}}), False, False)
+    add(
+        "v2 follow-up missing issue",
+        lambda r: r["findings"][0].pop("follow_up_issue"),
+        False,
+        False,
+    )
+    add(
+        "v2 note finding has follow-up issue",
+        lambda r: r["findings"][0].update({
+            "disposition": "NOTE_ONLY",
+            "follow_up_issue": 900,
+        }),
+        False,
+        False,
+    )
+    add(
+        "v2 proof arrays are not paired",
+        lambda r: r["findings"][0].update({"bad_case_evidence": ["escape"]}),
+        False,
+        False,
+    )
+    add(
+        "v2 duplicate finding ids",
+        lambda r: r["findings"].append(dict(r["findings"][0], severity="MAJOR")),
+        True,
+        False,
+        "duplicate_finding_ids",
+    )
+
+    add(
+        "v2 same-family exception omitted",
+        lambda r: r.pop("review_exception"),
+        True,
+        False,
+        "project_route_policy",
+    )
+    add(
+        "v2 wrong exception policy id",
+        lambda r: r["review_exception"].update({"policy_id": "other-policy"}),
+        True,
+        False,
+        "project_route_policy",
+    )
+    add(
+        "v2 reviewer endpoint violates selected route",
+        lambda r: (
+            r.update({"reviewer_model": "gpt-5.6-luna"}),
+            r["provenance"]["reviewer"].update({
+                "model_id": "gpt-5.6-luna",
+                "invocation_model": "gpt-5.6-luna",
+            }),
+        ),
+        True,
+        False,
+        "project_route_policy",
+    )
+    add(
+        "v2 cross-family route claims exception",
+        lambda r: r.update({
+            "review_exception": {
+                "policy_id": "publyapp-gpt-implementation-sol-review-v1",
+            }
+        }),
+        True,
+        False,
+        "project_route_policy",
+        cross_family=True,
     )
 
     return cases
@@ -665,6 +1102,82 @@ class V2SchemaAgreementTests(unittest.TestCase):
         comment = generated["$comment"]
         for term in ("policy", "canonical model", "launcher", "provenance", "route"):
             self.assertIn(term, comment.lower())
+
+    def test_v2_corpus_covers_the_required_contract_surfaces(self):
+        labels = {row[0] for row in v2_agreement_corpus()}
+        for expected in (
+            "v2 valid exact same-family route",
+            "v2 required provenance field: registry_version",
+            "v2 unknown participant field",
+            "v2 unknown implementer model",
+            "v2 invocation alias is not launcher identity",
+            "v2 digest wrong length",
+            "v2 unknown verdict",
+            "v2 follow-up missing issue",
+            "v2 same-family exception omitted",
+            "v2 cross-family route claims exception",
+        ):
+            with self.subTest(label=expected):
+                self.assertIn(expected, labels)
+
+    def test_v2_schema_and_python_validator_agree_or_name_asymmetry(self):
+        validator = Draft202012Validator(_schema_v2())
+        mismatches = []
+        for label, record, config, schema_ok, python_ok, _ in v2_agreement_corpus():
+            got_schema = validator.is_valid(record)
+            try:
+                if config is None:
+                    validate_review(record)
+                else:
+                    validate_review(
+                        record,
+                        review_policy=config.review_policy,
+                        model_routes=config.model_routes,
+                    )
+                got_python = True
+            except ReviewValidationError:
+                got_python = False
+            expected = (schema_ok, python_ok)
+            got = (got_schema, got_python)
+            if got != expected:
+                mismatches.append(
+                    f"{label}: got schema={got_schema} python={got_python} "
+                    f"expected schema={schema_ok} python={python_ok}"
+                )
+        self.assertEqual([], mismatches)
+
+    def test_v2_corpus_declares_agreement_and_only_documented_asymmetry(self):
+        declared = {item.id: item.description for item in V2_SEMANTIC_ASYMMETRIES}
+        corpus_declared = {
+            key: value for key, value in declared.items() if key != "duplicate_json_keys"
+        }
+        legacy_declared = {item.id for item in SEMANTIC_ASYMMETRIES}
+        covered = set()
+        outcomes = set()
+        errors = []
+        for label, _, _, schema_ok, python_ok, asymmetry_id in v2_agreement_corpus():
+            outcome = (schema_ok, python_ok)
+            outcomes.add(outcome)
+            is_deliberate_asymmetry = outcome == (True, False)
+            if is_deliberate_asymmetry and asymmetry_id is None:
+                errors.append(f"{label}: missing asymmetry id")
+            if not is_deliberate_asymmetry and asymmetry_id is not None:
+                errors.append(f"{label}: unexpected asymmetry id {asymmetry_id!r}")
+            if asymmetry_id in corpus_declared:
+                covered.add(asymmetry_id)
+            elif asymmetry_id is not None and asymmetry_id not in legacy_declared:
+                errors.append(f"{label}: unknown asymmetry id {asymmetry_id!r}")
+        self.assertEqual([], errors)
+        self.assertEqual(set(corpus_declared), covered)
+        self.assertIn((True, True), outcomes)
+        self.assertIn((False, False), outcomes)
+        self.assertIn((True, False), outcomes)
+        self.assertNotIn((False, True), outcomes)
+
+        comment = _schema_v2()["$comment"]
+        for asymmetry_id, description in declared.items():
+            with self.subTest(asymmetry_id=asymmetry_id):
+                self.assertIn(f"{asymmetry_id}: {description}", comment)
 
     def test_rollout_plan_has_no_eof_blank_line(self):
         path = Path(__file__).resolve().parents[2] / "docs" / "superpowers" / "plans" / "2026-09-05-publyapp-review-policy-rollout.md"

@@ -114,7 +114,11 @@ def _parse_participant(raw, name: str) -> ProvenanceParticipant:
     if _DIGEST_RE.fullmatch(digest) is None:
         raise ReviewValidationError(name + ".sha256 must be lowercase 64-hex")
     durable_path = _nonblank(item["durable_path"], name + ".durable_path")
-    if not durable_path.startswith("/"):
+    if (
+        len(durable_path) < 2
+        or not durable_path.startswith("/")
+        or durable_path[1].isspace()
+    ):
         raise ReviewValidationError(name + ".durable_path must be absolute")
     return ProvenanceParticipant(
         model_id=_nonblank(item["model_id"], name + ".model_id"),
