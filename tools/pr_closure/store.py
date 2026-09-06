@@ -6,6 +6,7 @@ import json
 import os
 import re
 import stat
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,7 @@ from pr_closure.contract import (
 from pr_closure.model import ClosureState
 from pr_closure.secure_paths import (
     SecurePathError,
+    append_contained_file as secure_append_contained_file,
     atomic_create as secure_atomic_create,
     ensure_directory,
     read_contained_file,
@@ -175,6 +177,17 @@ _POLICY_ADOPTION_EVENT_KEYS = frozenset(
     )
 )
 
+_PROJECT_LOCK_STATE = threading.local()
+_EVENT_OPERATIONAL_FILES = frozenset(
+    (
+        "heavy-job.lock",
+        "heavy-job.meta.json",
+        ".events-authoritative",
+        ".policy-adoption.lock",
+        "verification",
+    )
+)
+
 
 def _resolve(path: str) -> str:
     return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
@@ -327,6 +340,10 @@ class RunStore:
     def events_path(self) -> Path:
         return self._base / "events.jsonl"
 
+    @property
+    def _events_marker_path(self) -> Path:
+        return self._base / ".events-authoritative"
+
     @contextmanager
     def _policy_adoption_lock(self, *, exclusive=True):
         """Serialize project-wide policy adoption reads and writes.
@@ -336,9 +353,28 @@ class RunStore:
         while still serializing the first adoption against every other PR in
         the project.
         """
+        key = (os.fspath(self._root), self._project)
+        held_locks = getattr(_PROJECT_LOCK_STATE, "held", None)
+        if held_locks is None:
+            held_locks = {}
+            _PROJECT_LOCK_STATE.held = held_locks
+        held = held_locks.get(key)
+        if held is not None:
+            if exclusive and not held["exclusive"]:
+                raise MalformedEvidence(
+                    "cannot upgrade a shared project lock to exclusive"
+                )
+            held["depth"] += 1
+            try:
+                yield True
+            finally:
+                held["depth"] -= 1
+            return
+
         project_dir = self._root / self._project
         fd = None
         acquired = False
+        missing = False
         try:
             nofollow = getattr(os, "O_NOFOLLOW", None)
             if nofollow is None:
@@ -351,51 +387,70 @@ class RunStore:
                 try:
                     project_entry = project_dir.lstat()
                 except FileNotFoundError:
-                    yield False
-                    return
+                    missing = True
                 except OSError as error:
                     raise MalformedEvidence(
                         "cannot validate policy adoption root: {0}".format(project_dir)
                     ) from error
-                if not stat.S_ISDIR(project_entry.st_mode) or project_dir.is_symlink():
+                if not missing and (
+                    not stat.S_ISDIR(project_entry.st_mode) or project_dir.is_symlink()
+                ):
                     raise MalformedEvidence(
                         "policy adoption root must be a real directory: {0}".format(
                             project_dir
                         )
                     )
-            flags = os.O_RDONLY | os.O_DIRECTORY | nofollow
-            if hasattr(os, "O_CLOEXEC"):
-                flags |= os.O_CLOEXEC
-            fd = os.open(os.fspath(project_dir), flags)
-            entry = os.fstat(fd)
-            if not stat.S_ISDIR(entry.st_mode):
-                raise MalformedEvidence(
-                    "policy adoption lock root must be a real directory: {0}".format(
-                        project_dir
+            if not missing:
+                flags = os.O_RDONLY | os.O_DIRECTORY | nofollow
+                if hasattr(os, "O_CLOEXEC"):
+                    flags |= os.O_CLOEXEC
+                fd = os.open(os.fspath(project_dir), flags)
+                entry = os.fstat(fd)
+                if not stat.S_ISDIR(entry.st_mode):
+                    raise MalformedEvidence(
+                        "policy adoption lock root must be a real directory: {0}".format(
+                            project_dir
+                        )
                     )
-                )
-            fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-            acquired = True
-            yield True
+                fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+                held_locks[key] = {
+                    "fd": fd,
+                    "exclusive": exclusive,
+                    "depth": 1,
+                }
+                acquired = True
+        except MalformedEvidence:
+            if fd is not None:
+                os.close(fd)
+            raise
         except SecurePathError as error:
+            if fd is not None:
+                os.close(fd)
             raise MalformedEvidence(
                 "cannot establish policy adoption lock: {0}".format(project_dir)
             ) from error
         except OSError as error:
+            if fd is not None:
+                os.close(fd)
             raise MalformedEvidence(
                 "cannot establish policy adoption lock: {0}".format(project_dir)
             ) from error
+        if missing:
+            yield False
+            return
+        try:
+            yield True
         finally:
-            if fd is not None:
-                if acquired:
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-                    except OSError:
-                        pass
+            held_locks.pop(key, None)
+            if acquired:
                 try:
-                    os.close(fd)
+                    fcntl.flock(fd, fcntl.LOCK_UN)
                 except OSError:
                     pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def verification_dir(self, commit) -> Path:
         return self._base / "verification" / _require_commit(commit)
@@ -855,6 +910,12 @@ class RunStore:
         later closure context therefore cannot make an earlier project policy
         disappear merely by selecting a different tip or PR number.
         """
+        with self._policy_adoption_lock(exclusive=False) as acquired:
+            if not acquired:
+                return ()
+            return self._project_policy_adoption_events_unlocked()
+
+    def _project_policy_adoption_events_unlocked(self) -> Tuple[dict, ...]:
         project_dir = self._root / self._project
         try:
             entry = project_dir.lstat()
@@ -929,7 +990,9 @@ class RunStore:
         return tuple(events)
 
     def current_policy_adoption(self, repository: str) -> Optional[dict]:
-        with self._policy_adoption_lock(exclusive=False):
+        with self._policy_adoption_lock(exclusive=False) as acquired:
+            if not acquired:
+                return None
             return self._current_policy_adoption_unlocked(repository)
 
     def _current_policy_adoption_unlocked(self, repository: str) -> Optional[dict]:
@@ -1172,16 +1235,92 @@ class RunStore:
             except StoreError:
                 fail(f"malformed content_digest: {digest!r}")
 
+    def _events_parent_has_authoritative_entries(self) -> bool:
+        """Return whether an existing PR directory proves an event stream was in use."""
+        marker = self._events_marker_path
+        try:
+            marker_entry = marker.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise MalformedEvidence(
+                f"cannot validate events marker: {marker}: {error}"
+            ) from error
+        else:
+            if not stat.S_ISREG(marker_entry.st_mode) or marker_entry.st_nlink != 1:
+                raise MalformedEvidence(
+                    f"events marker must be a single-link regular file: {marker}"
+                )
+            return True
+        try:
+            entry = self._base.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise MalformedEvidence(
+                f"cannot validate events parent: {self._base}: {error}"
+            ) from error
+        if not stat.S_ISDIR(entry.st_mode) or self._base.is_symlink():
+            raise MalformedEvidence(
+                f"events parent must be a real directory: {self._base}"
+            )
+        try:
+            return any(
+                child.name not in _EVENT_OPERATIONAL_FILES
+                for child in self._base.iterdir()
+            )
+        except OSError as error:
+            raise MalformedEvidence(
+                f"cannot enumerate events parent: {self._base}: {error}"
+            ) from error
+
+    def _events_marker_present(self) -> bool:
+        marker = self._events_marker_path
+        try:
+            entry = marker.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise MalformedEvidence(
+                f"cannot validate events marker: {marker}: {error}"
+            ) from error
+        if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+            raise MalformedEvidence(
+                f"events marker must be a single-link regular file: {marker}"
+            )
+        return True
+
+    def _create_events_marker(self) -> None:
+        try:
+            secure_atomic_create(self._events_marker_path, b"")
+        except (OSError, SecurePathError) as error:
+            raise MalformedEvidence(
+                f"cannot establish events marker: {self._events_marker_path}"
+            ) from error
+        self._events_marker_present()
+
     def read_events(self) -> Tuple[dict, ...]:
         """Return every stored event in file order, raising on any malformed line."""
+        with self._policy_adoption_lock(exclusive=False) as acquired:
+            if not acquired:
+                return ()
+            return self._read_events_unlocked()
+
+    def _read_events_unlocked(self) -> Tuple[dict, ...]:
         path = self.events_path
-        if not path.exists():
-            return ()
         try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError as error:
+            raw, _digest = read_contained_file(path, self._root, "events")
+        except FileNotFoundError:
+            if self._events_parent_has_authoritative_entries():
+                raise MalformedEvidence(f"authoritative events file is missing: {path}")
+            return ()
+        except (OSError, SecurePathError) as error:
             raise MalformedEvidence(f"cannot read events: {path}: {error}") from error
-        lines = raw.split("\n")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise MalformedEvidence(f"events are not valid UTF-8: {path}: {error}") from error
+        lines = text.split("\n")
         if lines and lines[-1] == "":
             lines.pop()
         events = []
@@ -1215,17 +1354,33 @@ class RunStore:
         return current
 
     def _append_line(self, line: bytes) -> None:
-        self._base.mkdir(parents=True, exist_ok=True)
-        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-        fd = os.open(os.fspath(self.events_path), flags, 0o600)
-        try:
-            view = memoryview(line)
-            while view:
-                written = os.write(fd, view)
-                view = view[written:]
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        with self._policy_adoption_lock():
+            marker_present = self._events_marker_present()
+            try:
+                self.events_path.lstat()
+                create = False
+            except FileNotFoundError:
+                if self._events_parent_has_authoritative_entries():
+                    raise MalformedEvidence(
+                        f"authoritative events file is missing: {self.events_path}"
+                    )
+                create = True
+            try:
+                secure_append_contained_file(
+                    self.events_path,
+                    self._root,
+                    line,
+                    "events",
+                    create=create,
+                )
+            except PermissionError:
+                raise
+            except (OSError, SecurePathError) as error:
+                raise MalformedEvidence(
+                    f"cannot append events: {self.events_path}: {error}"
+                ) from error
+            if not marker_present:
+                self._create_events_marker()
 
     # -- verification records ---------------------------------------------
 
@@ -1529,10 +1684,19 @@ class RunStore:
         return state, envelope
 
     def retirement_status(self, commit, retirement_id) -> dict:
-        state, envelope = self._retirement_state(commit, retirement_id)
-        if envelope is None:
-            return {"state": "ACTIVE", "retirement_id": _require_component(retirement_id, "retirement_id")}
-        return {"state": state, **envelope}
+        with self._policy_adoption_lock(exclusive=False) as acquired:
+            if not acquired:
+                return {
+                    "state": "ACTIVE",
+                    "retirement_id": _require_component(retirement_id, "retirement_id"),
+                }
+            state, envelope = self._retirement_state(commit, retirement_id)
+            if envelope is None:
+                return {
+                    "state": "ACTIVE",
+                    "retirement_id": _require_component(retirement_id, "retirement_id"),
+                }
+            return {"state": state, **envelope}
 
     def _append_retirement_transition(self, event_type, envelope, commit, events):
         event_id = self._retirement_event_payload(envelope, event_type)["event_id"]
@@ -1563,6 +1727,27 @@ class RunStore:
             raise MalformedEvidence("platform cannot provide no-replace retirement move") from error
 
     def retire_review(
+        self,
+        repository,
+        commit,
+        review_id,
+        retirement_id,
+        reason,
+        policy_id,
+        expected_sha256,
+    ) -> dict:
+        with self._policy_adoption_lock():
+            return self._retire_review_locked(
+                repository,
+                commit,
+                review_id,
+                retirement_id,
+                reason,
+                policy_id,
+                expected_sha256,
+            )
+
+    def _retire_review_locked(
         self,
         repository,
         commit,
@@ -1710,6 +1895,10 @@ class RunStore:
         return self.retirement_status(commit, retirement_id)
 
     def recover_retirement(self, retirement_id, commit) -> dict:
+        with self._policy_adoption_lock():
+            return self._recover_retirement_locked(retirement_id, commit)
+
+    def _recover_retirement_locked(self, retirement_id, commit) -> dict:
         envelope = self._read_retirement_envelope(commit, retirement_id)
         if envelope is None:
             raise MalformedEvidence("retirement envelope does not exist")
@@ -2331,6 +2520,14 @@ class RunStore:
     def _commit_record(
         self, target: Path, line: bytes, event_type, commit, config_digest: Optional[str] = None
     ) -> Path:
+        with self._policy_adoption_lock():
+            return self._commit_record_locked(
+                target, line, event_type, commit, config_digest=config_digest
+            )
+
+    def _commit_record_locked(
+        self, target: Path, line: bytes, event_type, commit, config_digest: Optional[str] = None
+    ) -> Path:
         """Commit a record artifact and its evidence event as one transaction.
 
         The target is re-resolved against the durable-path rules before any
@@ -2346,6 +2543,15 @@ class RunStore:
         an already-complete write stays idempotent without a duplicate event.
         """
         _require_durable(os.fspath(target), "record path")
+        try:
+            self.events_path.lstat()
+        except FileNotFoundError:
+            if self._events_parent_has_authoritative_entries():
+                raise MalformedEvidence(
+                    f"authoritative events file is missing: {self.events_path}"
+                )
+            self._append_line(b"")
+        events = self.read_events()
         created = self._atomic_create(target, line)
         if not created:
             existing = self._read_existing_for_compare(target)
@@ -2355,7 +2561,7 @@ class RunStore:
                 )
         content_digest = hashlib.sha256(line).hexdigest()
         if self._has_matching_event(
-            self.read_events(),
+            events,
             event_type,
             commit,
             target,
