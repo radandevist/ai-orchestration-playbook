@@ -380,6 +380,45 @@ class CliTestCase(unittest.TestCase):
         self._write_json(path, record)
         return path
 
+    def write_authoritative_v2_provenance(self, record):
+        for role in ("implementer", "reviewer"):
+            participant = record["provenance"][role]
+            output_path = Path(self.state_dir) / "outputs" / (role + ".json")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes((role + " producer output").encode("utf-8"))
+            run_suffix = participant["run_ref"].split("orchestration://run/", 1)[1]
+            manifest = {
+                "schema_version": 1,
+                "run_ref": participant["run_ref"],
+                "repository": record["repository"],
+                "pr_number": record["pr_number"],
+                "reviewed_commit": record["reviewed_commit"],
+                "registry_version": record["provenance"]["registry_version"],
+                "launcher_registry_version": record["provenance"][
+                    "launcher_registry_version"
+                ],
+                "model_id": participant["model_id"],
+                "runner": participant["runner"],
+                "invocation_model": participant["invocation_model"],
+                "producer_output_path": str(output_path),
+                "producer_output_sha256": hashlib.sha256(
+                    output_path.read_bytes()
+                ).hexdigest(),
+            }
+            manifest_path = Path(self.state_dir) / "runs" / run_suffix / "manifest.json"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_json(str(manifest_path), manifest)
+            manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            envelope = dict(manifest)
+            envelope.update(
+                {"manifest_path": str(manifest_path), "manifest_sha256": manifest_digest}
+            )
+            envelope_path = Path(self.state_dir) / "provenance" / (role + ".json")
+            envelope_path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_json(str(envelope_path), envelope)
+            participant["durable_path"] = str(envelope_path)
+            participant["sha256"] = hashlib.sha256(envelope_path.read_bytes()).hexdigest()
+
     def run_cli(self, *args, extra_env=None, cwd=None):
         env = dict(os.environ)
         env["PATH"] = self.bin_dir + os.pathsep + env.get("PATH", "")
@@ -576,10 +615,143 @@ class CliExitCodeTests(CliTestCase):
             "--policy-id", "policy-v1",
             "--expected-sha256", source_digest,
         )
+        self.assertEqual(2, proc.returncode)
+        self.assertTrue(os.path.exists(review_path))
+        self.assertIn("staged", proc.stderr)
+
+    def test_staged_retirement_requires_matching_policy_and_reason(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        policy = active_policy_config()
+        config = self.write_config(
+            overrides={
+                "model_routes": policy["model_routes"],
+                "review_policy": policy["review_policy"],
+            }
+        )
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
         self.assertEqual(0, proc.returncode, proc.stderr)
-        self.assertFalse(os.path.exists(review_path))
-        events = self.read_events()
-        self.assertEqual("review_retirement_finalized", events[-1]["event_type"])
+        source = self.write_review(commit=COMMIT_A)
+        record = json.loads(Path(source).read_text(encoding="utf-8"))
+        store = RunStore(self.state_dir, PROJECT, PR)
+        store.write_review(COMMIT_A, "legacy", record)
+        review_path = store.review_path(COMMIT_A, "legacy")
+        digest = hashlib.sha256(review_path.read_bytes()).hexdigest()
+        exception_id = policy["review_policy"]["same_family_exceptions"][0]["id"]
+        rejected = self.run_cli(
+            "retire-review",
+            "--config", config,
+            "--pr", str(PR),
+            "--commit", COMMIT_A,
+            "--review-id", "legacy",
+            "--retirement-id", "retire-cli-reason",
+            "--reason", "policy-migration: schema-v2-provenance-required",
+            "--policy-id", exception_id,
+            "--expected-sha256", digest,
+        )
+        self.assertEqual(2, rejected.returncode)
+        accepted = self.run_cli(
+            "retire-review",
+            "--config", config,
+            "--pr", str(PR),
+            "--commit", COMMIT_A,
+            "--review-id", "legacy",
+            "--retirement-id", "retire-cli-allowed",
+            "--reason", "policy-migration: claude-reviewer-forbidden",
+            "--policy-id", exception_id,
+            "--expected-sha256", digest,
+        )
+        self.assertEqual(0, accepted.returncode, accepted.stderr)
+
+    def test_enforced_status_requires_activation_for_exact_tip_and_digest(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        policy = active_policy_config()
+        policy["review_policy"]["mode"] = "enforced"
+        config = self.write_config(
+            overrides={
+                "model_routes": policy["model_routes"],
+                "review_policy": policy["review_policy"],
+            }
+        )
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        record = v2_record()
+        record.update({"repository": REPOSITORY, "pr_number": PR, "reviewed_branch": BRANCH, "reviewed_commit": COMMIT_A})
+        self.write_authoritative_v2_provenance(record)
+        review_path = os.path.join(self.root, "direct-enforced-v2.json")
+        self._write_json(review_path, record)
+        proc = self.run_cli("import-review", "--config", config, "--pr", str(PR), "--review", review_path)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        status = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(0, status.returncode, status.stderr)
+        self.assertEqual("UNVERIFIED", json.loads(status.stdout)["state"])
+        config_data = json.loads(Path(config).read_text(encoding="utf-8"))
+        projected_digest = hashlib.sha256(
+            json.dumps(
+                config_data, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        ).hexdigest()
+        store = RunStore(self.state_dir, PROJECT, PR)
+        store.record_policy_activation(COMMIT_A, "1" * 64, projected_digest)
+        stale_activation = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual("UNVERIFIED", json.loads(stale_activation.stdout)["state"])
+        staged_data = json.loads(json.dumps(config_data))
+        staged_data["review_policy"]["mode"] = "staged"
+        staged_digest = hashlib.sha256(
+            json.dumps(
+                staged_data, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        ).hexdigest()
+        store.record_policy_activation(COMMIT_A, staged_digest, projected_digest)
+        activated = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual("APPROVED", json.loads(activated.stdout)["state"])
+        changed_data = json.loads(json.dumps(config_data))
+        changed_data["review_policy"]["owner_authorization"] += " changed"
+        changed_config = self.write_config(
+            overrides={
+                "model_routes": changed_data["model_routes"],
+                "review_policy": changed_data["review_policy"],
+            },
+            path=os.path.join(self.root, "changed-enforced.json"),
+        )
+        changed = self.run_cli("status", "--config", changed_config, "--pr", str(PR), "--json")
+        self.assertEqual("UNVERIFIED", json.loads(changed.stdout)["state"])
+        self.set_git(head=COMMIT_B)
+        self.set_gh(headRefOid=COMMIT_B, statusCheckRollup=PASSING_ROLLUP)
+        changed_tip = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(3, changed_tip.returncode)
+
+    def test_activation_consumes_projected_state_and_rejects_blocking_review(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        policy = active_policy_config()
+        config = self.write_config(overrides={"model_routes": policy["model_routes"], "review_policy": policy["review_policy"]})
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        review = v2_record()
+        review.update({"repository": REPOSITORY, "pr_number": PR, "reviewed_branch": BRANCH, "reviewed_commit": COMMIT_A, "verdict": "CHANGES_REQUIRED"})
+        self.write_authoritative_v2_provenance(review)
+        review_path = os.path.join(self.root, "blocking-v2.json")
+        self._write_json(review_path, review)
+        proc = self.run_cli("import-review", "--config", config, "--pr", str(PR), "--review", review_path)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        activation = self.run_cli("check-policy-activation", "--config", config, "--pr", str(PR))
+        self.assertEqual(4, activation.returncode)
+
+    def test_import_rejects_duplicate_keys_and_preserves_exact_raw_bytes(self):
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.prepare_approved()
+        record = self.write_review()
+        raw = Path(record).read_text(encoding="utf-8").strip().replace(
+            '"verdict": "APPROVED"', '"verdict":"APPROVED","verdict":"APPROVED"'
+        ) + "  \n"
+        duplicate_path = Path(self.root) / "duplicate.json"
+        duplicate_path.write_bytes(raw.encode("utf-8"))
+        proc = self.run_cli("import-review", "--config", config, "--pr", str(PR), "--review", str(duplicate_path))
+        self.assertEqual(2, proc.returncode)
+        self.assertFalse((Path(self.state_dir) / PROJECT / str(PR) / "reviews" / COMMIT_A / "duplicate.json").exists())
 
     def test_check_policy_activation_rejects_non_staged_policy(self):
         self.set_git()
@@ -636,35 +808,7 @@ class CliExitCodeTests(CliTestCase):
             "reviewed_branch": BRANCH,
             "reviewed_commit": COMMIT_A,
         })
-        for role in ("implementer", "reviewer"):
-            participant = record["provenance"][role]
-            manifest = {
-                "schema_version": 1,
-                "run_ref": participant["run_ref"],
-                "repository": REPOSITORY,
-                "pr_number": PR,
-                "reviewed_commit": COMMIT_A,
-                "registry_version": "models-v1",
-                "launcher_registry_version": "launchers-v1",
-                "model_id": participant["model_id"],
-                "runner": participant["runner"],
-                "invocation_model": participant["invocation_model"],
-                "producer_output_sha256": ("2" if role == "implementer" else "3") * 64,
-            }
-            manifest_path = Path(self.state_dir) / "runs" / (role + "-manifest.json")
-            manifest_path.parent.mkdir(parents=True, exist_ok=True)
-            self._write_json(str(manifest_path), manifest)
-            manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-            envelope = dict(manifest)
-            envelope.update({
-                "manifest_path": str(manifest_path),
-                "manifest_sha256": manifest_digest,
-            })
-            envelope_path = Path(self.state_dir) / "provenance" / (role + ".json")
-            envelope_path.parent.mkdir(parents=True, exist_ok=True)
-            self._write_json(str(envelope_path), envelope)
-            participant["durable_path"] = str(envelope_path)
-            participant["sha256"] = hashlib.sha256(envelope_path.read_bytes()).hexdigest()
+        self.write_authoritative_v2_provenance(record)
         review_path = os.path.join(self.root, "v2-review.json")
         self._write_json(review_path, record)
         proc = self.run_cli(
@@ -904,6 +1048,26 @@ class ImportReviewTests(CliTestCase):
         status = self.run_cli("status", "--config", config, "--pr", str(PR))
         self.assertEqual(0, status.returncode, status.stderr)
         self.assertIn("state: APPROVED", status.stdout)
+
+    def test_import_review_preserves_exact_raw_bytes(self):
+        config = self.prepare_tip()
+        source = Path(self.write_review(commit=COMMIT_A)).read_bytes()
+        raw = source + b"  \n"
+        review = Path(self.root) / "raw-preserved.json"
+        review.write_bytes(raw)
+        proc = self.run_cli(
+            "import-review", "--config", config, "--pr", str(PR), "--review", str(review)
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        stored = (
+            Path(self.state_dir)
+            / PROJECT
+            / str(PR)
+            / "reviews"
+            / COMMIT_A
+            / "raw-preserved.json"
+        )
+        self.assertEqual(raw, stored.read_bytes())
 
     def test_import_review_for_stale_commit_is_rejected(self):
         config = self.prepare_tip(commit=COMMIT_A)

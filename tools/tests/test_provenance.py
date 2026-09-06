@@ -5,8 +5,9 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
-from pr_closure.provenance import ProvenanceValidationError, verify_review_provenance
+from pr_closure.provenance import ProvenanceValidationError, _read_bound, verify_review_provenance
 from pr_closure.review import validate_review
 from tools.tests.test_policy_config import active_policy_config
 from tools.tests.test_review_policy import v2_record
@@ -30,6 +31,10 @@ class ProvenanceTests(unittest.TestCase):
         raw = v2_record()
         for role in ("implementer", "reviewer"):
             participant = raw["provenance"][role]
+            run_suffix = participant["run_ref"].split("orchestration://run/", 1)[1]
+            output_path = self.root / "outputs" / (role + ".json")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes((role + " producer output").encode("utf-8"))
             manifest = {
                 "schema_version": 1,
                 "run_ref": participant["run_ref"],
@@ -43,9 +48,10 @@ class ProvenanceTests(unittest.TestCase):
                 "model_id": participant["model_id"],
                 "runner": participant["runner"],
                 "invocation_model": participant["invocation_model"],
-                "producer_output_sha256": ("2" if role == "implementer" else "3") * 64,
+                "producer_output_path": str(output_path),
+                "producer_output_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
             }
-            manifest_path = self.root / "runs" / (role + "-manifest.json")
+            manifest_path = self.root / "runs" / run_suffix / "manifest.json"
             manifest_sha = write_json(manifest_path, manifest)
             envelope = dict(manifest)
             envelope.update({
@@ -126,6 +132,35 @@ class ProvenanceTests(unittest.TestCase):
         )
         with self.assertRaises(ProvenanceValidationError):
             verify_review_provenance(record, self.root)
+
+    def test_producer_output_must_be_an_authoritative_existing_file(self):
+        envelope = json.loads(Path(self.record.provenance.implementer.durable_path).read_text())
+        Path(envelope["producer_output_path"]).unlink()
+        with self.assertRaises(ProvenanceValidationError):
+            verify_review_provenance(self.record, self.root)
+
+    def test_ancestor_symlink_swap_cannot_escape_the_closure_root(self):
+        participant = self.record.provenance.implementer
+        envelope_path = Path(participant.durable_path)
+        original_open = os.open
+        swapped = False
+        original_envelope = envelope_path.read_bytes()
+
+        def swap_then_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if not swapped and path == "provenance":
+                inside = envelope_path.parent
+                moved = self.root / "provenance-inside"
+                for child in inside.iterdir():
+                    (Path(self.temp.name) / child.name).write_bytes(child.read_bytes())
+                inside.rename(moved)
+                os.symlink(self.temp.name, inside)
+                swapped = True
+            return original_open(path, flags, *args, **kwargs)
+
+        with mock.patch("pr_closure.provenance.os.open", side_effect=swap_then_open):
+            with self.assertRaises(ProvenanceValidationError):
+                _read_bound(participant.durable_path, str(self.root), "implementer envelope")
 
 
 if __name__ == "__main__":

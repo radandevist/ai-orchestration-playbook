@@ -225,6 +225,8 @@ class ProjectConfig:
     ci_required_checks: Tuple[str, ...] = ()
     model_routes: Tuple[ModelRoute, ...] = ()
     review_policy: ReviewPolicy = field(default_factory=ReviewPolicy)
+    config_digest: Optional[str] = None
+    staged_config_digest: Optional[str] = None
 
     def __post_init__(self):
         object.__setattr__(

@@ -40,4 +40,3 @@
 - [ ] Encode the staged rollback target from the design: Anthropic remains forbidden, same-family exceptions are empty, GPT routes to the registered DeepSeek endpoint, and DeepSeek routes to exact Sol.
 - [ ] Test that removing the policy, restoring Claude, or reviving retired evidence can never serve as rollback.
 - [ ] Document the staged migration/activation sequence; do not execute rollback unless the owner requests it.
-
