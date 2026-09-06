@@ -229,6 +229,111 @@ class ReviewRetirementTests(unittest.TestCase):
         result = self.store.recover_retirement("retire-staging-crash", COMMIT)
         self.assertEqual("FINALIZED", result["state"])
 
+    def test_same_argument_replay_recovers_envelope_without_prepared_event(self):
+        original_transition = self.store._append_retirement_transition
+        retirement_id = "retire-public-envelope-gap"
+
+        def crash_before_prepared(event_type, *args, **kwargs):
+            if event_type == RETIREMENT_PREPARED_EVENT:
+                raise RuntimeError("crash before prepared event")
+            return original_transition(event_type, *args, **kwargs)
+
+        with mock.patch.object(
+            self.store, "_append_retirement_transition", side_effect=crash_before_prepared
+        ):
+            with self.assertRaises(RuntimeError):
+                self.store.retire_review(
+                    repository="owner/repo",
+                    commit=COMMIT,
+                    review_id="legacy",
+                    retirement_id=retirement_id,
+                    reason="policy-migration: schema-v2-provenance-required",
+                    policy_id="policy-v1",
+                    expected_sha256=self.source_digest,
+                )
+
+        result = self.store.retire_review(
+            repository="owner/repo",
+            commit=COMMIT,
+            review_id="legacy",
+            retirement_id=retirement_id,
+            reason="policy-migration: schema-v2-provenance-required",
+            policy_id="policy-v1",
+            expected_sha256=self.source_digest,
+        )
+        self.assertEqual("FINALIZED", result["state"])
+
+    def test_same_argument_replay_adopts_verified_staging_without_copied_event(self):
+        original_transition = self.store._append_retirement_transition
+        retirement_id = "retire-public-staging-gap"
+
+        def crash_before_copied(event_type, *args, **kwargs):
+            if event_type == RETIREMENT_COPIED_EVENT:
+                raise RuntimeError("crash before copied event")
+            return original_transition(event_type, *args, **kwargs)
+
+        with mock.patch.object(
+            self.store, "_append_retirement_transition", side_effect=crash_before_copied
+        ):
+            with self.assertRaises(RuntimeError):
+                self.store.retire_review(
+                    repository="owner/repo",
+                    commit=COMMIT,
+                    review_id="legacy",
+                    retirement_id=retirement_id,
+                    reason="policy-migration: schema-v2-provenance-required",
+                    policy_id="policy-v1",
+                    expected_sha256=self.source_digest,
+                )
+
+        result = self.store.retire_review(
+            repository="owner/repo",
+            commit=COMMIT,
+            review_id="legacy",
+            retirement_id=retirement_id,
+            reason="policy-migration: schema-v2-provenance-required",
+            policy_id="policy-v1",
+            expected_sha256=self.source_digest,
+        )
+        self.assertEqual("FINALIZED", result["state"])
+
+    def test_same_argument_replay_recovers_after_committed_source_move(self):
+        original_append = self.store.append_event
+        retirement_id = "retire-public-committed-gap"
+
+        def stop_after_committed(event_type, *args, **kwargs):
+            result = original_append(event_type, *args, **kwargs)
+            if event_type == RETIREMENT_COMMITTED_EVENT:
+                raise RuntimeError("crash after committed")
+            return result
+
+        with mock.patch.object(self.store, "append_event", side_effect=stop_after_committed):
+            with self.assertRaises(RuntimeError):
+                self.store.retire_review(
+                    repository="owner/repo",
+                    commit=COMMIT,
+                    review_id="legacy",
+                    retirement_id=retirement_id,
+                    reason="policy-migration: schema-v2-provenance-required",
+                    policy_id="policy-v1",
+                    expected_sha256=self.source_digest,
+                )
+        self.store._move_no_replace(
+            self.source,
+            self.store.retirement_final_path(COMMIT, retirement_id),
+            self.source_digest,
+        )
+        result = self.store.retire_review(
+            repository="owner/repo",
+            commit=COMMIT,
+            review_id="legacy",
+            retirement_id=retirement_id,
+            reason="policy-migration: schema-v2-provenance-required",
+            policy_id="policy-v1",
+            expected_sha256=self.source_digest,
+        )
+        self.assertEqual("FINALIZED", result["state"])
+
     def test_same_byte_preplanted_staging_is_not_adopted_without_matching_sequence(self):
         retirement_id = "retire-collision"
         staging = self.store.retirement_staging_path(COMMIT, retirement_id)

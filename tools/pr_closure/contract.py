@@ -168,6 +168,18 @@ CONFIG_SEMANTIC_ASYMMETRIES = (
         "argv contract cannot carry them; JSON Schema's \\S pattern accepts NUL, so "
         "this schema accepts spellings the Python gate rejects.",
     ),
+    SemanticAsymmetry(
+        "project_model_registry",
+        "canonical model and launcher-registry membership for project routes is a Python "
+        "registry lookup; JSON Schema can constrain exact spelling shape but cannot reject "
+        "an unknown model or endpoint identity.",
+    ),
+    SemanticAsymmetry(
+        "project_route_policy",
+        "project route uniqueness, same-family exception concordance, forbidden reviewer "
+        "families, and staged/enforced cross-object policy relations are Python checks; "
+        "JSON Schema cannot compare those normalized values.",
+    ),
 )
 
 V2_SEMANTIC_ASYMMETRIES = (
@@ -1003,8 +1015,8 @@ def _project_comment() -> str:
 
 
 def project_json_schema() -> Dict:
-    policy_id = {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$"}
-    model_id = {"type": "string", "pattern": "^[a-z0-9][a-z0-9.-]*$"}
+    policy_id = {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*" + END}
+    model_id = {"type": "string", "pattern": "^[a-z0-9][a-z0-9.-]*" + END}
     non_blank = dict({"type": "string"}, **NON_BLANK)
     exception_def = {
         "type": "object",
