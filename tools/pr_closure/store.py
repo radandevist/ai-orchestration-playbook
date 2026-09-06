@@ -1356,8 +1356,10 @@ class RunStore:
     def _append_line(self, line: bytes) -> None:
         with self._policy_adoption_lock():
             marker_present = self._events_marker_present()
+            expected_identity = None
             try:
-                self.events_path.lstat()
+                entry = self.events_path.lstat()
+                expected_identity = (entry.st_dev, entry.st_ino)
                 create = False
             except FileNotFoundError:
                 if self._events_parent_has_authoritative_entries():
@@ -1372,6 +1374,7 @@ class RunStore:
                     line,
                     "events",
                     create=create,
+                    expected_identity=expected_identity,
                 )
             except PermissionError:
                 raise
