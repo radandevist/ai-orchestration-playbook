@@ -135,6 +135,35 @@ class ReviewRetirementTests(unittest.TestCase):
         result = self.store.recover_retirement("retire-committed", COMMIT)
         self.assertEqual("FINALIZED", result["state"])
 
+    def test_crash_after_final_publication_before_finalized_event_recovers(self):
+        original_transition = self.store._append_retirement_transition
+
+        def crash_before_finalized(event_type, *args, **kwargs):
+            if event_type == RETIREMENT_FINALIZED_EVENT:
+                raise RuntimeError("crash after final publication")
+            return original_transition(event_type, *args, **kwargs)
+
+        retirement_id = "retire-final-publication"
+        with mock.patch.object(
+            self.store,
+            "_append_retirement_transition",
+            side_effect=crash_before_finalized,
+        ):
+            with self.assertRaises(RuntimeError):
+                self.store.retire_review(
+                    repository="owner/repo",
+                    commit=COMMIT,
+                    review_id="legacy",
+                    retirement_id=retirement_id,
+                    reason="policy-migration: schema-v2-provenance-required",
+                    policy_id="policy-v1",
+                    expected_sha256=self.source_digest,
+                )
+        self.assertFalse(self.source.exists())
+        self.assertTrue(self.store.retirement_final_path(COMMIT, retirement_id).exists())
+        result = self.store.recover_retirement(retirement_id, COMMIT)
+        self.assertEqual("FINALIZED", result["state"])
+
     def test_conflicting_replay_is_rejected(self):
         self.store.retire_review(
             repository="owner/repo",
