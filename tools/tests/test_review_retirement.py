@@ -185,6 +185,131 @@ class ReviewRetirementTests(unittest.TestCase):
                 expected_sha256=self.source_digest,
             )
 
+    def test_different_argument_envelope_winner_is_rejected_before_any_retirement_mutation(self):
+        rival_id = "legacy-rival"
+        self.store.write_review(COMMIT, rival_id, self.record)
+        rival_source = self.store.review_path(COMMIT, rival_id)
+        envelope_path = self.store.retirement_envelope_path(COMMIT, "retire-race")
+        original_atomic_create = self.store._atomic_create
+        raced = False
+
+        def publish_rival_winner(target, line):
+            nonlocal raced
+            if target == envelope_path and not raced:
+                raced = True
+                candidate = json.loads(line.decode("utf-8"))
+                candidate["review_id"] = rival_id
+                candidate["source_path"] = str(rival_source.resolve())
+                original_atomic_create(envelope_path, json.dumps(candidate, sort_keys=True).encode("utf-8"))
+                return False
+            return original_atomic_create(target, line)
+
+        with mock.patch.object(
+            self.store, "_atomic_create", side_effect=publish_rival_winner
+        ):
+            with self.assertRaises(EvidenceConflict):
+                self.store.retire_review(
+                    repository="owner/repo",
+                    commit=COMMIT,
+                    review_id="legacy",
+                    retirement_id="retire-race",
+                    reason="policy-migration: schema-v2-provenance-required",
+                    policy_id="policy-v1",
+                    expected_sha256=self.source_digest,
+                )
+
+        self.assertTrue(self.source.exists())
+        self.assertTrue(rival_source.exists())
+        self.assertFalse(self.store.retirement_staging_path(COMMIT, "retire-race").exists())
+        self.assertFalse(self.store.retirement_final_path(COMMIT, "retire-race").exists())
+        self.assertEqual(
+            [COMMIT_EVENT, REVIEW_EVENT, REVIEW_EVENT],
+            [event["event_type"] for event in self.store.read_events()],
+        )
+
+    def test_publication_winner_controls_reject_every_immutable_argument_difference(self):
+        variants = (
+            {"expected_sha256": "0" * 64},
+            {"review_id": "legacy-rival"},
+            {"retirement_id": "retire-other-target"},
+            {"reason": "policy-migration: claude-reviewer-forbidden"},
+            {"policy_id": "policy-other"},
+            {"repository": "other/repo"},
+            {"project": "other-project"},
+            {"pr_number": 8},
+            {"commit": "b" * 40},
+        )
+        for index, overrides in enumerate(variants):
+            root = Path(tempfile.mkdtemp(prefix="review-retirement-race-", dir="/var/tmp"))
+            self.addCleanup(lambda root=root: shutil.rmtree(root, ignore_errors=True))
+            store = RunStore(root, "project", 7)
+            tip = root / "tip.json"
+            tip.write_text("tip")
+            store.record_commit(COMMIT, str(tip))
+            store.write_review(COMMIT, "legacy", self.record)
+            source = store.review_path(COMMIT, "legacy")
+            source_digest = digest(source.read_bytes())
+            rival_id = "legacy-rival"
+            store.write_review(COMMIT, rival_id, self.record)
+            rival_source = store.review_path(COMMIT, rival_id)
+            original_atomic_create = store._atomic_create
+            retirement_id = "retire-race-{0}".format(index)
+            envelope_path = store.retirement_envelope_path(COMMIT, retirement_id)
+
+            def publish_variant(target, line, *, overrides=overrides):
+                if target == envelope_path:
+                    candidate = json.loads(line.decode("utf-8"))
+                    candidate.update(overrides)
+                    if candidate.get("review_id") == rival_id:
+                        candidate["source_path"] = str(rival_source.resolve())
+                    if (
+                        candidate.get("commit") != COMMIT
+                        or candidate.get("pr_number") != 7
+                        or candidate.get("project") != "project"
+                    ):
+                        commit = candidate["commit"]
+                        project = candidate["project"]
+                        pr = candidate["pr_number"]
+                        candidate["source_path"] = str(
+                            (
+                                root
+                                / project
+                                / str(pr)
+                                / "reviews"
+                                / commit
+                                / (candidate["review_id"] + ".json")
+                            ).resolve()
+                        )
+                    original_atomic_create(
+                        envelope_path,
+                        json.dumps(candidate, sort_keys=True).encode("utf-8"),
+                    )
+                    return False
+                return original_atomic_create(target, line)
+
+            with self.subTest(overrides=overrides):
+                with mock.patch.object(
+                    store, "_atomic_create", side_effect=publish_variant
+                ):
+                    with self.assertRaises(EvidenceConflict):
+                        store.retire_review(
+                            repository="owner/repo",
+                            commit=COMMIT,
+                            review_id="legacy",
+                            retirement_id=retirement_id,
+                            reason="policy-migration: schema-v2-provenance-required",
+                            policy_id="policy-v1",
+                            expected_sha256=source_digest,
+                        )
+                self.assertTrue(source.exists())
+                self.assertTrue(rival_source.exists())
+                self.assertFalse(
+                    store.retirement_staging_path(COMMIT, retirement_id).exists()
+                )
+                self.assertFalse(
+                    store.retirement_final_path(COMMIT, retirement_id).exists()
+                )
+
     def test_recovery_finishes_when_envelope_was_published_before_prepared_event(self):
         original_transition = self.store._append_retirement_transition
 

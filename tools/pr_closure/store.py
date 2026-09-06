@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
 import stat
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping, Optional, Tuple
@@ -54,9 +56,10 @@ VERIFICATION_EVENT = "verification"
 REVIEW_EVENT = "review"
 REPAIR_STRATEGY_EVENT = "REPAIR_STRATEGY"
 REVIEW_DISPATCH_EVENT = "REVIEW_DISPATCH"
+POLICY_ADOPTION_EVENT = "policy_adoption"
 
 LIFECYCLE_EVENT_TYPES = frozenset(
-    (REPAIR_STRATEGY_EVENT, REVIEW_DISPATCH_EVENT)
+    (REPAIR_STRATEGY_EVENT, REVIEW_DISPATCH_EVENT, POLICY_ADOPTION_EVENT)
 )
 RETIREMENT_PREPARED_EVENT = "review_retirement_prepared"
 RETIREMENT_COPIED_EVENT = "review_retirement_copied"
@@ -111,6 +114,7 @@ KNOWN_EVENT_TYPES = frozenset(
         "INFRA_FAILURE",
         *RETIREMENT_EVENT_TYPES,
         POLICY_ACTIVATION_EVENT,
+        POLICY_ADOPTION_EVENT,
     )
 )
 
@@ -151,6 +155,23 @@ _RETIREMENT_EVENT_KEYS = frozenset(
         "expected_sha256",
         "reason",
         "policy_id",
+    )
+)
+_POLICY_ADOPTION_EVENT_KEYS = frozenset(
+    (
+        "event_id",
+        "transition_kind",
+        "activation_event_id",
+        "repository",
+        "policy_id",
+        "policy_digest",
+        "mode",
+        "staged_config_digest",
+        "enforced_config_digest",
+        "previous_transition_id",
+        "previous_policy_id",
+        "previous_policy_digest",
+        "previous_enforced_config_digest",
     )
 )
 
@@ -305,6 +326,76 @@ class RunStore:
     @property
     def events_path(self) -> Path:
         return self._base / "events.jsonl"
+
+    @contextmanager
+    def _policy_adoption_lock(self, *, exclusive=True):
+        """Serialize project-wide policy adoption reads and writes.
+
+        The project directory itself is the stable lock inode.  Locking it
+        avoids creating a marker during read-only status/import inspection,
+        while still serializing the first adoption against every other PR in
+        the project.
+        """
+        project_dir = self._root / self._project
+        fd = None
+        acquired = False
+        try:
+            nofollow = getattr(os, "O_NOFOLLOW", None)
+            if nofollow is None:
+                raise MalformedEvidence(
+                    "platform does not provide O_NOFOLLOW for policy adoption lock"
+                )
+            if exclusive:
+                ensure_directory(project_dir)
+            else:
+                try:
+                    project_entry = project_dir.lstat()
+                except FileNotFoundError:
+                    yield False
+                    return
+                except OSError as error:
+                    raise MalformedEvidence(
+                        "cannot validate policy adoption root: {0}".format(project_dir)
+                    ) from error
+                if not stat.S_ISDIR(project_entry.st_mode) or project_dir.is_symlink():
+                    raise MalformedEvidence(
+                        "policy adoption root must be a real directory: {0}".format(
+                            project_dir
+                        )
+                    )
+            flags = os.O_RDONLY | os.O_DIRECTORY | nofollow
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            fd = os.open(os.fspath(project_dir), flags)
+            entry = os.fstat(fd)
+            if not stat.S_ISDIR(entry.st_mode):
+                raise MalformedEvidence(
+                    "policy adoption lock root must be a real directory: {0}".format(
+                        project_dir
+                    )
+                )
+            fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            acquired = True
+            yield True
+        except SecurePathError as error:
+            raise MalformedEvidence(
+                "cannot establish policy adoption lock: {0}".format(project_dir)
+            ) from error
+        except OSError as error:
+            raise MalformedEvidence(
+                "cannot establish policy adoption lock: {0}".format(project_dir)
+            ) from error
+        finally:
+            if fd is not None:
+                if acquired:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     def verification_dir(self, commit) -> Path:
         return self._base / "verification" / _require_commit(commit)
@@ -672,6 +763,351 @@ class RunStore:
                 raise MalformedEvidence("policy activation event id is not bound to its digests")
             matches.append(event)
         return matches
+
+    @staticmethod
+    def _policy_adoption_event_id(identity: Mapping) -> str:
+        raw = json.dumps(
+            dict(identity), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
+    def _require_policy_adoption_event(
+        self, event: dict, number: int, path: Path
+    ) -> None:
+        def fail(detail: str) -> None:
+            raise MalformedEvidence(
+                f"policy adoption event at line {number}: {path}: {detail}"
+            )
+
+        custom = {key: event.get(key) for key in _POLICY_ADOPTION_EVENT_KEYS}
+        actual_custom = frozenset(
+            key for key in event if key not in _REQUIRED_EVENT_KEYS
+        )
+        if actual_custom != _POLICY_ADOPTION_EVENT_KEYS:
+            fail(
+                "keys differ: missing={0}, unknown={1}".format(
+                    sorted(_POLICY_ADOPTION_EVENT_KEYS - actual_custom),
+                    sorted(actual_custom - _POLICY_ADOPTION_EVENT_KEYS),
+                )
+            )
+        if event.get("evidence_path") != _resolve(os.fspath(path)):
+            fail("evidence_path must be the exact events file")
+        if event.get("mode") != "enforced":
+            fail("mode must be enforced")
+        transition_kind = event.get("transition_kind")
+        if transition_kind not in (
+            "initial-adoption",
+            "continued-adoption",
+            "authorized-rollback",
+        ):
+            fail("transition_kind is not an authorized adoption transition")
+        try:
+            _require_digest(event.get("activation_event_id"))
+            _require_lifecycle_text(event.get("repository"), "repository")
+            _require_component(event.get("policy_id"), "policy_id")
+            _require_digest(event.get("policy_digest"))
+            _require_digest(event.get("staged_config_digest"))
+            _require_digest(event.get("enforced_config_digest"))
+            _require_digest(event.get("event_id"))
+        except StoreError as error:
+            fail(str(error))
+        if event.get("repository") == "":
+            fail("repository must be non-blank")
+        previous_id = event.get("previous_transition_id")
+        previous_policy_id = event.get("previous_policy_id")
+        previous_policy_digest = event.get("previous_policy_digest")
+        previous_enforced_digest = event.get("previous_enforced_config_digest")
+        if transition_kind == "initial-adoption":
+            if any(
+                value is not None
+                for value in (
+                    previous_id,
+                    previous_policy_id,
+                    previous_policy_digest,
+                    previous_enforced_digest,
+                )
+            ):
+                fail("initial adoption must not name a predecessor")
+        else:
+            try:
+                _require_digest(previous_id)
+                _require_component(previous_policy_id, "previous_policy_id")
+                _require_digest(previous_policy_digest)
+                _require_digest(previous_enforced_digest)
+            except StoreError as error:
+                fail(str(error))
+        identity = dict(custom)
+        identity.pop("event_id")
+        identity.update(
+            {
+                "project": event["project"],
+                "pr": event["pr"],
+                "commit": event["commit"],
+            }
+        )
+        if self._policy_adoption_event_id(identity) != event.get("event_id"):
+            fail("event_id is not bound to the complete transition identity")
+
+    def project_policy_adoption_events(self) -> Tuple[dict, ...]:
+        """Read every project-scoped policy adoption transition.
+
+        Adoption is intentionally discovered across all PR event streams. A
+        later closure context therefore cannot make an earlier project policy
+        disappear merely by selecting a different tip or PR number.
+        """
+        project_dir = self._root / self._project
+        try:
+            entry = project_dir.lstat()
+        except FileNotFoundError:
+            return ()
+        except OSError as error:
+            raise MalformedEvidence(
+                "cannot validate project adoption root: {0}".format(project_dir)
+            ) from error
+        if not stat.S_ISDIR(entry.st_mode) or project_dir.is_symlink():
+            raise MalformedEvidence(
+                "project adoption root must be a real directory: {0}".format(project_dir)
+            )
+        events = []
+        try:
+            children = sorted(project_dir.iterdir(), key=lambda child: child.name)
+        except OSError as error:
+            raise MalformedEvidence(
+                "cannot enumerate project adoption root: {0}".format(project_dir)
+            ) from error
+        for child in children:
+            if child.name == ".policy-adoption.lock":
+                if child.is_symlink() or not child.is_file():
+                    raise MalformedEvidence(
+                        "policy adoption lock must be a regular file: {0}".format(child)
+                    )
+                continue
+            if re.fullmatch(r"[1-9][0-9]*", child.name) is None:
+                raise MalformedEvidence(
+                    "project adoption child must be a positive PR directory: {0}".format(
+                        child
+                    )
+                )
+            try:
+                child_pr = int(child.name)
+            except ValueError as error:
+                raise MalformedEvidence(
+                    "project adoption PR directory number is invalid: {0}".format(child)
+                ) from error
+            if child.is_symlink() or not child.is_dir():
+                raise MalformedEvidence(
+                    "project adoption PR entry must be a real directory: {0}".format(
+                        child
+                    )
+                )
+            child_store = RunStore(self._root, self._project, child_pr)
+            child_events = child_store.read_events()
+            activations = {
+                event["event_id"]: event
+                for event in child_events
+                if event["event_type"] == POLICY_ACTIVATION_EVENT
+            }
+            for event in child_events:
+                if event["event_type"] != POLICY_ADOPTION_EVENT:
+                    continue
+                activation = activations.get(event["activation_event_id"])
+                if activation is None:
+                    raise MalformedEvidence(
+                        "policy adoption event does not bind a local policy activation"
+                    )
+                if (
+                    activation["commit"] != event["commit"]
+                    or activation.get("staged_config_digest")
+                    != event["staged_config_digest"]
+                    or activation.get("projected_enforced_config_digest")
+                    != event["enforced_config_digest"]
+                ):
+                    raise MalformedEvidence(
+                        "policy adoption event does not match its activation evidence"
+                    )
+                events.append(event)
+        return tuple(events)
+
+    def current_policy_adoption(self, repository: str) -> Optional[dict]:
+        with self._policy_adoption_lock(exclusive=False):
+            return self._current_policy_adoption_unlocked(repository)
+
+    def _current_policy_adoption_unlocked(self, repository: str) -> Optional[dict]:
+        """Return the sole verified leaf of the project's adoption chain."""
+        if not isinstance(repository, str) or not repository.strip():
+            raise MalformedEvidence("repository must be non-blank")
+        events = self.project_policy_adoption_events()
+        if not events:
+            return None
+        for event in events:
+            if event["repository"] != repository:
+                raise MalformedEvidence(
+                    "policy adoption repository does not match the requested repository"
+                )
+        by_id = {}
+        for event in events:
+            event_id = event["event_id"]
+            if event_id in by_id:
+                raise MalformedEvidence("policy adoption transition identity is duplicated")
+            by_id[event_id] = event
+        roots = [event for event in events if event["previous_transition_id"] is None]
+        if len(roots) != 1:
+            raise MalformedEvidence("policy adoption chain must have exactly one root")
+        referenced = set()
+        for event in events:
+            previous_id = event["previous_transition_id"]
+            if previous_id is None:
+                continue
+            previous = by_id.get(previous_id)
+            if previous is None:
+                raise MalformedEvidence("policy adoption predecessor is missing")
+            if previous_id in referenced:
+                raise MalformedEvidence("policy adoption chain branches")
+            referenced.add(previous_id)
+            if any(
+                event[key] != previous[previous_key]
+                for key, previous_key in (
+                    ("previous_policy_id", "policy_id"),
+                    ("previous_policy_digest", "policy_digest"),
+                    ("previous_enforced_config_digest", "enforced_config_digest"),
+                )
+            ):
+                raise MalformedEvidence(
+                    "policy adoption predecessor identity does not match"
+                )
+        leaves = [event for event in events if event["event_id"] not in referenced]
+        if len(leaves) != 1:
+            raise MalformedEvidence("policy adoption chain must have exactly one leaf")
+        head = leaves[0]
+        seen = set()
+        while head["previous_transition_id"] is not None:
+            if head["event_id"] in seen:
+                raise MalformedEvidence("policy adoption chain contains a cycle")
+            seen.add(head["event_id"])
+            head = by_id[head["previous_transition_id"]]
+        return leaves[0]
+
+    def record_policy_adoption(
+        self,
+        repository: str,
+        commit,
+        *,
+        policy_id: str,
+        policy_digest: str,
+        staged_config_digest: str,
+        enforced_config_digest: str,
+        activation_event_id: str,
+        transition_kind: str,
+        previous_adoption: Optional[Mapping] = None,
+    ) -> dict:
+        with self._policy_adoption_lock():
+            return self._record_policy_adoption_locked(
+                repository,
+                commit,
+                policy_id=policy_id,
+                policy_digest=policy_digest,
+                staged_config_digest=staged_config_digest,
+                enforced_config_digest=enforced_config_digest,
+                activation_event_id=activation_event_id,
+                transition_kind=transition_kind,
+                previous_adoption=previous_adoption,
+            )
+
+    def _record_policy_adoption_locked(
+        self,
+        repository: str,
+        commit,
+        *,
+        policy_id: str,
+        policy_digest: str,
+        staged_config_digest: str,
+        enforced_config_digest: str,
+        activation_event_id: str,
+        transition_kind: str,
+        previous_adoption: Optional[Mapping] = None,
+    ) -> dict:
+        """Append one project-scoped, activation-backed policy transition."""
+        commit = _require_commit(commit)
+        if not isinstance(repository, str) or not repository.strip():
+            raise MalformedEvidence("repository must be non-blank")
+        _require_component(policy_id, "policy_id")
+        _require_digest(policy_digest)
+        _require_digest(staged_config_digest)
+        _require_digest(enforced_config_digest)
+        _require_digest(activation_event_id)
+        if transition_kind not in (
+            "initial-adoption",
+            "continued-adoption",
+            "authorized-rollback",
+        ):
+            raise MalformedEvidence("transition_kind is not an authorized adoption transition")
+        activation = self.matching_policy_activation(
+            commit, staged_config_digest, enforced_config_digest
+        )
+        if activation is None or activation.get("event_id") != activation_event_id:
+            raise EvidenceConflict("policy adoption lacks matching activation evidence")
+        actual_previous = self._current_policy_adoption_unlocked(repository)
+        actual_previous_id = (
+            actual_previous.get("event_id") if actual_previous is not None else None
+        )
+        supplied_previous_id = (
+            previous_adoption.get("event_id")
+            if previous_adoption is not None
+            else None
+        )
+        if actual_previous_id != supplied_previous_id:
+            raise EvidenceConflict("policy adoption predecessor changed concurrently")
+        if transition_kind == "initial-adoption":
+            if actual_previous is not None:
+                raise EvidenceConflict("initial adoption cannot replace an existing policy")
+            previous_fields = {
+                "previous_transition_id": None,
+                "previous_policy_id": None,
+                "previous_policy_digest": None,
+                "previous_enforced_config_digest": None,
+            }
+        else:
+            if actual_previous is None:
+                raise EvidenceConflict("non-initial adoption requires an existing policy")
+            previous_fields = {
+                "previous_transition_id": actual_previous["event_id"],
+                "previous_policy_id": actual_previous["policy_id"],
+                "previous_policy_digest": actual_previous["policy_digest"],
+                "previous_enforced_config_digest": actual_previous[
+                    "enforced_config_digest"
+                ],
+            }
+        identity = {
+            "transition_kind": transition_kind,
+            "activation_event_id": activation_event_id,
+            "repository": repository,
+            "policy_id": policy_id,
+            "policy_digest": policy_digest,
+            "mode": "enforced",
+            "staged_config_digest": staged_config_digest,
+            "enforced_config_digest": enforced_config_digest,
+            **previous_fields,
+        }
+        event_id = self._policy_adoption_event_id(
+            {
+                **identity,
+                "project": self._project,
+                "pr": self._pr,
+                "commit": commit,
+            }
+        )
+        for event in self.project_policy_adoption_events():
+            if event["event_id"] == event_id:
+                if all(event.get(key) == value for key, value in identity.items()):
+                    return event
+                raise EvidenceConflict("policy adoption identity collides with existing evidence")
+        return self._append_event(
+            POLICY_ADOPTION_EVENT,
+            commit,
+            os.fspath(self.events_path),
+            payload={"event_id": event_id, **identity},
+        )
+
     def _require_event_envelope(self, event: dict, number: int, path: Path) -> None:
         def fail(detail: str) -> None:
             raise MalformedEvidence(f"event at line {number}: {path}: {detail}")
@@ -765,6 +1201,8 @@ class RunStore:
                     f"event at line {number} missing key(s): {', '.join(missing)}"
                 )
             self._require_event_envelope(event, number, path)
+            if event["event_type"] == POLICY_ADOPTION_EVENT:
+                self._require_policy_adoption_event(event, number, path)
             events.append(event)
         return tuple(events)
 
@@ -928,7 +1366,9 @@ class RunStore:
             "policy_id": envelope["policy_id"],
         }
 
-    def _require_retirement_envelope(self, envelope, commit, retirement_id) -> dict:
+    def _require_retirement_envelope(
+        self, envelope, commit, retirement_id, *, bind_to_store=True
+    ) -> dict:
         if not isinstance(envelope, dict):
             raise MalformedEvidence("retirement envelope must be a JSON object")
         if frozenset(envelope) != _RETIREMENT_ENVELOPE_KEYS:
@@ -937,17 +1377,35 @@ class RunStore:
             raise MalformedEvidence("retirement envelope schema_version must be 1")
         if envelope["operation"] != "REVIEW_RETIREMENT":
             raise MalformedEvidence("retirement envelope operation is invalid")
-        if envelope["project"] != self._project or envelope["pr_number"] != self._pr:
+        try:
+            envelope_project = _require_component(envelope["project"], "project")
+            envelope_pr = _require_pr(envelope["pr_number"])
+            envelope_commit = _require_commit(envelope["commit"])
+            envelope_retirement_id = _require_component(
+                envelope["retirement_id"], "retirement_id"
+            )
+        except StoreError as error:
+            raise MalformedEvidence("retirement envelope identity is malformed") from error
+        if bind_to_store and (
+            envelope_project != self._project
+            or envelope_pr != self._pr
+            or envelope_commit != _require_commit(commit)
+            or envelope_retirement_id != _require_component(retirement_id, "retirement_id")
+        ):
             raise MalformedEvidence("retirement envelope does not bind to this store")
-        if envelope["commit"] != _require_commit(commit):
-            raise MalformedEvidence("retirement envelope commit does not bind to its path")
-        if envelope["retirement_id"] != _require_component(retirement_id, "retirement_id"):
-            raise MalformedEvidence("retirement envelope id does not bind to its path")
-        _require_component(envelope["retirement_id"], "retirement_id")
         _require_review_id(envelope["review_id"])
         if not isinstance(envelope["repository"], str) or not envelope["repository"].strip():
             raise MalformedEvidence("retirement envelope repository must be non-blank")
-        source = _resolve(os.fspath(self.review_path(commit, envelope["review_id"])))
+        source = _resolve(
+            os.fspath(
+                self._root
+                / envelope_project
+                / str(envelope_pr)
+                / "reviews"
+                / envelope_commit
+                / (envelope["review_id"] + ".json")
+            )
+        )
         if envelope["source_path"] != source:
             raise MalformedEvidence("retirement envelope source path is not canonical")
         _require_digest(envelope["expected_sha256"])
@@ -978,7 +1436,10 @@ class RunStore:
         except OSError as error:
             raise MalformedEvidence("cannot read retirement envelope: {0}".format(path)) from error
         return self._require_retirement_envelope(
-            _parse_json_bytes(raw, path, "retirement envelope"), commit, retirement_id
+            _parse_json_bytes(raw, path, "retirement envelope"),
+            commit,
+            retirement_id,
+            bind_to_store=True,
         )
 
     def _retirement_events(self, commit, retirement_id, events=None):
@@ -1172,7 +1633,53 @@ class RunStore:
         }
         if envelope is None:
             self._atomic_create(envelope_path, _serialize(candidate))
-            envelope = self._read_retirement_envelope(commit, retirement_id)
+            try:
+                winner_raw, _winner_digest = self._read_bound_bytes(
+                    envelope_path, "retirement publication winner"
+                )
+                envelope = self._require_retirement_envelope(
+                    _parse_json_bytes(
+                        winner_raw, envelope_path, "retirement publication winner"
+                    ),
+                    commit,
+                    retirement_id,
+                    bind_to_store=False,
+                )
+            except FileNotFoundError as error:
+                raise MalformedEvidence(
+                    "retirement envelope disappeared after publication"
+                ) from error
+            if envelope is None:
+                raise MalformedEvidence("retirement envelope disappeared after publication")
+            candidate_identity = {
+                key: candidate[key]
+                for key in _RETIREMENT_ENVELOPE_KEYS
+                if key != "requested_at"
+            }
+            winner_identity = {
+                key: envelope[key]
+                for key in _RETIREMENT_ENVELOPE_KEYS
+                if key != "requested_at"
+            }
+            if winner_identity != candidate_identity:
+                raise EvidenceConflict(
+                    "retirement envelope winner has different immutable arguments"
+                )
+            # The publication winner owns the source identity and all bytes.
+            # Do not continue with any local caller state after a race.
+            commit = envelope["commit"]
+            retirement_id = envelope["retirement_id"]
+            expected_sha256 = envelope["expected_sha256"]
+            staging_path = self.retirement_staging_path(commit, retirement_id)
+            final_path = self.retirement_final_path(commit, retirement_id)
+            source = Path(envelope["source_path"])
+            raw, actual_digest = self._read_bound_bytes(
+                source, "retirement winner active review record"
+            )
+            if actual_digest != envelope["expected_sha256"]:
+                raise EvidenceConflict(
+                    "retirement winner source digest does not match its envelope"
+                )
         if staging_path.exists() or staging_path.is_symlink():
             if not any(
                 event.get("event_type") == RETIREMENT_COPIED_EVENT

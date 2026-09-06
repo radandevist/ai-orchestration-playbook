@@ -4,6 +4,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -207,6 +208,54 @@ class CommandSequenceDigestTests(StoreTestCase):
         second = store.record_policy_activation(COMMIT_A, "3" * 64, "4" * 64)
         self.assertNotEqual(first["event_id"], second["event_id"])
         self.assertEqual(2, len([event for event in store.read_events() if event["event_type"] == "policy_activation"]))
+
+    def test_policy_adoption_cross_pr_writers_share_a_serialized_project_lock(self):
+        policy_id = "policy-one"
+        policy_digest = "3" * 64
+        initial = RunStore(self.root, "proj", 6)
+        initial_activation = initial.record_policy_activation(COMMIT_A, "1" * 64, "2" * 64)
+        initial_adoption = initial.record_policy_adoption(
+            "owner/repo",
+            COMMIT_A,
+            policy_id=policy_id,
+            policy_digest=policy_digest,
+            staged_config_digest="1" * 64,
+            enforced_config_digest="2" * 64,
+            activation_event_id=initial_activation["event_id"],
+            transition_kind="initial-adoption",
+        )
+        contender = RunStore(self.root, "proj", 7)
+        activation = contender.record_policy_activation(COMMIT_B, "4" * 64, "5" * 64)
+        started = threading.Event()
+
+        def write_contender():
+            started.set()
+            return contender.record_policy_adoption(
+                "owner/repo",
+                COMMIT_B,
+                policy_id=policy_id,
+                policy_digest=policy_digest,
+                staged_config_digest="4" * 64,
+                enforced_config_digest="5" * 64,
+                activation_event_id=activation["event_id"],
+                transition_kind="continued-adoption",
+                previous_adoption=initial_adoption,
+            )
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            with initial._policy_adoption_lock():
+                future = executor.submit(write_contender)
+                self.assertTrue(started.wait(timeout=1))
+                time.sleep(0.05)
+                self.assertFalse(future.done())
+            self.assertEqual(COMMIT_B, future.result(timeout=2)["commit"])
+        finally:
+            executor.shutdown(wait=True)
+        self.assertEqual(
+            COMMIT_B,
+            initial.current_policy_adoption("owner/repo")["commit"],
+        )
 
 
 class RunStorePathTests(StoreTestCase):

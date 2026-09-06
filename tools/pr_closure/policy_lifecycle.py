@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from typing import Mapping
 
@@ -92,6 +93,80 @@ def _without_mode(raw: Mapping) -> dict:
 
 def _route_as_mapping(route: ModelRoute) -> dict:
     return {name: getattr(route, name) for name in ModelRoute.__dataclass_fields__}
+
+
+def policy_identity(config) -> tuple[str, str]:
+    """Return the stable ID and digest for a policy, excluding its mode.
+
+    ``staged`` and ``enforced`` are transition modes for the same policy
+    content.  The project-scoped adoption record binds this content identity
+    separately from each PR's full configuration digest.
+    """
+    policy = config.review_policy
+    payload = {
+        "owner_authorization": policy.owner_authorization,
+        "forbidden_reviewer_families": list(policy.forbidden_reviewer_families),
+        "same_family_exceptions": [
+            {
+                name: getattr(exception, name)
+                for name in SameFamilyReviewException.__dataclass_fields__
+            }
+            for exception in policy.same_family_exceptions
+        ],
+        "model_routes": [
+            _route_as_mapping(route)
+            for route in config.model_routes
+        ],
+    }
+    raw = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
+    return "review-policy-" + digest, digest
+
+
+def validate_adopted_policy_context(config, adoption: Mapping) -> None:
+    """Reject config authority that does not match the adopted project policy.
+
+    A staged exact rollback target is the only different policy permitted to
+    exist while the owner-authorized rollback transition is being migrated.
+    It remains non-authoritative until its own activation/adoption event.
+    """
+    if adoption.get("project") != config.project:
+        raise ConfigValidationError("policy adoption project does not match configuration")
+    if adoption.get("repository") != config.repository:
+        raise ConfigValidationError("policy adoption repository does not match configuration")
+    policy_id, digest = policy_identity(config)
+    if adoption.get("policy_id") == policy_id and adoption.get("policy_digest") == digest:
+        if (
+            config.review_policy.mode is ReviewPolicyMode.ENFORCED
+            and adoption.get("enforced_config_digest") != config.config_digest
+        ):
+            raise ConfigValidationError(
+                "enforced configuration does not match the adopted transition"
+            )
+        return
+    if config.review_policy.mode is ReviewPolicyMode.STAGED and is_exact_rollback_target(config):
+        return
+    raise ConfigValidationError(
+        "configuration does not match the adopted project policy; policy removal or replacement is not a rollback"
+    )
+
+
+def policy_transition_kind(config, adoption: Mapping | None) -> str:
+    """Return the authorized adoption transition for a staged config."""
+    if adoption is None:
+        return "initial-adoption"
+    validate_adopted_policy_context(config, adoption)
+    policy_id, digest = policy_identity(config)
+    if adoption.get("policy_id") == policy_id and adoption.get("policy_digest") == digest:
+        return "continued-adoption"
+    if config.review_policy.mode is ReviewPolicyMode.STAGED and is_exact_rollback_target(config):
+        return "authorized-rollback"
+    raise ConfigValidationError("policy transition is not an authorized staged rollback")
 
 
 def is_exact_rollback_target(config: Mapping) -> bool:
