@@ -201,6 +201,13 @@ class CommandSequenceDigestTests(StoreTestCase):
         fast = command_sequence_digest(commands, verification_command_timeout_seconds=4)
         self.assertNotEqual(slow, fast)
 
+    def test_distinct_policy_activation_identities_at_one_tip_do_not_conflict(self):
+        store = RunStore(self.root, "proj", 7)
+        first = store.record_policy_activation(COMMIT_A, "1" * 64, "2" * 64)
+        second = store.record_policy_activation(COMMIT_A, "3" * 64, "4" * 64)
+        self.assertNotEqual(first["event_id"], second["event_id"])
+        self.assertEqual(2, len([event for event in store.read_events() if event["event_type"] == "policy_activation"]))
+
 
 class RunStorePathTests(StoreTestCase):
     def test_rejects_escaped_project_components(self):

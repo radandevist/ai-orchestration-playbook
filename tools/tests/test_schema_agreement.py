@@ -11,11 +11,13 @@ from pr_closure.contract import (
     SEMANTIC_ASYMMETRIES,
     ConfigValidationError,
     project_json_schema,
+    review_json_schema_v2,
     validate_project_config,
 )
 from pr_closure.review import ReviewValidationError, validate_review
 
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "review-record-v1.json"
+SCHEMA_V2_PATH = Path(__file__).resolve().parent.parent / "schemas" / "review-record-v2.json"
 CONFIG_SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "project-closure-v1.json"
 REQUIREMENTS_PATH = Path(__file__).resolve().parent / "requirements-test.txt"
 
@@ -653,6 +655,20 @@ def config_agreement_corpus():
     )
 
     return cases
+
+
+class V2SchemaAgreementTests(unittest.TestCase):
+    def test_generated_v2_schema_matches_contract_and_mentions_policy_asymmetries(self):
+        generated = review_json_schema_v2()
+        checked_in = json.loads(SCHEMA_V2_PATH.read_text())
+        self.assertEqual(generated, checked_in)
+        comment = generated["$comment"]
+        for term in ("policy", "canonical model", "launcher", "provenance", "route"):
+            self.assertIn(term, comment.lower())
+
+    def test_rollout_plan_has_no_eof_blank_line(self):
+        path = Path(__file__).resolve().parents[2] / "docs" / "superpowers" / "plans" / "2026-09-05-publyapp-review-policy-rollout.md"
+        self.assertFalse(path.read_bytes().endswith(b"\n\n"))
 
 
 class ConfigCorpusShapeTests(unittest.TestCase):

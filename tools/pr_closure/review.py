@@ -26,6 +26,7 @@ from pr_closure.model import (
     Verdict,
 )
 from pr_closure.registries import RegistryValidationError, require_launcher, require_model
+from pr_closure.dispatch import select_route
 
 TOP_LEVEL_FIELDS = ALLOWED_TOP_LEVEL_KEYS
 FINDING_FIELDS = ALLOWED_FINDING_KEYS
@@ -241,12 +242,10 @@ def _validate_v2_identity(
                 "implementer and reviewer must come from a different model family"
             )
     else:
-        matches = [
-            route for route in model_routes if route.implementer_model == implementer_model
-        ]
-        if len(matches) != 1:
-            raise ReviewValidationError("implementer model does not match exactly one policy route")
-        route = matches[0]
+        try:
+            route = select_route(model_routes, implementer_model)
+        except ValueError as error:
+            raise ReviewValidationError(str(error)) from error
         if reviewer_family in review_policy.forbidden_reviewer_families:
             raise ReviewValidationError("reviewer family is forbidden by project policy")
         route_identity = (

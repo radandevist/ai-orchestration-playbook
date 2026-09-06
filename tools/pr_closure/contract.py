@@ -170,6 +170,32 @@ CONFIG_SEMANTIC_ASYMMETRIES = (
     ),
 )
 
+V2_SEMANTIC_ASYMMETRIES = (
+    SemanticAsymmetry(
+        "canonical_model_registry",
+        "canonical model and family resolution is a Python registry lookup; JSON Schema can "
+        "only constrain the spelling shape and cannot reject unknown model IDs or family-only "
+        "labels.",
+    ),
+    SemanticAsymmetry(
+        "launcher_provenance_membership",
+        "launcher membership, immutable run-manifest identity, producer-output existence, and "
+        "independent output digest verification are Python checks; JSON Schema cannot read "
+        "registries or the closure filesystem.",
+    ),
+    SemanticAsymmetry(
+        "project_route_policy",
+        "project model-route selection, forbidden reviewer families, and configured exception "
+        "policy IDs are normalized ProjectConfig checks; JSON Schema cannot compare those "
+        "cross-object values.",
+    ),
+    SemanticAsymmetry(
+        "duplicate_json_keys",
+        "duplicate JSON object keys are rejected by the strict importer before durable storage; "
+        "JSON Schema validates the decoded object after a parser has already collapsed keys.",
+    ),
+)
+
 
 RECORD_FIELDS = (
     _f("schema_version", "const_int", {"value": 1}),
@@ -732,6 +758,18 @@ def validate_project_config(record: Mapping) -> ProjectConfig:
     are resolved before they are returned; no filesystem state is created.
     """
     record = require_mapping(record, "project config")
+    config_digest = configuration_digest(record)
+    staged_config_digest = None
+    raw_policy = record.get("review_policy")
+    if isinstance(raw_policy, Mapping) and raw_policy.get("mode") in (
+        ReviewPolicyMode.STAGED.value,
+        ReviewPolicyMode.ENFORCED.value,
+    ):
+        staged_record = dict(record)
+        staged_policy = dict(raw_policy)
+        staged_policy["mode"] = ReviewPolicyMode.STAGED.value
+        staged_record["review_policy"] = staged_policy
+        staged_config_digest = configuration_digest(staged_record)
     try:
         reject_unknown_keys(record, PROJECT_CONFIG_ALLOWED_KEYS, "project config")
         require_present(record, PROJECT_CONFIG_REQUIRED_KEYS, "project config")
@@ -758,6 +796,8 @@ def validate_project_config(record: Mapping) -> ProjectConfig:
         ci_required_checks=values.get("ci_required_checks", ()),
         model_routes=model_routes,
         review_policy=review_policy,
+        config_digest=config_digest,
+        staged_config_digest=staged_config_digest,
     )
 
 
@@ -859,6 +899,7 @@ def json_schema() -> Dict:
 
 def review_json_schema_v2() -> Dict:
     schema = copy.deepcopy(json_schema())
+    schema["$comment"] = _comment(v2=True)
     schema["$id"] = "https://ai-orchestration-playbook/schemas/review-record-v2.json"
     schema["title"] = "Structured Exact-Model Adversarial Review Record"
     schema["description"] = (
@@ -933,7 +974,8 @@ def review_json_schema_v2() -> Dict:
     return schema
 
 
-def _comment() -> str:
+def _comment(v2: bool = False) -> str:
+    asymmetries = SEMANTIC_ASYMMETRIES + (V2_SEMANTIC_ASYMMETRIES if v2 else ())
     return (
         "Generated from tools/pr_closure/contract.py by "
         "PYTHONPATH=tools python3 -m pr_closure.contract - never hand-edit. "
@@ -941,7 +983,7 @@ def _comment() -> str:
         "documented verbatim: "
         + "; ".join(
             f"{asymmetry.id}: {asymmetry.description}"
-            for asymmetry in SEMANTIC_ASYMMETRIES
+            for asymmetry in asymmetries
         )
     )
 

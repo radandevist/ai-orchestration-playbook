@@ -51,6 +51,7 @@ from pr_closure.model import (
     ReviewPolicyMode,
 )
 from pr_closure.provenance import ProvenanceValidationError, verify_review_provenance
+from pr_closure.policy_lifecycle import authorize_retirement, validate_activation_projection
 from pr_closure.review import require_live_binding, validate_review
 from pr_closure.sources import (
     INFRA_FAILURE_EVENT,
@@ -150,6 +151,26 @@ def _read_config(path: str) -> Mapping:
         raise CliInputError("config {0} is not valid JSON: {1}".format(path, error))
     if not isinstance(data, dict):
         raise CliInputError("config {0} must be a JSON object".format(path))
+    return data
+
+
+def _strict_json_object(raw: bytes, label: str) -> Mapping:
+    def pairs(items):
+        value = {}
+        for key, item in items:
+            if key in value:
+                raise CliInputError("{0} contains a duplicate JSON key: {1}".format(label, key))
+            value[key] = item
+        return value
+
+    try:
+        data = json.loads(raw, object_pairs_hook=pairs)
+    except CliInputError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CliInputError("{0} is not valid UTF-8 JSON: {1}".format(label, error)) from error
+    if not isinstance(data, dict):
+        raise CliInputError("{0} must be a JSON object".format(label))
     return data
 
 
@@ -326,7 +347,7 @@ def _contradictions_of(snapshot) -> Tuple[str, ...]:
     return tuple(out)
 
 
-def _status_snapshot(config, pr_number):
+def _status_snapshot(config, pr_number, *, require_activation=True):
     """Derive the live fail-closed state from Git/GitHub plus durable records.
 
     Strictly read-only: no commit, verification, review, or projection write
@@ -404,6 +425,20 @@ def _status_snapshot(config, pr_number):
         and config.review_policy.mode.value == "staged"
     ):
         review_policy_reason = "review_policy_staged"
+    elif (
+        require_activation
+        and config.review_policy.mode is ReviewPolicyMode.ENFORCED
+    ):
+        if config.config_digest is None:
+            review_policy_reason = "policy_activation_missing_or_stale"
+        else:
+            activation = store.matching_policy_activation(
+                facts.local_commit,
+                config.staged_config_digest,
+                config.config_digest,
+            ) if config.staged_config_digest is not None else None
+            if activation is None:
+                review_policy_reason = "policy_activation_missing_or_stale"
     for _stem, data in store.bound_reviews(facts.local_commit):
         if config.review_policy.mode is not None and data.get("schema_version") == 1:
             review_policy_reason = "schema_v1_review_requires_retirement"
@@ -612,19 +647,12 @@ def cmd_import_review(config, args) -> int:
     github = GitHubSource(config.repository, args.pr)
     pr = _require_live_pr(github, config)
     try:
-        raw = Path(args.review).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
+        raw = Path(args.review).read_bytes()
+    except OSError as error:
         raise CliInputError(
             "cannot read review artifact {0}: {1}".format(args.review, error)
         )
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise CliInputError(
-            "review artifact {0} is not valid JSON: {1}".format(args.review, error)
-        )
-    if not isinstance(data, dict):
-        raise CliInputError("review artifact must be a JSON object")
+    data = _strict_json_object(raw, "review artifact {0}".format(args.review))
     record = validate_review(
         data,
         review_policy=config.review_policy,
@@ -645,7 +673,7 @@ def cmd_import_review(config, args) -> int:
             "record-verification at the exact commit first"
         )
     review_id = Path(args.review).stem
-    store.write_review(record.reviewed_commit, review_id, data)
+    store.write_review_bytes(record.reviewed_commit, review_id, raw)
     return EXIT_OK
 
 
@@ -658,6 +686,9 @@ def cmd_retire_review(config, args) -> int:
     durable_tip = store.current_commit()
     if durable_tip != args.commit:
         raise CliInputError("retirement commit must match the durably recorded tip")
+    authorize_retirement(
+        config, store, args.commit, args.review_id, args.reason, args.policy_id
+    )
     result = store.retire_review(
         repository=config.repository,
         commit=args.commit,
@@ -701,19 +732,18 @@ def cmd_check_policy_activation(config, args) -> int:
     else:
         projected_data = _read_config(args.projected_config)
         projected_config = validate_project_config(projected_data)
-        expected_projected = _activation_config_data(
-            current_data, ReviewPolicyMode.ENFORCED.value
-        )
-        if projected_data != expected_projected:
-            raise CliInputError(
-                "projected enforced config must differ from staged config only by mode"
-            )
+    try:
+        validate_activation_projection(current_data, projected_data)
+    except ConfigValidationError as error:
+        raise CliInputError(str(error)) from error
     if projected_config.review_policy.mode is not ReviewPolicyMode.ENFORCED:
         raise CliInputError("projected policy must be enforced")
     staged_digest = configuration_digest(current_data)
     projected_digest = configuration_digest(projected_data)
     try:
-        snapshot, _decision = _status_snapshot(config, args.pr)
+        snapshot, decision = _status_snapshot(
+            projected_config, args.pr, require_activation=False
+        )
     except (SourceMalformed, SourceUnavailable, MalformedEvidence) as error:
         payload = _activation_refusal(
             ["activation_evidence_invalid: {0}".format(error)],
@@ -737,6 +767,12 @@ def cmd_check_policy_activation(config, args) -> int:
     if snapshot.mergeable is not None and snapshot.mergeable.value == "CONFLICTING":
         reasons.append("merge_conflict")
     reasons.extend(_contradictions_of(snapshot))
+    if decision.state not in (
+        ClosureState.APPROVED,
+        ClosureState.APPROVED_WITH_FOLLOW_UPS,
+    ):
+        reasons.append("projected_normal_state_ineligible:{0}".format(decision.state.value))
+        reasons.extend(decision.reasons)
     compliant_reviews = 0
     try:
         for _review_id, data in store.bound_reviews(snapshot.local_commit):

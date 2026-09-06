@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import stat
 from pathlib import Path
 from typing import Mapping
 
 from pr_closure.model import ProvenanceParticipant, ReviewRecord
+from pr_closure.secure_paths import SecurePathError, read_contained_file
 
 
 class ProvenanceValidationError(ValueError):
@@ -26,52 +25,33 @@ _MANIFEST_KEYS = frozenset({
     "model_id",
     "runner",
     "invocation_model",
+    "producer_output_path",
     "producer_output_sha256",
 })
 _ENVELOPE_KEYS = _MANIFEST_KEYS | frozenset({"manifest_path", "manifest_sha256"})
 
 
-def _is_under(path: str, root: str) -> bool:
-    return path == root or path.startswith(root + os.sep)
-
-
 def _read_bound(path_value: str, root_value: str, label: str) -> tuple[bytes, str]:
-    if not isinstance(path_value, str) or not os.path.isabs(path_value):
-        raise ProvenanceValidationError(label + " path must be absolute")
-    root = os.path.realpath(os.fspath(root_value))
-    path = os.path.realpath(path_value)
-    if not _is_under(path, root):
-        raise ProvenanceValidationError(label + " path escapes the closure root")
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path_value, os.O_RDONLY | nofollow)
-    except OSError as error:
+        return read_contained_file(path_value, root_value, label)
+    except (OSError, SecurePathError) as error:
         raise ProvenanceValidationError(
             "cannot open {0}: {1}".format(label, error)
         ) from error
-    try:
-        opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
-            raise ProvenanceValidationError(label + " must be a single-link regular file")
-        chunks = []
-        while True:
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        raw = b"".join(chunks)
-        entry = os.lstat(path_value)
-        if (
-            not stat.S_ISREG(entry.st_mode)
-            or entry.st_nlink != 1
-            or (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino)
-        ):
-            raise ProvenanceValidationError(label + " changed identity during read")
-    except OSError as error:
-        raise ProvenanceValidationError("cannot verify {0}".format(label)) from error
-    finally:
-        os.close(fd)
-    return raw, hashlib.sha256(raw).hexdigest()
+
+
+def _manifest_path(closure_root: Path, run_ref: str) -> str:
+    prefix = "orchestration://run/"
+    if not isinstance(run_ref, str) or not run_ref.startswith(prefix):
+        raise ProvenanceValidationError("run_ref must use the authoritative orchestration://run/ form")
+    relative = run_ref[len(prefix):]
+    parts = tuple(relative.split("/"))
+    if not parts or any(
+        not part or part in (".", "..") or "\\" in part or "\x00" in part
+        for part in parts
+    ):
+        raise ProvenanceValidationError("run_ref contains an unsafe manifest component")
+    return os.path.abspath(os.path.join(os.fspath(closure_root), "runs", *parts, "manifest.json"))
 
 
 def _json_object(raw: bytes, label: str) -> Mapping:
@@ -179,6 +159,19 @@ def _verify_participant(
             )
     if manifest.get("producer_output_sha256") != producer_digest:
         raise ProvenanceValidationError(label + " producer output digest mismatch")
+    expected_manifest_path = _manifest_path(closure_root, participant.run_ref)
+    if manifest_path != expected_manifest_path:
+        raise ProvenanceValidationError(label + " manifest is not the authoritative run manifest")
+    producer_path = envelope.get("producer_output_path")
+    if producer_path != manifest.get("producer_output_path"):
+        raise ProvenanceValidationError(label + " producer output path mismatch")
+    _output_raw, actual_output_digest = _read_bound(
+        producer_path,
+        os.fspath(closure_root),
+        label + " producer output",
+    )
+    if actual_output_digest != producer_digest:
+        raise ProvenanceValidationError(label + " producer output digest is not independently verified")
 
 
 def verify_review_provenance(record: ReviewRecord, closure_root: Path) -> None:

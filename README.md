@@ -267,7 +267,8 @@ forbidden; removing the policy or reviving retired evidence is not a rollback.
 
 The gate reduces wasted cycles, not review pressure: every green tip gets a fresh independent
 cross-family review, every fix is re-reviewed, and there is no maximum review count. The reviewer
-family must differ from the implementer family.
+family is cross-family by default; an explicitly configured, owner-authorized
+same-family exception may be used only when the exact policy route and provenance permit it.
 
 ---
 

@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from pr_closure.store import (
     COMMIT_EVENT,
@@ -154,3 +155,80 @@ class ReviewRetirementTests(unittest.TestCase):
                 policy_id="policy-v1",
                 expected_sha256=self.source_digest,
             )
+
+    def test_recovery_finishes_when_envelope_was_published_before_prepared_event(self):
+        original_transition = self.store._append_retirement_transition
+
+        def crash_before_prepared(event_type, *args, **kwargs):
+            if event_type == RETIREMENT_PREPARED_EVENT:
+                raise RuntimeError("crash before prepared event")
+            return original_transition(event_type, *args, **kwargs)
+
+        with mock.patch.object(self.store, "_append_retirement_transition", side_effect=crash_before_prepared):
+            with self.assertRaises(RuntimeError):
+                self.store.retire_review(
+                    repository="owner/repo",
+                    commit=COMMIT,
+                    review_id="legacy",
+                    retirement_id="retire-envelope-crash",
+                    reason="policy-migration: schema-v2-provenance-required",
+                    policy_id="policy-v1",
+                    expected_sha256=self.source_digest,
+                )
+        result = self.store.recover_retirement("retire-envelope-crash", COMMIT)
+        self.assertEqual("FINALIZED", result["state"])
+
+    def test_recovery_finishes_when_staging_was_published_before_copied_event(self):
+        original_transition = self.store._append_retirement_transition
+
+        def crash_before_copied(event_type, *args, **kwargs):
+            if event_type == RETIREMENT_COPIED_EVENT:
+                raise RuntimeError("crash before copied event")
+            return original_transition(event_type, *args, **kwargs)
+
+        with mock.patch.object(self.store, "_append_retirement_transition", side_effect=crash_before_copied):
+            with self.assertRaises(RuntimeError):
+                self.store.retire_review(
+                    repository="owner/repo",
+                    commit=COMMIT,
+                    review_id="legacy",
+                    retirement_id="retire-staging-crash",
+                    reason="policy-migration: schema-v2-provenance-required",
+                    policy_id="policy-v1",
+                    expected_sha256=self.source_digest,
+                )
+        result = self.store.recover_retirement("retire-staging-crash", COMMIT)
+        self.assertEqual("FINALIZED", result["state"])
+
+    def test_same_byte_preplanted_staging_is_not_adopted_without_matching_sequence(self):
+        retirement_id = "retire-collision"
+        staging = self.store.retirement_staging_path(COMMIT, retirement_id)
+        staging.parent.mkdir(parents=True, exist_ok=True)
+        staging.write_bytes(self.source.read_bytes())
+        with self.assertRaises((EvidenceConflict, MalformedEvidence)):
+            self.store.retire_review(
+                repository="owner/repo",
+                commit=COMMIT,
+                review_id="legacy",
+                retirement_id=retirement_id,
+                reason="policy-migration: schema-v2-provenance-required",
+                policy_id="policy-v1",
+                expected_sha256=self.source_digest,
+            )
+
+    def test_parent_fsync_failure_is_fatal(self):
+        with mock.patch(
+            "pr_closure.secure_paths._fsync_directory_fd",
+            side_effect=OSError("simulated parent fsync failure"),
+        ):
+            with self.assertRaises(MalformedEvidence):
+                self.store.retire_review(
+                    repository="owner/repo",
+                    commit=COMMIT,
+                    review_id="legacy",
+                    retirement_id="retire-fsync-failure",
+                    reason="policy-migration: schema-v2-provenance-required",
+                    policy_id="policy-v1",
+                    expected_sha256=self.source_digest,
+                )
+        self.assertTrue(self.source.exists())

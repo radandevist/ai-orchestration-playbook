@@ -5,7 +5,6 @@ import json
 import os
 import re
 import stat
-import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +16,13 @@ from pr_closure.contract import (
     legacy_command_sequence_digest,
 )
 from pr_closure.model import ClosureState
+from pr_closure.secure_paths import (
+    SecurePathError,
+    atomic_create as secure_atomic_create,
+    ensure_directory,
+    read_contained_file,
+    rename_no_replace,
+)
 
 
 class StoreError(ValueError):
@@ -614,13 +620,58 @@ class RunStore:
                 continue
             if all(event.get(key) == value for key, value in payload.items()):
                 return event
-            raise EvidenceConflict("policy activation event conflicts with an existing result")
         return self.append_event(
             POLICY_ACTIVATION_EVENT,
             commit,
             os.fspath(self.events_path),
             payload=payload,
         )
+
+    def matching_policy_activation(
+        self, commit, staged_config_digest, projected_config_digest
+    ) -> Optional[dict]:
+        commit = _require_commit(commit)
+        staged_config_digest = _require_digest(staged_config_digest)
+        projected_config_digest = _require_digest(projected_config_digest)
+        expected_id = hashlib.sha256(
+            (commit + staged_config_digest + projected_config_digest).encode("ascii")
+        ).hexdigest()
+        matches = []
+        for event in self.read_events():
+            if (
+                event["event_type"] == POLICY_ACTIVATION_EVENT
+                and event["commit"] == commit
+                and event.get("event_id") == expected_id
+                and event.get("result") == "ELIGIBLE"
+                and event.get("staged_config_digest") == staged_config_digest
+                and event.get("projected_enforced_config_digest") == projected_config_digest
+            ):
+                matches.append(event)
+        if len(matches) > 1:
+            raise MalformedEvidence("policy activation identity is duplicated")
+        return matches[0] if matches else None
+
+    def policy_activations_for_projected(self, commit, projected_config_digest) -> list:
+        commit = _require_commit(commit)
+        projected_config_digest = _require_digest(projected_config_digest)
+        matches = []
+        for event in self.read_events():
+            if (
+                event["event_type"] != POLICY_ACTIVATION_EVENT
+                or event["commit"] != commit
+                or event.get("result") != "ELIGIBLE"
+                or event.get("projected_enforced_config_digest") != projected_config_digest
+            ):
+                continue
+            staged_digest = event.get("staged_config_digest")
+            _require_digest(staged_digest)
+            expected_id = hashlib.sha256(
+                (commit + staged_digest + projected_config_digest).encode("ascii")
+            ).hexdigest()
+            if event.get("event_id") != expected_id:
+                raise MalformedEvidence("policy activation event id is not bound to its digests")
+            matches.append(event)
+        return matches
     def _require_event_envelope(self, event: dict, number: int, path: Path) -> None:
         def fail(detail: str) -> None:
             raise MalformedEvidence(f"event at line {number}: {path}: {detail}")
@@ -794,6 +845,18 @@ class RunStore:
         if "reviewed_commit" in record and record["reviewed_commit"] != commit:
             raise MalformedEvidence("review record reviewed_commit contradicts its store path")
         line = _serialize(record)
+        return self.write_review_bytes(commit, review_id, line)
+
+    def write_review_bytes(self, commit, review_id, line: bytes) -> Path:
+        """Persist already-validated review bytes without reserialization."""
+        commit = _require_commit(commit)
+        review_id = _require_review_id(review_id)
+        if not isinstance(line, bytes):
+            raise MalformedEvidence("review record bytes must be bytes")
+        record = _parse_json_bytes(line, self.review_path(commit, review_id), "review record")
+        if "reviewed_commit" in record and record["reviewed_commit"] != commit:
+            raise MalformedEvidence("review record reviewed_commit contradicts its store path")
+        target = self.review_path(commit, review_id)
         return self._commit_record(target, line, REVIEW_EVENT, commit)
 
     def review_exists(self, commit, review_id) -> bool:
@@ -1027,32 +1090,16 @@ class RunStore:
             if target_digest != expected_digest:
                 raise EvidenceConflict("retirement final path already contains different bytes")
             if source.exists():
-                _source_raw, source_digest = self._read_bound_bytes(source, "active review record")
-                if source_digest != expected_digest:
-                    raise MalformedEvidence("active review changed before retirement move")
-                os.unlink(os.fspath(source))
+                raise MalformedEvidence("retirement final and active source both exist")
             return
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            os.link(os.fspath(source), os.fspath(target))
+            ensure_directory(target.parent)
+            rename_no_replace(source, target)
         except FileExistsError:
             self._move_no_replace(source, target, expected_digest)
             return
-        except OSError as error:
+        except (OSError, SecurePathError) as error:
             raise MalformedEvidence("platform cannot provide no-replace retirement move") from error
-        try:
-            os.unlink(os.fspath(source))
-        except OSError as error:
-            raise MalformedEvidence("retirement move could not remove the active source") from error
-        for directory in (source.parent, target.parent):
-            try:
-                fd = os.open(os.fspath(directory), os.O_RDONLY)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-            except OSError as error:
-                raise MalformedEvidence("retirement directory could not be fsynced") from error
 
     def retire_review(
         self,
@@ -1100,6 +1147,16 @@ class RunStore:
             raise EvidenceConflict("retirement source digest does not match expected_sha256")
         self.validate_event_relations(commit)
         events = self.read_events()
+        staging_path = self.retirement_staging_path(commit, retirement_id)
+        final_path = self.retirement_final_path(commit, retirement_id)
+        if staging_path.exists() or staging_path.is_symlink():
+            raise EvidenceConflict(
+                "pre-existing retirement staging lacks its matching envelope and event sequence"
+            )
+        if final_path.exists() or final_path.is_symlink():
+            raise EvidenceConflict(
+                "pre-existing retirement final lacks its matching envelope and event sequence"
+            )
         requested = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         candidate = {
             "schema_version": 1,
@@ -1119,6 +1176,14 @@ class RunStore:
         if envelope is None:
             self._atomic_create(envelope_path, _serialize(candidate))
             envelope = self._read_retirement_envelope(commit, retirement_id)
+        if staging_path.exists() or staging_path.is_symlink():
+            if not any(
+                event.get("event_type") == RETIREMENT_COPIED_EVENT
+                and event.get("retirement_id") == retirement_id
+                and event.get("commit") == commit
+                for event in self.read_events()
+            ):
+                raise EvidenceConflict("pre-existing retirement staging lacks its matching COPIED event")
         self._append_retirement_transition(RETIREMENT_PREPARED_EVENT, envelope, commit, events)
         events = self.read_events()
         staging = self.retirement_staging_path(commit, retirement_id)
@@ -1126,7 +1191,14 @@ class RunStore:
             self._atomic_create(staging, raw)
         self._append_retirement_transition(RETIREMENT_COPIED_EVENT, envelope, commit, events)
         events = self.read_events()
-        if not self.retirement_final_path(commit, retirement_id).exists():
+        if final_path.exists() and not any(
+            event.get("event_type") == RETIREMENT_COMMITTED_EVENT
+            and event.get("retirement_id") == retirement_id
+            and event.get("commit") == commit
+            for event in self.read_events()
+        ):
+            raise EvidenceConflict("pre-existing retirement final lacks its matching COMMITTED event")
+        if not final_path.exists():
             self._append_retirement_transition(RETIREMENT_COMMITTED_EVENT, envelope, commit, events)
             events = self.read_events()
         self._move_no_replace(source, self.retirement_final_path(commit, retirement_id), expected_sha256)
@@ -1155,7 +1227,34 @@ class RunStore:
                 raise MalformedEvidence("retirement source digest does not match its envelope")
         else:
             raw = None
-        state, _ = self._retirement_state(commit, retirement_id, events)
+        selected = self._retirement_events(commit, retirement_id, events)
+        event_types = [event["event_type"] for event in selected]
+        if not event_types:
+            staging_path = self.retirement_staging_path(commit, retirement_id)
+            if staging_path.exists() or staging_path.is_symlink():
+                raise EvidenceConflict(
+                    "retirement staging cannot be adopted before PREPARED"
+                )
+            # The envelope is the durable intent record.  A crash after its
+            # no-replace publication but before PREPARED must be recoverable.
+            self._append_retirement_transition(
+                RETIREMENT_PREPARED_EVENT, envelope, commit, events
+            )
+            events = self.read_events()
+            selected = self._retirement_events(commit, retirement_id, events)
+            event_types = [event["event_type"] for event in selected]
+        if RETIREMENT_PREPARED_EVENT in event_types and RETIREMENT_COPIED_EVENT not in event_types:
+            staging = self.retirement_staging_path(commit, retirement_id)
+            if staging.exists():
+                _staging_raw, staging_digest = self._read_bound_bytes(
+                    staging, "retirement staging proof"
+                )
+                if staging_digest != envelope["expected_sha256"]:
+                    raise MalformedEvidence("retirement staging digest does not match")
+                self._append_retirement_transition(
+                    RETIREMENT_COPIED_EVENT, envelope, commit, self.read_events()
+                )
+        state, _ = self._retirement_state(commit, retirement_id, self.read_events())
         if state == "FINALIZED":
             return self.retirement_status(commit, retirement_id)
         if state == "PREPARED" and raw is not None:
@@ -1601,43 +1700,10 @@ class RunStore:
         raises :class:`MalformedEvidence`. Every descriptor is closed on all
         paths.
         """
-        path = os.fspath(target)
         try:
-            fd = os.open(path, os.O_RDONLY | self._O_NOFOLLOW)
-        except OSError as error:
+            return read_contained_file(target, self._root, label)
+        except (OSError, SecurePathError) as error:
             raise MalformedEvidence(f"cannot open {label}: {target}: {error}") from error
-        try:
-            opened = os.fstat(fd)
-            if not stat.S_ISREG(opened.st_mode):
-                raise MalformedEvidence(f"{label} is not a regular file: {target}")
-            if opened.st_nlink != 1:
-                raise MalformedEvidence(
-                    f"{label} must be a single-link regular file: {target}"
-                )
-            chunks = []
-            while True:
-                chunk = os.read(fd, 65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            raw = b"".join(chunks)
-            try:
-                entry = os.lstat(path)
-            except OSError as error:
-                raise MalformedEvidence(
-                    f"cannot re-stat {label}: {target}: {error}"
-                ) from error
-            if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
-                raise MalformedEvidence(
-                    f"{label} directory entry changed identity: {target}"
-                )
-            if (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino):
-                raise MalformedEvidence(
-                    f"{label} path changed identity during read: {target}"
-                )
-        finally:
-            os.close(fd)
-        return raw, hashlib.sha256(raw).hexdigest()
 
     def _require_command_sequence(
         self, record: dict, target: Path
@@ -1815,42 +1881,7 @@ class RunStore:
         made. ``os.link`` fails with ``EEXIST`` if the target already exists, so
         two writers cannot both create the same path.
         """
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temp_name = None
         try:
-            with tempfile.NamedTemporaryFile(
-                dir=os.fspath(target.parent), mode="wb", prefix=".tmp-", delete=False
-            ) as handle:
-                temp_name = handle.name
-                handle.write(line)
-                handle.flush()
-                os.fsync(handle.fileno())
-            try:
-                os.link(temp_name, os.fspath(target))
-            except OSError:
-                if target.exists():
-                    return False
-                raise
-            # Drop the temporary link before the directory fsync so a
-            # concurrent loser never observes a multi-link entry for a
-            # legitimately created single-link record (T6L-F4).
-            try:
-                os.unlink(temp_name)
-            except OSError:
-                pass
-            temp_name = None
-            try:
-                dir_fd = os.open(os.fspath(target.parent), os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-            except OSError:
-                pass
-            return True
-        finally:
-            if temp_name is not None:
-                try:
-                    os.unlink(temp_name)
-                except OSError:
-                    pass
+            return secure_atomic_create(target, line)
+        except (OSError, SecurePathError) as error:
+            raise MalformedEvidence("cannot atomically create durable record: {0}".format(target)) from error
