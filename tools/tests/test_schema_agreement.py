@@ -854,6 +854,17 @@ def _valid_config():
         "heavy_job_limit": 1,
         "verification_command_timeout_seconds": 300,
         "tracking_projection": "trello card update",
+        "ci_required_checks": [],
+        "ci_live_pr_checks": [],
+        "ci_required_checks_source": {
+            "pull_request": "candidate_tip",
+            "merge_group": "event_tip",
+            "push": "event_tip",
+        },
+        "ci_live_pr_workflow": {
+            "path": ".github/workflows/ci.yml",
+            "action": "pull_request",
+        },
     }
 
 

@@ -39,7 +39,7 @@
 ## PR closure fields (playbook §2.6 — mandatory for orchestrated PR work)
 
 - **closure_config:** `<absolute path to the machine-readable project-closure-v1.json (schema: tools/schemas/project-closure-v1.json), or none if the repo never opens PRs>`
-- **ci_status_cmd:** `<read current required GitHub checks for the exact pull-request tip>`
+- **ci_status_cmd:** `<read current required GitHub checks for the exact pull-request tip, including live baseRefName and potentialMergeCommit; PR closure uses the candidate-tip config source and never a checked-out/default-branch override>`
 - **ci_rerun_cmd:** `<bounded rerun command for proven infrastructure failures, or none>`
 - **local_review_ready_commands:** `<the minimum local gate(s) before an adversarial review may start — exact closure_config key>`
 - **closure_acceptance_commands:** `<the full gate(s) required for approval — exact closure_config key>`
@@ -62,6 +62,7 @@ The machine-readable `closure_config` carries the mechanically enforced subset w
 names — `schema_version`, `project`, `repository`, `repo_path`, `default_branch`,
 `closure_state_dir`, `local_review_ready_commands`, `closure_acceptance_commands`,
 `verification_command_timeout_seconds`, `ci_required_checks`,
+`ci_live_pr_checks`, `ci_required_checks_source`, `ci_live_pr_workflow`,
 `infra_retry_budget`, `stagnation_budget_minutes`, `heavy_job_limit`, `tracking_projection` (see
 `tools/schemas/project-closure-v1.json`). The fields above are the declarative project bindings the
 harness resolves against; the gate itself reads only the `closure_config` JSON.

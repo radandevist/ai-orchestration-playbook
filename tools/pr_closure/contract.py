@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Dict, List, Mapping, NamedTuple, Optional, Tuple
 
 from pr_closure.model import (
+    CiLiveWorkflow,
+    CiRequiredChecksSource,
     Disposition,
     ModelRoute,
     ProjectConfig,
@@ -35,6 +37,16 @@ COMMAND_DIGEST_PATTERN = "^[0-9a-f]{64}" + END
 REPOSITORY_PATTERN = "^[^/\\s]+/[^/\\s]+" + END
 
 NON_BLANK = {"minLength": 1, "pattern": "\\S"}
+
+CI_REQUIRED_CHECKS_SOURCE = {
+    "pull_request": "candidate_tip",
+    "merge_group": "event_tip",
+    "push": "event_tip",
+}
+CI_LIVE_PR_WORKFLOW = {
+    "path": ".github/workflows/ci.yml",
+    "action": "pull_request",
+}
 
 SEVERITIES = tuple(item.value for item in Severity)
 DISPOSITIONS = tuple(item.value for item in Disposition)
@@ -131,6 +143,9 @@ PROJECT_CONFIG_FIELDS = (
     _f("verification_command_timeout_seconds", "integer", {"minimum": 1}),
     _f("tracking_projection", "nullable_text"),
     _f("ci_required_checks", "check_name_array"),
+    _f("ci_live_pr_checks", "check_name_array"),
+    _f("ci_required_checks_source", "ci_source"),
+    _f("ci_live_pr_workflow", "ci_workflow"),
     _f("model_routes", "policy_routes"),
     _f("review_policy", "review_policy"),
 )
@@ -179,6 +194,12 @@ CONFIG_SEMANTIC_ASYMMETRIES = (
         "project route uniqueness, same-family exception concordance, forbidden reviewer "
         "families, and staged/enforced cross-object policy relations are Python checks; "
         "JSON Schema cannot compare those normalized values.",
+    ),
+    SemanticAsymmetry(
+        "ci_live_checks_subset",
+        "ci_live_pr_checks must be a subset of ci_required_checks; JSON Schema cannot "
+        "express a dynamic array-subset relationship, so it validates the member shape "
+        "and uniqueness while Python enforces the cross-field subset.",
     ),
 )
 
@@ -388,6 +409,24 @@ def _check_check_name_array(name: str, raw) -> Tuple[str, ...]:
             raise ReviewValidationError(f"{name} must not contain duplicate check names")
         seen.add(item)
     return tuple(items)
+
+
+def _check_ci_source(name: str, raw) -> CiRequiredChecksSource:
+    item = require_mapping(raw, name)
+    reject_unknown_keys(item, CI_REQUIRED_CHECKS_SOURCE, name)
+    require_present(item, CI_REQUIRED_CHECKS_SOURCE, name)
+    if dict(item) != CI_REQUIRED_CHECKS_SOURCE:
+        raise ReviewValidationError(f"{name} must use the canonical source mapping")
+    return CiRequiredChecksSource(**CI_REQUIRED_CHECKS_SOURCE)
+
+
+def _check_ci_workflow(name: str, raw) -> CiLiveWorkflow:
+    item = require_mapping(raw, name)
+    reject_unknown_keys(item, CI_LIVE_PR_WORKFLOW, name)
+    require_present(item, CI_LIVE_PR_WORKFLOW, name)
+    if dict(item) != CI_LIVE_PR_WORKFLOW:
+        raise ReviewValidationError(f"{name} must use the canonical workflow identity")
+    return CiLiveWorkflow(**CI_LIVE_PR_WORKFLOW)
 
 
 def _check_project_component(name: str, raw) -> str:
@@ -643,6 +682,10 @@ def check(fields, record: Mapping, parsers: Optional[Dict] = None) -> Dict:
             values[name] = _check_string_array(name, raw, params.get("min_items", 0))
         elif kind == "check_name_array":
             values[name] = _check_check_name_array(name, raw)
+        elif kind == "ci_source":
+            values[name] = _check_ci_source(name, raw)
+        elif kind == "ci_workflow":
+            values[name] = _check_ci_workflow(name, raw)
         elif kind == "object_array":
             items = require_list(raw, name)
             parser = parsers.get(name)
@@ -797,6 +840,10 @@ def validate_project_config(record: Mapping) -> ProjectConfig:
             raise ReviewValidationError(str(error)) from error
     except ReviewValidationError as error:
         raise ConfigValidationError(str(error)) from error
+    if not set(values["ci_live_pr_checks"]).issubset(values["ci_required_checks"]):
+        raise ConfigValidationError(
+            "ci_live_pr_checks must be a duplicate-free subset of ci_required_checks"
+        )
     return ProjectConfig(
         schema_version=values["schema_version"],
         project=values["project"],
@@ -812,6 +859,9 @@ def validate_project_config(record: Mapping) -> ProjectConfig:
         verification_command_timeout_seconds=values["verification_command_timeout_seconds"],
         tracking_projection=values["tracking_projection"],
         ci_required_checks=values.get("ci_required_checks", ()),
+        ci_live_pr_checks=values["ci_live_pr_checks"],
+        ci_required_checks_source=values["ci_required_checks_source"],
+        ci_live_pr_workflow=values["ci_live_pr_workflow"],
         model_routes=model_routes,
         review_policy=review_policy,
         config_digest=config_digest,
@@ -851,6 +901,26 @@ def _property_schema(name: str, kind: str, params: Dict) -> Dict:
             "type": "array",
             "items": dict({"type": "string"}, **NON_BLANK),
             "uniqueItems": True,
+        }
+    if kind == "ci_source":
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": list(CI_REQUIRED_CHECKS_SOURCE),
+            "properties": {
+                key: {"const": value}
+                for key, value in CI_REQUIRED_CHECKS_SOURCE.items()
+            },
+        }
+    if kind == "ci_workflow":
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": list(CI_LIVE_PR_WORKFLOW),
+            "properties": {
+                key: {"const": value}
+                for key, value in CI_LIVE_PR_WORKFLOW.items()
+            },
         }
     if kind == "follow_up":
         schema = {"type": "integer"}

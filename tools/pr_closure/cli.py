@@ -26,6 +26,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from dataclasses import replace
 from pathlib import Path
 from typing import Mapping, Optional, Tuple
 
@@ -44,6 +45,7 @@ from pr_closure.lease import (
     LeaseUnavailable,
 )
 from pr_closure.model import (
+    CiState,
     ClosureSnapshot,
     ClosureState,
     Disposition,
@@ -257,6 +259,33 @@ def _require_live_pr(github, config):
     return pr
 
 
+def _resolve_ci_config(config, github, pr):
+    """Resolve PR CI policy from the exact candidate tip when configured."""
+    source = config.ci_required_checks_source
+    if source is None or source.pull_request != "candidate_tip":
+        return config
+    raw = github.read_candidate_tip_config(pr.head_oid)
+    try:
+        candidate = validate_project_config(raw)
+    except ConfigValidationError as error:
+        raise SourceMalformed(
+            "candidate-tip closure config is invalid: {0}".format(error)
+        ) from error
+    if candidate.repository != config.repository:
+        raise SourceMalformed("candidate-tip closure config repository mismatch")
+    if candidate.project != config.project:
+        raise SourceMalformed("candidate-tip closure config project mismatch")
+    if candidate.default_branch != config.default_branch:
+        raise SourceMalformed("candidate-tip closure config default branch mismatch")
+    return replace(
+        config,
+        ci_required_checks=candidate.ci_required_checks,
+        ci_live_pr_checks=candidate.ci_live_pr_checks,
+        ci_required_checks_source=candidate.ci_required_checks_source,
+        ci_live_pr_workflow=candidate.ci_live_pr_workflow,
+    )
+
+
 def _resolve_pr_sources(config, pr_number):
     """Resolve the live PR worktree and its GitSource.
 
@@ -268,10 +297,11 @@ def _resolve_pr_sources(config, pr_number):
     """
     github = GitHubSource(config.repository, pr_number)
     pr = _require_live_pr(github, config)
+    effective_config = _resolve_ci_config(config, github, pr)
     resolver = WorktreeResolver(config.repo_path)
     record = resolver.resolve(pr.head_branch)
     git = GitSource(record.path, pr.head_branch)
-    return github, pr, git
+    return github, pr, git, effective_config
 
 
 def _bind_verification_target(config, pr_number):
@@ -283,7 +313,7 @@ def _bind_verification_target(config, pr_number):
     is committed.
     """
     store = RunStore(config.closure_state_dir, config.project, pr_number)
-    _, pr, git = _resolve_pr_sources(config, pr_number)
+    _, pr, git, _effective_config = _resolve_pr_sources(config, pr_number)
     facts = git.facts()
     if facts.local_commit != facts.remote_commit:
         raise SourceMalformed(
@@ -367,7 +397,7 @@ def _status_snapshot(
     legacy explicit-adoption behavior.
     """
     store = RunStore(config.closure_state_dir, config.project, pr_number)
-    _github, pr, git = _resolve_pr_sources(config, pr_number)
+    github, pr, git, effective_config = _resolve_pr_sources(config, pr_number)
     facts = git.facts()
     events = store._read_authoritative_events()
     adopted_policy = store.current_policy_adoption(config.repository)
@@ -431,12 +461,53 @@ def _status_snapshot(
             "test_steps_not_started": last.get("test_steps_not_started"),
             "evidence_path": last["evidence_path"],
         }
-    ci = classify_ci(
-        pr.checks,
-        pr.head_oid,
-        infra_event=infra_event,
-        required_checks=config.ci_required_checks,
-    )
+    workflow = effective_config.ci_live_pr_workflow
+    if (
+        effective_config.ci_required_checks_source is not None
+        and effective_config.ci_required_checks_source.pull_request == "candidate_tip"
+        and workflow is not None
+        and effective_config.ci_required_checks
+    ):
+        ci = github.read_live_ci(
+            pr,
+            required_checks=effective_config.ci_required_checks,
+            live_checks=effective_config.ci_live_pr_checks,
+            workflow_path=workflow.path,
+            workflow_action=workflow.action,
+        )
+        if infra_event is not None and ci.ci_state is CiState.BRANCH_FAILURE:
+            reclassified = classify_ci(
+                ci.checks,
+                pr.head_oid,
+                infra_event=infra_event,
+                required_checks=effective_config.ci_required_checks,
+            )
+            ci = replace(
+                reclassified,
+                check_run_id=ci.check_run_id,
+                check_suite_id=ci.check_suite_id,
+                head_sha=ci.head_sha,
+                started_at=ci.started_at,
+                completed_at=ci.completed_at,
+                app_slug=ci.app_slug,
+                base_ref_name=ci.base_ref_name,
+                potential_merge_commit_oid=ci.potential_merge_commit_oid,
+                event_sha=ci.event_sha,
+                workflow_path=ci.workflow_path,
+                workflow_id=ci.workflow_id,
+                workflow_action=ci.workflow_action,
+                workflow_event=ci.workflow_event,
+                workflow_run_id=ci.workflow_run_id,
+                run_attempt=ci.run_attempt,
+                snapshot_body_sha256=ci.snapshot_body_sha256,
+            )
+    else:
+        ci = classify_ci(
+            pr.checks,
+            pr.head_oid,
+            infra_event=infra_event,
+            required_checks=effective_config.ci_required_checks,
+        )
 
     review_verdict = None
     review_commit = None
@@ -595,6 +666,17 @@ def _status_snapshot(
         worktree_clean=facts.worktree_clean,
         local_verification=local_verification,
         ci_state=ci.ci_state,
+        ci_check_run_id=ci.check_run_id,
+        ci_workflow_run_id=ci.workflow_run_id,
+        ci_check_suite_id=ci.check_suite_id,
+        ci_base_ref_name=ci.base_ref_name,
+        ci_potential_merge_commit_oid=ci.potential_merge_commit_oid,
+        ci_event_sha=ci.event_sha,
+        ci_workflow_path=ci.workflow_path,
+        ci_workflow_id=ci.workflow_id,
+        ci_workflow_action=ci.workflow_action,
+        ci_run_attempt=ci.run_attempt,
+        ci_snapshot_body_sha256=ci.snapshot_body_sha256,
         fixing_lane_active=fixing_lane_active,
         review_owned=review_owned,
         review_verdict=review_verdict,
@@ -639,6 +721,17 @@ def cmd_status(config, args) -> int:
             "allowed_actions": list(decision.allowed_actions),
             "commit": snapshot.local_commit,
             "ci_state": snapshot.ci_state.value,
+            "ci_check_run_id": snapshot.ci_check_run_id,
+            "ci_workflow_run_id": snapshot.ci_workflow_run_id,
+            "ci_check_suite_id": snapshot.ci_check_suite_id,
+            "ci_base_ref_name": snapshot.ci_base_ref_name,
+            "ci_potential_merge_commit_oid": snapshot.ci_potential_merge_commit_oid,
+            "ci_event_sha": snapshot.ci_event_sha,
+            "ci_workflow_path": snapshot.ci_workflow_path,
+            "ci_workflow_id": snapshot.ci_workflow_id,
+            "ci_workflow_action": snapshot.ci_workflow_action,
+            "ci_run_attempt": snapshot.ci_run_attempt,
+            "ci_snapshot_body_sha256": snapshot.ci_snapshot_body_sha256,
             "worktree_clean": snapshot.worktree_clean,
             "local_verification": snapshot.local_verification,
             "durable_tip": snapshot.durable_tip,
