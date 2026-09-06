@@ -111,11 +111,11 @@
     },
     "implementer_model": {
       "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9.-]*$"
+      "pattern": "^[a-z0-9][a-z0-9.-]*(?![\\s\\S])"
     },
     "reviewer_model": {
       "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9.-]*$"
+      "pattern": "^[a-z0-9][a-z0-9.-]*(?![\\s\\S])"
     },
     "review_exception": {
       "$ref": "#/$defs/reviewException"
@@ -306,7 +306,7 @@
       "properties": {
         "model_id": {
           "type": "string",
-          "pattern": "^[a-z0-9][a-z0-9.-]*$"
+          "pattern": "^[a-z0-9][a-z0-9.-]*(?![\\s\\S])"
         },
         "runner": {
           "type": "string",

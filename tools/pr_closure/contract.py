@@ -899,6 +899,7 @@ def json_schema() -> Dict:
 
 def review_json_schema_v2() -> Dict:
     schema = copy.deepcopy(json_schema())
+    model_id_pattern = "^[a-z0-9][a-z0-9.-]*" + END
     schema["$comment"] = _comment(v2=True)
     schema["$id"] = "https://ai-orchestration-playbook/schemas/review-record-v2.json"
     schema["title"] = "Structured Exact-Model Adversarial Review Record"
@@ -910,11 +911,11 @@ def review_json_schema_v2() -> Dict:
     schema["properties"].update({
         "implementer_model": {
             "type": "string",
-            "pattern": "^[a-z0-9][a-z0-9.-]*$",
+            "pattern": model_id_pattern,
         },
         "reviewer_model": {
             "type": "string",
-            "pattern": "^[a-z0-9][a-z0-9.-]*$",
+            "pattern": model_id_pattern,
         },
         "review_exception": {"$ref": "#/$defs/reviewException"},
         "provenance": {"$ref": "#/$defs/provenance"},
@@ -936,7 +937,7 @@ def review_json_schema_v2() -> Dict:
         )),
         "additionalProperties": False,
         "properties": {
-            "model_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9.-]*$"},
+            "model_id": {"type": "string", "pattern": model_id_pattern},
             "runner": dict({"type": "string"}, **NON_BLANK),
             "invocation_model": dict({"type": "string"}, **NON_BLANK),
             "run_ref": dict({"type": "string"}, **NON_BLANK),
