@@ -45,10 +45,12 @@ The policy is additive to project-configuration schema version 1. Review artifac
 version 2 because mandatory provenance is a safety boundary, not an optional decoration. Schema-v1
 artifacts remain parseable for historical inspection and migration diagnostics, but are not
 current approval evidence for a project with a staged or enforced policy. When `review_policy` is
-absent or empty, normal import and status retain the existing schema-v1 authority path unchanged:
-validate
-the exact v1 shape, resolve `implementer_family` and `reviewer_family` with the existing family
-resolver, and accept only a cross-family review. Unknown fields remain rejected in both versions.
+absent or empty, normal import and status retain the existing schema-v1 authority path unchanged
+for projects that have never adopted a policy: validate the exact v1 shape, resolve
+`implementer_family` and `reviewer_family` with the existing family resolver, and accept only a
+cross-family review. A project that has durably adopted a policy remains bound to that policy
+identity; a missing, empty, disabled, or mismatched policy is a fail-closed transition state, not a
+return to the legacy authority path. Unknown fields remain rejected in both versions.
 
 ### Configuration API
 
@@ -179,7 +181,8 @@ Configuration validation is fail-closed:
 The owner-authorized policy has three effective modes:
 
 - **disabled** — `review_policy` is absent or exactly empty. Existing schema-v1 cross-family
-  authority remains unchanged.
+  authority remains unchanged only for a project with no durable policy adoption. After adoption,
+  the same configuration is a missing-policy transition and cannot authorize any review.
 - **staged** — the full candidate policy is loaded and strictly validated. `import-review` may
   import schema-v2 records that satisfy that candidate policy, and retirement/recovery operations
   may migrate existing evidence. Forbidden reviewer families already apply to new imports, so a
@@ -202,8 +205,11 @@ schema-v1 artifact, no incomplete retirement, no forbidden reviewer, and at leas
 active schema-v2 review at the exact pushed tip. Its result is only `ELIGIBLE` or a typed refusal;
 it can never emit an approval state. The eligibility record binds the tip, current staged-config
 digest, and projected enforced-config digest obtained by changing only `mode`. After `ELIGIBLE`, the
-config may change only to that exact enforced digest; normal `status` must then independently derive
-the result. Any other config or tip change makes the eligibility record stale.
+config may change only to that exact enforced digest, and the project-scoped adoption event must
+append the exact staged-to-enforced transition against the prior adoption leaf. Normal `status` and
+`import-review` must then independently derive the result from that adoption chain. Any other
+config, policy identity, repository, or tip change makes the transition stale; policy removal is
+never a rollback.
 
 #### Canonical model identity registry
 
@@ -319,10 +325,12 @@ constant is permitted.
 
 The launcher registry is deliberately not a second project-route source: it describes globally
 real endpoints, while `model_routes` grants project-specific dispatch and reviewer choice only in
-staged or enforced mode. With policy disabled, schema-v2 validation consults no `model_routes`
-entry. It verifies each claimed participant independently against the launcher registry and its
-immutable manifest, then applies the generic cross-family rule. It neither authorizes dispatch nor
-invents a reviewer pairing that is absent from project configuration.
+staged or enforced mode. With policy disabled and no durable adoption, schema-v2 validation
+consults no `model_routes` entry. It verifies each claimed participant independently against the
+launcher registry and its immutable manifest, then applies the generic cross-family rule. It
+neither authorizes dispatch nor invents a reviewer pairing that is absent from project
+configuration. After adoption, a disabled or absent policy is not a compatibility path: the
+adoption invariant rejects it before this validation can grant authority.
 
 For PublyApp, the table above authorizes exactly two implementation routes today:
 
@@ -358,10 +366,11 @@ validate_review(
 `None` is normalized to a disabled empty policy. Validation first dispatches by schema version and
 policy mode:
 
-1. For schema v1 with an empty policy, run the existing v1 validator unchanged. It validates the
-   exact v1 shape, resolves the two `*_family` fields with `families.resolve_family()`, rejects equal
-   resolved families, and preserves all existing finding, live-tip, and verdict validation. This is
-   the normal import/status path and its accepted cross-family record remains current-tip authority.
+1. For schema v1 with an empty policy and no durable project adoption, run the existing v1 validator
+   unchanged. It validates the exact v1 shape, resolves the two `*_family` fields with
+   `families.resolve_family()`, rejects equal resolved families, and preserves all existing finding,
+   live-tip, and verdict validation. This is the legacy compatibility path and its accepted
+   cross-family record remains current-tip authority.
 2. For schema v1 with a staged or enforced policy, normal import rejects the record before any
    write. Status treats any active-tip v1 artifact as non-authoritative and returns `UNVERIFIED`; it
    cannot skip the artifact in favor of another review. Only the separate migration reader may
@@ -512,28 +521,33 @@ The version/policy matrix is normative:
 
 | Artifact | Policy | `import-review` | `status` |
 |---|---|---|---|
-| schema v1 | disabled | Existing v1 validator; write only if cross-family | Existing v1 validator; accepted cross-family review remains authority |
+| schema v1 | disabled, never adopted | Existing v1 validator; write only if cross-family | Existing v1 validator; accepted cross-family review remains authority |
+| schema v1 | disabled after adoption | Reject before write | Fail closed; no legacy authority |
 | schema v1 | staged or enforced | Reject before write | `UNVERIFIED` until schema-v2 replacement and retirement |
 | schema v2 | disabled | Cross-family validator; each participant must match its immutable manifest and launcher-registry identity; no project route lookup | Identical validator; no route is inferred and same-family remains forbidden |
 | schema v2 | staged | Candidate-policy validator permits migration import; forbidden reviewer families already rejected | Always `UNVERIFIED`; staged evidence has no approval authority |
 | schema v2 | enforced | Enforced-policy validator and provenance checks | Identical validator; compliant active review may contribute authority |
 
 An empty policy means `mode` and `owner_authorization` are `None` and both collections in
-`ReviewPolicy` are empty; it is semantically identical to an absent `review_policy`. A project name,
-repository name, schema-v2 support, or staged import cannot implicitly activate approval authority.
+`ReviewPolicy` are empty at configuration-validation time; it is semantically identical to an
+absent `review_policy` only before durable project adoption. After adoption, the persisted policy
+identity and transition chain are additional authority inputs. A project name, repository name,
+schema-v2 support, or staged import cannot implicitly activate approval authority.
 
 The policy is loaded and validated once with `ProjectConfig`; its normalized immutable value is
 passed through both paths. `model_routes` concordance is evaluated only for staged or enforced
 policy. The disabled schema-v2 branch requires the configured route table to be empty and validates
 only the generic cross-family rule plus the two independently registered, manifest-backed launcher
 identities; it cannot synthesize or persist a project route. A policy change invalidates no bytes
-and silently upgrades no record. If a durable record or its provenance no longer satisfies the
+and silently upgrades no record. Once a project-scoped policy adoption exists, removing, emptying,
+disabling, or changing that policy is a typed fail-closed state rather than a legacy fallback. If a durable record or its provenance no longer satisfies the
 enforced policy, status returns a typed malformed/unverified error rather than treating another
 review or a projection as approval evidence. Import validates provenance before creating the
 review event, and status validates the same envelope, path, registry versions, model IDs, runner and
 invocation identities, reviewed commit, and digest before considering
 the review verdict. Staged import calls this same validator but cannot bypass the mode-level
-`UNVERIFIED` status result.
+`UNVERIFIED` status result. If adoption exists and the loaded policy is absent, empty, disabled,
+or has a different identity, both public paths fail closed before review authority is evaluated.
 
 The public schema and Python validator intentionally retain their existing semantic asymmetry:
 JSON Schema cannot compare resolved families or look up policy IDs, so those checks belong to the
@@ -691,7 +705,7 @@ place, invent a Sol review, or delete evidence.
 - schema/Python agreement includes `launcher_registry_version` in routes, artifacts, provenance
   envelopes, and immutable manifests;
 - schema-v1 uses the normal existing validator and can remain current-tip cross-family authority
-  only when policy is absent or empty;
+  only when policy is absent or empty and the project has never adopted a policy;
 - schema-v1 is accepted only by the historical/migration reader when policy is staged or enforced
   and cannot become current-tip approval in either mode;
 - missing provenance, wrong registry version, unknown run ref, path escape, symlink, missing file,
@@ -744,12 +758,14 @@ place, invent a Sol review, or delete evidence.
 - enforced status revalidates independently after a staged-to-enforced change that modifies only
   the mode;
 - schema-v1 import and status with absent or empty policy preserve the existing cross-family
-  authority path and all existing v1 regression tests remain green;
+  authority path only for projects that have never adopted a policy; all existing v1 regression
+  tests remain green;
 - schema-v1 import with a staged or enforced policy rejects before writing, and status with an
   active-tip v1 artifact returns `UNVERIFIED` even when that artifact was a valid cross-family
   approval before policy activation;
 - an accepted same-family artifact cannot be read as approved when the config exception is removed;
-- a legacy cross-family artifact remains authoritative only on the policy-empty compatibility path;
+- a legacy cross-family artifact remains authoritative only on the policy-empty compatibility path
+  for a project with no durable adoption;
 - an old Claude artifact plus a new Sol artifact fails until the old artifact is explicitly retired;
 - rollout inventory catches every schema-v1 artifact at the active tip, including old
   cross-family records and records with no Claude;

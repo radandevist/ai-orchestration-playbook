@@ -19,7 +19,7 @@ The playbook is documentation-only, but it assumes a working AI coding agent set
 
 | Agent | What it does | Install |
 |-------|--------------|---------|
-| **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** | Anthropic's CLI agent — executors, reviews, dispatch | `npm install -g @anthropic-ai/claude-code` |
+| **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** | Optional agent-runtime host for executor/review/dispatch workflows; policy-controlled model routes apply to model calls | `npm install -g @anthropic-ai/claude-code` |
 | **[Codex CLI](https://github.com/openai/codex)** | OpenAI's CLI agent — executors, reviews, dispatch | `npm install -g @openai/codex` |
 | **[Hermes Agent](https://hermes-agent.nousresearch.com)** | Nous Research's agent — captains, executors, dispatch | `curl -fsSL https://hermes-agent.nousresearch.com/install.sh \| bash` |
 
@@ -74,9 +74,11 @@ The playbook references these tools in §5.4 (Installed tooling). They compress 
 
 - **Parallelism without chaos.** The captain splits a goal into file-disjoint tasks and runs N executors concurrently in isolated worktrees. No collisions, no entangled blame.
 - **You stay in control.** The captain **pauses** at three gates — scope-changing decisions, every merge, and anything outward-facing/irreversible. It asks; it never guesses and never merges on its own.
-- **Nothing integrates unreviewed.** Every result gets an independent review pass — ideally from a *different model family* than produced it — before it touches the default branch. This is what catches the plausible-but-wrong result that passes all tests.
+- **Nothing integrates unreviewed.** Every result gets a separate independent review pass — cross-family by default — before it touches the default branch. The exact owner-authorized same-family exception is **OpenAI GPT-5.6 Luna implementer → OpenAI GPT-5.6 Sol reviewer**, and it requires the exact policy route, independently verified durable provenance, and staged-to-enforced activation evidence. It is never cross-family independence or a different-family second opinion.
 - **Dead executors don't block you.** A hung or crashed executor is inherited by a fresh one with its on-disk WIP, not hand-patched.
 - **Works with the agents you already use.** Agent-neutral. Claude Code, Codex CLI, Hermes — same playbook, same adapter contract.
+
+Claude Code is a supported agent runtime host; the no-new-Claude rule applies to model calls, not the host process itself.
 - **It improves from use.** A living document: every session that exposes a new failure mode feeds back into the playbook or the project adapter. The `orchestration/ledger/` directory holds real preflight-ledger entries from actual orchestrated runs.
 
 ---
@@ -265,10 +267,13 @@ forbidden; removing the policy or reviving retired evidence is not a rollback.
 
 ### Preserved adversarial review
 
-The gate reduces wasted cycles, not review pressure: every green tip gets a fresh independent
-cross-family review, every fix is re-reviewed, and there is no maximum review count. The reviewer
-family is cross-family by default; an explicitly configured, owner-authorized
-same-family exception may be used only when the exact policy route and provenance permit it.
+The gate reduces wasted cycles, not review pressure: every green tip gets a fresh separate
+independent review pass, every fix is re-reviewed, and there is no maximum review count. The
+reviewer family is cross-family by default. The exact owner-authorized same-family exception is
+**OpenAI GPT-5.6 Luna implementer → OpenAI GPT-5.6 Sol reviewer**, and it may be used only when
+the exact policy route, independently verified durable provenance, and staged-to-enforced
+activation evidence permit it; it is never cross-family independence or a different-family
+second opinion. Anthropic/Claude remains forbidden.
 
 ---
 
@@ -292,7 +297,7 @@ The agent reads `PLAYBOOK.md` + the repo's adapter, then runs the **seven-phase 
 | **2 · Decision-gate** | Surfaces genuine judgment calls | **You decide** (rename file vs class? split vs allowlist? strict vs lenient?) |
 | **3 · Dispatch** | Launches N executors in isolated worktrees, one brief each | — |
 | **4 · Rescue** | If an executor dies, spawns a fresh one to inherit its WIP | — |
-| **5 · Review** | Runs an independent (cross-family) review on each result | — |
+| **5 · Review** | Runs a separate independent review pass on each result (cross-family by default; exact owner-authorized Luna → Sol exception only with policy, provenance, and activation evidence) | — |
 | **6 · Merge** | Rebase → remove worktree → squash-merge → sync | **You authorize each merge** |
 | **7 · Close-out** | Links sub-issues, closes tracking issues | — |
 
