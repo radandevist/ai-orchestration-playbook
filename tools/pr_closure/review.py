@@ -26,6 +26,7 @@ from pr_closure.model import (
     Verdict,
 )
 from pr_closure.registries import RegistryValidationError, require_launcher, require_model
+from pr_closure.registries import require_policy_floor
 from pr_closure.dispatch import select_route
 
 TOP_LEVEL_FIELDS = ALLOWED_TOP_LEVEL_KEYS
@@ -330,6 +331,10 @@ def validate_review(
             "unsupported schema_version: {0!r}".format(schema_version)
         )
     policy = review_policy or ReviewPolicy()
+    try:
+        require_policy_floor(record.get("repository"), policy, tuple(model_routes))
+    except RegistryValidationError as error:
+        raise ReviewValidationError(str(error)) from error
     if schema_version == 1:
         if policy.mode is not None:
             raise ReviewValidationError(

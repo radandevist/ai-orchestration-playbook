@@ -4,7 +4,7 @@
 
 **Goal:** Replace the unconditional family mismatch check with an explicit, owner-authorized, exact-model review policy that permits PublyApp's GPT/Luna implementations to be reviewed by GPT-5.6 Sol without weakening any unrelated review route.
 
-**Architecture:** Project configuration is the sole route authority. Immutable model and launcher registries resolve byte-exact identities. Schema-v2 review records bind both participants to immutable provenance. Staged mode permits migration but never approval; enforced mode grants authority only to fully compliant active artifacts. Legacy projects with no policy keep their current schema-v1 behavior.
+**Architecture:** The immutable versioned repository-policy registry is the minimum route/policy authority for registered repositories; local configuration may not weaken it. Immutable model and launcher registries resolve byte-exact identities. Schema-v2 review records bind both participants to immutable provenance. Staged mode permits migration but never approval; enforced mode grants authority only to fully compliant active artifacts. Unregistered projects with no policy keep their current schema-v1 behavior.
 
 **Tech Stack:** Python standard library, JSON Schema 2020-12, `unittest`, existing `tools/pr_closure` CLI and immutable store.
 

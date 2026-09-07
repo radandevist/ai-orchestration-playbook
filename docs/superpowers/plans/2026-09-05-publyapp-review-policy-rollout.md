@@ -4,7 +4,7 @@
 
 **Goal:** Move PublyApp from legacy family-only review records to exact schema-v2 provenance, authorize only the owner-approved GPT/Luna→GPT-5.6-Sol exception, and keep Anthropic forbidden.
 
-**Architecture:** Rollout is fail-closed. A staged config makes every PR `UNVERIFIED` while active-tip artifacts are inventoried, replaced, and retired. Enforcement begins only after the activation checker proves the exact projected config and tip eligible.
+**Architecture:** Rollout is fail-closed. The immutable versioned PublyApp policy floor is authoritative from config load onward, including before local adoption exists. A staged config makes every PR `UNVERIFIED` while active-tip artifacts are inventoried, replaced, and retired. Enforcement begins only after the activation checker proves the exact projected config and tip eligible; adoption events document migration but do not establish the floor.
 
 ---
 
@@ -16,7 +16,7 @@
 
 ### Task 2: Stage the exact owner-authorized policy
 
-- [ ] Add the exact canonical model routes from the approved design to `.ai/project-closure-v1.json` as the only machine-readable dispatch/closure authority.
+- [ ] Confirm the exact canonical model routes and policy identity match the versioned immutable registry floor; local project config is an explicit projection that cannot weaken it.
 - [ ] Set `review_policy.mode` to `staged`, include the owner authorization and GPT→Sol exception, and forbid the Anthropic reviewer family.
 - [ ] Remove Claude from every new-review route in the same checkpoint.
 - [ ] Verify config parsing and confirm status is deliberately `UNVERIFIED` for all affected PRs.
@@ -37,6 +37,6 @@
 
 ### Task 5: Prepare the verified rollback target
 
-- [ ] Encode the staged rollback target from the design: Anthropic remains forbidden, same-family exceptions are empty, GPT routes to the registered DeepSeek endpoint, and DeepSeek routes to exact Sol.
-- [ ] Test that removing the policy, restoring Claude, or reviving retired evidence can never serve as rollback.
+- [ ] Treat any future policy replacement as a new versioned registry floor; the current PublyApp floor remains mandatory until an explicitly released stronger floor supersedes it.
+- [ ] Test that removing the policy, restoring Claude, rolling back local event/adoption files, or reviving retired evidence can never weaken the floor.
 - [ ] Document the staged migration/activation sequence; do not execute rollback unless the owner requests it.

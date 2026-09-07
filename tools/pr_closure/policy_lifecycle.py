@@ -16,6 +16,7 @@ from pr_closure.model import (
     SameFamilyReviewException,
 )
 from pr_closure.review import validate_review
+from pr_closure.registries import canonical_policy_definition
 
 
 _ROLLBACK_ROUTES = (
@@ -102,22 +103,7 @@ def policy_identity(config) -> tuple[str, str]:
     content.  The project-scoped adoption record binds this content identity
     separately from each PR's full configuration digest.
     """
-    policy = config.review_policy
-    payload = {
-        "owner_authorization": policy.owner_authorization,
-        "forbidden_reviewer_families": list(policy.forbidden_reviewer_families),
-        "same_family_exceptions": [
-            {
-                name: getattr(exception, name)
-                for name in SameFamilyReviewException.__dataclass_fields__
-            }
-            for exception in policy.same_family_exceptions
-        ],
-        "model_routes": [
-            _route_as_mapping(route)
-            for route in config.model_routes
-        ],
-    }
+    payload = canonical_policy_definition(config.review_policy, config.model_routes)
     raw = json.dumps(
         payload,
         sort_keys=True,
@@ -129,11 +115,12 @@ def policy_identity(config) -> tuple[str, str]:
 
 
 def validate_adopted_policy_context(config, adoption: Mapping) -> None:
-    """Reject config authority that does not match the adopted project policy.
+    """Validate an adoption record as audit/migration evidence.
 
     A staged exact rollback target is the only different policy permitted to
-    exist while the owner-authorized rollback transition is being migrated.
-    It remains non-authoritative until its own activation/adoption event.
+    exist for an unregistered project's owner-authorized rollback transition.
+    Registered repository policy floors are enforced independently and never
+    derive authority from this event.
     """
     if adoption.get("project") != config.project:
         raise ConfigValidationError("policy adoption project does not match configuration")
@@ -170,7 +157,7 @@ def policy_transition_kind(config, adoption: Mapping | None) -> str:
 
 
 def is_exact_rollback_target(config: Mapping) -> bool:
-    """Return whether a normalized or raw config is the pinned rollback target."""
+    """Return whether an unregistered project's config is the legacy rollback target."""
     normalized = config if hasattr(config, "review_policy") else validate_project_config(config)
     if normalized.project != "publyapp":
         return False

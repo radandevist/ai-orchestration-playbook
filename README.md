@@ -256,8 +256,15 @@ only a complete `ACTIVE -> PREPARED -> COPIED -> COMMITTED -> FINALIZED` relatio
 active reads. After every active tip has a compliant v2 review and finalized retirements, run
 `check-policy-activation`; it returns only `ELIGIBLE` or a refusal bound to the exact tip and staged
 and projected-enforced configuration digests. Change only the policy mode to `enforced`, then run a
-fresh `status`. Rollback is another staged/enforced, owner-authorized policy that keeps Anthropic
-forbidden; removing the policy or reviving retired evidence is not a rollback.
+fresh `status`.
+
+For `PublyApp/publyapp`, the versioned immutable registry is the policy floor. It binds the exact
+policy identity, current implementation routes, owner-authorized GPT-5.6 Luna → GPT-5.6 Sol
+same-OpenAI-family exception, and prohibition on Claude/Anthropic reviewers. Every config load,
+review validation, import, and status derivation enforces that floor even when local adoption
+events or stream files are absent or rolled back. Adoption events and the external event anchor
+are audit/integrity and crash-recovery evidence only; they cannot create, remove, or weaken policy
+authority. Unknown repositories retain the generic explicit-config behavior.
 
 ### Project migration and preflight
 
@@ -268,12 +275,13 @@ forbidden; removing the policy or reviving retired evidence is not a rollback.
 ### Preserved adversarial review
 
 The gate reduces wasted cycles, not review pressure: every green tip gets a fresh separate
-independent review pass, every fix is re-reviewed, and there is no maximum review count. The
-reviewer family is cross-family by default. The exact owner-authorized same-family exception is
+independent review pass, every fix is re-reviewed, and there is no maximum review count. Owner-
+mandated adversarial reviews remain Sol-only at high/xhigh effort. The reviewer family is
+cross-family by default. The exact owner-authorized same-family exception is
 **OpenAI GPT-5.6 Luna implementer → OpenAI GPT-5.6 Sol reviewer**, and it may be used only when
-the exact policy route, independently verified durable provenance, and staged-to-enforced
-activation evidence permit it; it is never cross-family independence or a different-family
-second opinion. Anthropic/Claude remains forbidden.
+the immutable policy-floor route and independently verified durable provenance permit it; it is
+never cross-family independence or a different-family second opinion. Anthropic/Claude remains
+forbidden.
 
 ---
 

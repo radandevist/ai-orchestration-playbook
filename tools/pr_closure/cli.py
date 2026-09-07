@@ -59,6 +59,7 @@ from pr_closure.policy_lifecycle import (
     validate_adopted_policy_context,
 )
 from pr_closure.dispatch import select_model_route
+from pr_closure.registries import policy_floor_for
 from pr_closure.review import require_live_binding, validate_review
 from pr_closure.sources import (
     INFRA_FAILURE_EVENT,
@@ -361,10 +362,9 @@ def _status_snapshot(
 
     Strictly read-only: no commit, verification, review, or projection write
     is ever made here. Missing, malformed, or contradictory evidence raises a
-    typed source error so the caller fails closed. The only caller that sets
-    ``require_policy_adoption=False`` is the activation command's proposed
-    target snapshot; that snapshot is not authority and is followed by the
-    durable adoption write before activation can succeed.
+    typed source error so the caller fails closed. Registered repository floors
+    do not require an adoption event; unregistered repositories retain their
+    legacy explicit-adoption behavior.
     """
     store = RunStore(config.closure_state_dir, config.project, pr_number)
     _github, pr, git = _resolve_pr_sources(config, pr_number)
@@ -373,7 +373,8 @@ def _status_snapshot(
     adopted_policy = store.current_policy_adoption(config.repository)
     policy_adoption_valid = True
     policy_adoption_reason = None
-    if require_policy_adoption:
+    registered_policy = policy_floor_for(config.repository)
+    if require_policy_adoption and registered_policy is None:
         if config.review_policy.mode is ReviewPolicyMode.ENFORCED and adopted_policy is None:
             policy_adoption_valid = False
             policy_adoption_reason = "policy_adoption_required"
@@ -679,9 +680,14 @@ def cmd_import_review(config, args) -> int:
     github = GitHubSource(config.repository, args.pr)
     pr = _require_live_pr(github, config)
     adopted_policy = store.current_policy_adoption(config.repository)
-    if config.review_policy.mode is ReviewPolicyMode.ENFORCED and adopted_policy is None:
+    registered_policy = policy_floor_for(config.repository)
+    if (
+        registered_policy is None
+        and config.review_policy.mode is ReviewPolicyMode.ENFORCED
+        and adopted_policy is None
+    ):
         raise CliInputError("enforced policy requires project policy adoption")
-    if adopted_policy is not None:
+    if registered_policy is None and adopted_policy is not None:
         try:
             validate_adopted_policy_context(config, adopted_policy)
         except ConfigValidationError as error:

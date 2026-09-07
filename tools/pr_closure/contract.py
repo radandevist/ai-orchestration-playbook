@@ -789,6 +789,12 @@ def validate_project_config(record: Mapping) -> ProjectConfig:
         review_policy = values.get("review_policy", ReviewPolicy())
         model_routes = values.get("model_routes", ())
         _validate_policy_routes(review_policy, model_routes)
+        from pr_closure.registries import RegistryValidationError, require_policy_floor
+
+        try:
+            require_policy_floor(record["repository"], review_policy, model_routes)
+        except RegistryValidationError as error:
+            raise ReviewValidationError(str(error)) from error
     except ReviewValidationError as error:
         raise ConfigValidationError(str(error)) from error
     return ProjectConfig(
