@@ -743,6 +743,58 @@ class LivePrFixTests(unittest.TestCase):
                     [call[-1] for call in runner.calls],
                 )
 
+    def test_full_reader_rejects_newer_contradictory_attempt_without_old_fallback(self):
+        endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
+        for run_suite_id, attempt_suite_id in ((302, 999), (999, 302)):
+            with self.subTest(run_suite_id=run_suite_id, attempt_suite_id=attempt_suite_id):
+                old = check(
+                    "ci-final-gate",
+                    run_id=201,
+                    check_id=101,
+                    suite_id=301,
+                    start="2026-09-07T10:00:00Z",
+                )
+                newer = check(
+                    "ci-final-gate",
+                    run_id=202,
+                    check_id=102,
+                    suite_id=302,
+                    start="2026-09-07T11:00:00Z",
+                )
+                responses = {
+                    "gh api repos/owner/repo/actions/workflows/ci.yml": (
+                        0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), ""
+                    ),
+                    "gh api " + endpoint + "&page=1&per_page=100": (
+                        0, json.dumps({"total_count": 2, "check_runs": [old, newer]}), ""
+                    ),
+                    "gh api repos/owner/repo/actions/runs/201": (
+                        0, json.dumps(run(run_id=201, suite_id=301)), ""
+                    ),
+                    "gh api repos/owner/repo/actions/runs/201/attempts/1": (
+                        0, json.dumps(run(run_id=201, suite_id=301)), ""
+                    ),
+                    "gh api repos/owner/repo/actions/runs/202": (
+                        0, json.dumps(run(run_id=202, suite_id=run_suite_id)), ""
+                    ),
+                    "gh api repos/owner/repo/actions/runs/202/attempts/1": (
+                        0, json.dumps(run(run_id=202, suite_id=attempt_suite_id)), ""
+                    ),
+                }
+                source = GitHubSource("owner/repo", 42, runner=Runner(responses))
+
+                facts = source.read_live_ci(
+                    pr(),
+                    required_checks=("ci-final-gate",),
+                    live_checks=(),
+                    workflow_path=".github/workflows/ci.yml",
+                    workflow_action="pull_request",
+                )
+
+                self.assertEqual(CiState.UNKNOWN, facts.ci_state)
+                self.assertIsNone(facts.check_run_id)
+                self.assertIsNone(facts.workflow_run_id)
+
     def test_full_reader_current_green_survives_unavailable_historical_attempt(self):
         endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
         old = check("ci-final-gate", check_id=101, suite_id=301)
