@@ -1539,12 +1539,12 @@ class GitHubSource:
                 "current workflow check-suite id",
                 (),
             )
+            _validate_current_attempt(workflow, current_attempt, run_id, run_attempt)
             authoritative = current_suite_id == suite_id == _require_positive_int(
                 workflow.get("check_suite_id"),
                 "workflow check-suite id",
                 (),
             )
-            _validate_current_attempt(workflow, current_attempt, run_id, run_attempt)
             enforce_central = workflow_id is not None and (
                 central_names is None or name in central_names
             )
