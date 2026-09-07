@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Mapping, Optional, Tuple
 
 from pr_closure.store import _FORBIDDEN_ROOT_SPECS, _is_forbidden, _resolve
+from pr_closure.jsonio import StrictJsonError, loads as strict_json_loads
 
 LEASE_SCHEMA_VERSION = 1
 
@@ -312,8 +313,8 @@ def _try_read_metadata(
             except OSError:
                 pass
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as error:
+        parsed = strict_json_loads(raw, "lease metadata")
+    except StrictJsonError as error:
         raise LeaseMetadataError(f"malformed lease metadata {path}: {error}") from error
     return validate_lease_metadata(parsed), identity
 

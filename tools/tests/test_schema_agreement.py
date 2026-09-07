@@ -942,6 +942,16 @@ def config_agreement_corpus():
         False,
         False,
     )
+    add(
+        "ci_live_pr_checks outside required checks",
+        lambda c: c.update({
+            "ci_required_checks": ["gate-a"],
+            "ci_live_pr_checks": ["gate-b"],
+        }),
+        True,
+        False,
+        "ci_live_checks_subset",
+    )
 
     add("unknown top-level key", lambda c: c.update({"rogue": "x"}), False, False)
     add("missing schema_version", lambda c: c.pop("schema_version"), False, False)
@@ -1452,7 +1462,7 @@ class ConfigCorpusShapeTests(unittest.TestCase):
                 "required_valid": 1,
                 "required_empty": 1,
                 "structural": 49,
-                "asymmetric": 15,
+                "asymmetric": 16,
             },
             counts,
         )

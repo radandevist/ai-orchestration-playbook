@@ -17,6 +17,7 @@ from pr_closure.model import (
 )
 from pr_closure.review import validate_review
 from pr_closure.registries import canonical_policy_definition
+from pr_closure.jsonio import StrictJsonError, loads as strict_json_loads
 
 
 _ROLLBACK_ROUTES = (
@@ -257,8 +258,8 @@ def authorize_retirement(
         expected_sha256,
     )
     try:
-        record = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        record = strict_json_loads(raw, "retirement source")
+    except StrictJsonError as error:
         raise ConfigValidationError("retirement source is not valid UTF-8 JSON") from error
     if not isinstance(record, dict):
         raise ConfigValidationError("retirement source must be a JSON object")

@@ -44,6 +44,7 @@ from pr_closure.lease import (
     LeasePathEscape,
     LeaseUnavailable,
 )
+from pr_closure.jsonio import StrictJsonError, loads as strict_json_loads
 from pr_closure.model import (
     CiState,
     ClosureSnapshot,
@@ -156,8 +157,8 @@ def _read_config(path: str) -> Mapping:
     except (OSError, UnicodeDecodeError) as error:
         raise CliInputError("cannot read config {0}: {1}".format(path, error))
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as error:
+        data = strict_json_loads(raw, "config {0}".format(path))
+    except StrictJsonError as error:
         raise CliInputError("config {0} is not valid JSON: {1}".format(path, error))
     if not isinstance(data, dict):
         raise CliInputError("config {0} must be a JSON object".format(path))
@@ -165,19 +166,9 @@ def _read_config(path: str) -> Mapping:
 
 
 def _strict_json_object(raw: bytes, label: str) -> Mapping:
-    def pairs(items):
-        value = {}
-        for key, item in items:
-            if key in value:
-                raise CliInputError("{0} contains a duplicate JSON key: {1}".format(label, key))
-            value[key] = item
-        return value
-
     try:
-        data = json.loads(raw, object_pairs_hook=pairs)
-    except CliInputError:
-        raise
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        data = strict_json_loads(raw, label)
+    except StrictJsonError as error:
         raise CliInputError("{0} is not valid UTF-8 JSON: {1}".format(label, error)) from error
     if not isinstance(data, dict):
         raise CliInputError("{0} must be a JSON object".format(label))
@@ -302,6 +293,32 @@ def _resolve_pr_sources(config, pr_number):
     record = resolver.resolve(pr.head_branch)
     git = GitSource(record.path, pr.head_branch)
     return github, pr, git, effective_config
+
+
+def _assert_live_pr_unchanged(before, after) -> None:
+    fields = (
+        "state", "head_branch", "head_oid", "base_ref_name", "potential_merge_commit_oid",
+        "body", "is_draft", "merge_state_status", "mergeable",
+    )
+    changed = [field for field in fields if getattr(before, field) != getattr(after, field)]
+    if changed:
+        raise SourceMalformed(
+            "live PR changed during status evaluation: {0}".format(", ".join(changed))
+        )
+
+
+def _assert_git_binding_unchanged(before, after) -> None:
+    fields = (
+        "worktree_path", "branch", "checked_out_branch", "local_commit", "remote_commit",
+        "worktree_clean", "dirty_entries",
+    )
+    changed = [field for field in fields if getattr(before, field) != getattr(after, field)]
+    if changed:
+        raise SourceMalformed(
+            "local Git/worktree binding changed during status evaluation: {0}".format(
+                ", ".join(changed)
+            )
+        )
 
 
 def _bind_verification_target(config, pr_number):
@@ -633,6 +650,14 @@ def _status_snapshot(
                 acceptable = False
                 break
         follow_ups_complete = acceptable
+
+    # The first PR/Git/worktree snapshot is never reused as the final
+    # authority. Re-read after every candidate/provenance/review/issue lookup
+    # and refuse to mix observations from different live states.
+    final_pr = _require_live_pr(github, config)
+    _assert_live_pr_unchanged(pr, final_pr)
+    final_facts = git.facts()
+    _assert_git_binding_unchanged(facts, final_facts)
 
     available = {
         Evidence.WORKTREE,
@@ -1352,8 +1377,8 @@ def _parse_adapter_result(stdout, mode, require_delivery_cards=False):
     objects are never accepted.
     """
     try:
-        data = json.loads(stdout)
-    except json.JSONDecodeError:
+        data = strict_json_loads(stdout, "projection adapter result")
+    except StrictJsonError:
         raise ProjectionFailure("projection adapter returned malformed JSON")
     if not isinstance(data, dict):
         raise ProjectionFailure("projection adapter must return a JSON object")

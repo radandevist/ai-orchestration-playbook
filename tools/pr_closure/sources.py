@@ -8,6 +8,7 @@ import re
 import subprocess
 import tempfile
 import urllib.parse
+import zipfile
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -15,12 +16,14 @@ from enum import StrEnum
 from typing import Callable, Mapping, Optional, Sequence, Tuple
 
 from pr_closure.contract import COMMIT_ID_PATTERN, REPOSITORY_PATTERN
+from pr_closure.jsonio import StrictJsonError, loads as strict_json_loads
 from pr_closure.model import CiState, MergeableState
 
 _COMMIT_ID_RE = re.compile(COMMIT_ID_PATTERN)
 _REPOSITORY_RE = re.compile(REPOSITORY_PATTERN)
 _NON_BLANK_RE = re.compile(r"\S")
 _WHITESPACE_RE = re.compile(r"\s")
+MAX_SNAPSHOT_ARTIFACT_BYTES = 64 * 1024
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -198,14 +201,24 @@ def _require_non_blank(stdout: str, argv, label: str) -> str:
 def _parse_json_object(stdout: str, argv, label: str) -> dict:
     raw = _require_non_blank(stdout, argv, label)
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as error:
+        parsed = strict_json_loads(raw, label)
+    except StrictJsonError as error:
         raise SourceMalformed(
             "{0} returned malformed JSON for: {1}: {2}".format(label, _describe_command(argv), error)
         ) from error
     if not isinstance(parsed, dict):
         raise SourceMalformed("{0} must be a JSON object for: {1}".format(label, _describe_command(argv)))
     return parsed
+
+
+def _parse_json_value(stdout: str, argv, label: str):
+    raw = _require_non_blank(stdout, argv, label)
+    try:
+        return strict_json_loads(raw, label)
+    except StrictJsonError as error:
+        raise SourceMalformed(
+            "{0} returned malformed JSON for: {1}: {2}".format(label, _describe_command(argv), error)
+        ) from error
 
 
 def _require_commit(value, label: str, argv) -> str:
@@ -970,6 +983,12 @@ def _require_positive_int(value, label: str, argv) -> int:
     return value
 
 
+def _require_nonnegative_int(value, label: str, argv) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise SourceMalformed("{0} must be a non-negative integer for: {1}".format(label, _describe_command(argv)))
+    return value
+
+
 def _flatten_api_pages(data, label: str, argv) -> Tuple[dict, ...]:
     """Normalize gh api --paginate --slurp output to object pages."""
     if isinstance(data, dict):
@@ -1031,6 +1050,15 @@ def _parse_actions_run_id(details_url: str, repository: str, argv) -> int:
             )
         )
     return _require_positive_int(int(match.group(1)), "workflow run id", argv)
+
+
+def _workflow_path_matches(actual: object, configured: str) -> bool:
+    if actual == configured:
+        return True
+    if not isinstance(actual, str) or not actual.startswith(configured + "@"):
+        return False
+    ref = actual[len(configured) + 1:]
+    return bool(ref) and not any(char.isspace() or ord(char) < 32 for char in ref)
 
 
 class GitHubSource:
@@ -1153,14 +1181,14 @@ class GitHubSource:
         )
 
     def _api_json(self, endpoint: str, *, paginate: bool = False, label: str = "gh api"):
-        argv = ["gh", "api", "--repo", self._repository]
+        argv = ["gh", "api"]
         if paginate:
             argv.extend(["--paginate", "--slurp"])
         argv.append(endpoint)
         argv = tuple(argv)
         _, stdout, _ = _invoke(argv, self._timeout, self._runner)
-        return _parse_json_object(stdout, argv, label) if not paginate else json.loads(
-            _require_non_blank(stdout, argv, label)
+        return _parse_json_object(stdout, argv, label) if not paginate else _parse_json_value(
+            stdout, argv, label
         )
 
     def read_candidate_tip_config(
@@ -1189,8 +1217,8 @@ class GitHubSource:
             raise SourceMalformed("candidate-tip Contents response lacks base64 content")
         try:
             decoded = base64.b64decode("".join(encoded.split()), validate=True)
-            raw = json.loads(decoded.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raw = strict_json_loads(decoded, "candidate-tip closure config")
+        except (ValueError, StrictJsonError) as error:
             raise SourceMalformed("candidate-tip closure config is not valid JSON") from error
         if not isinstance(raw, Mapping):
             raise SourceMalformed("candidate-tip closure config must be a JSON object")
@@ -1217,20 +1245,34 @@ class GitHubSource:
         return raw
 
     def _workflow_id(self, path: str) -> int:
-        endpoint = "repos/{0}/actions/workflows/{1}".format(
-            self._repository, urllib.parse.quote(path, safe="/")
-        )
+        endpoint = "repos/{0}/actions/workflows?per_page=100".format(self._repository)
         data = self._api_json(endpoint, label="GitHub workflow API")
-        workflow_path = data.get("path")
-        if workflow_path != path:
-            raise SourceMalformed("configured workflow path does not match GitHub workflow")
-        return _require_positive_int(data.get("id"), "workflow id", ())
+        workflows = data.get("workflows")
+        if not isinstance(workflows, list):
+            raise SourceMalformed("GitHub workflow list is malformed")
+        matches = [
+            workflow for workflow in workflows
+            if isinstance(workflow, Mapping) and workflow.get("path") == path
+        ]
+        if len(matches) != 1:
+            raise SourceMalformed("configured workflow path does not identify exactly one workflow")
+        return _require_positive_int(matches[0].get("id"), "workflow id", ())
 
-    def _workflow_run(self, run_id: int) -> Mapping:
-        endpoint = "repos/{0}/actions/runs/{1}".format(self._repository, run_id)
+
+    def _workflow_run(self, run_id: int, run_attempt: Optional[int] = None) -> Mapping:
+        if run_attempt is None:
+            endpoint = "repos/{0}/actions/runs/{1}".format(self._repository, run_id)
+        else:
+            endpoint = "repos/{0}/actions/runs/{1}/attempts/{2}".format(
+                self._repository, run_id, run_attempt
+            )
         data = self._api_json(endpoint, label="GitHub workflow-run API")
         if _require_positive_int(data.get("id"), "workflow run id", ()) != run_id:
             raise SourceMalformed("workflow-run identity mismatch")
+        if run_attempt is not None and _require_positive_int(
+            data.get("run_attempt"), "workflow run attempt", ()
+        ) != run_attempt:
+            raise SourceMalformed("workflow-run attempt identity mismatch")
         return data
 
     def _check_run_candidate(
@@ -1240,7 +1282,8 @@ class GitHubSource:
         head_oid: str,
         workflow_path: str,
         workflow_action: str,
-        workflow_id: int,
+        workflow_id: Optional[int] = None,
+        workflow_cache: Optional[dict] = None,
     ) -> CheckRunCandidate:
         name = raw.get("name") if isinstance(raw.get("name"), str) else "<malformed>"
         try:
@@ -1279,19 +1322,39 @@ class GitHubSource:
             if not isinstance(suite, Mapping):
                 raise SourceMalformed("candidate check-suite identity is missing")
             suite_id = _require_positive_int(suite.get("id"), "check-suite id", ())
-            workflow = self._workflow_run(run_id)
-            if _require_positive_int(workflow.get("workflow_id"), "workflow id", ()) != workflow_id:
-                raise SourceMalformed("workflow id mismatch")
-            if workflow.get("path") != workflow_path:
-                raise SourceMalformed("workflow path mismatch")
-            if workflow.get("event") != workflow_action:
-                raise SourceMalformed("workflow event/action mismatch")
+            cache = workflow_cache if workflow_cache is not None else {}
+            workflow = cache.get((run_id, None))
+            if workflow is None:
+                workflow = self._workflow_run(run_id)
+                cache[(run_id, None)] = workflow
+            base_workflow_id = _require_positive_int(workflow.get("workflow_id"), "workflow id", ())
+            actual_workflow_path = _require_non_empty_str(workflow.get("path"), "workflow path", ())
+            event = _require_non_empty_str(workflow.get("event"), "workflow event/action", ())
             workflow_head = _require_commit(workflow.get("head_sha"), "workflow-run head_sha", ())
             if run_head != head_oid or workflow_head != head_oid:
                 raise SourceMalformed("workflow/check candidate head does not match PR head")
             run_attempt = _require_positive_int(workflow.get("run_attempt"), "run attempt", ())
-            if _require_positive_int(workflow.get("id"), "workflow run id", ()) != run_id:
-                raise SourceMalformed("workflow-run id mismatch")
+            attempt_workflow = cache.get((run_id, run_attempt))
+            if attempt_workflow is None:
+                attempt_workflow = self._workflow_run(run_id, run_attempt)
+                cache[(run_id, run_attempt)] = attempt_workflow
+            if _require_positive_int(attempt_workflow.get("workflow_id"), "workflow id", ()) != base_workflow_id:
+                raise SourceMalformed("workflow attempt id mismatch")
+            if _require_positive_int(attempt_workflow.get("check_suite_id"), "workflow check-suite id", ()) != suite_id:
+                raise SourceMalformed("check-suite/workflow-run identity mismatch")
+            if _require_positive_int(workflow.get("check_suite_id"), "workflow check-suite id", ()) != suite_id:
+                raise SourceMalformed("check-suite/workflow-run identity mismatch")
+            if workflow_id is not None and base_workflow_id != workflow_id:
+                raise SourceMalformed("workflow id mismatch")
+            if workflow_id is not None and not _workflow_path_matches(actual_workflow_path, workflow_path):
+                raise SourceMalformed("workflow path mismatch")
+            if workflow_id is not None and event != workflow_action:
+                raise SourceMalformed("workflow event/action mismatch")
+            attempt_path = _require_non_empty_str(attempt_workflow.get("path"), "workflow attempt path", ())
+            if workflow_id is not None and not _workflow_path_matches(attempt_path, workflow_path):
+                raise SourceMalformed("workflow attempt path mismatch")
+            if workflow_id is not None and attempt_workflow.get("event") != workflow_action:
+                raise SourceMalformed("workflow attempt event/action mismatch")
             outcome = _classify_check("check_run", status, conclusion)
             return CheckRunCandidate(
                 result=CheckResult(
@@ -1308,10 +1371,10 @@ class GitHubSource:
                     app_slug=app.get("slug"),
                     check_suite_id=suite_id,
                     workflow_run_id=run_id,
-                    workflow_id=workflow_id,
-                    workflow_path=workflow_path,
-                    workflow_action=workflow_action,
-                    workflow_event=workflow.get("event"),
+                    workflow_id=base_workflow_id,
+                    workflow_path=actual_workflow_path,
+                    workflow_action=event,
+                    workflow_event=event,
                     run_attempt=run_attempt,
                 )
             )
@@ -1324,9 +1387,9 @@ class GitHubSource:
         *,
         workflow_path: str,
         workflow_action: str,
+        required_names: Sequence[str] = (),
     ) -> Tuple[CheckRunCandidate, ...]:
         head_oid = _require_commit(head_oid, "PR head", ())
-        workflow_id = self._workflow_id(workflow_path)
         endpoint = (
             "repos/{0}/commits/{1}/check-runs?filter=all&per_page=100".format(
                 self._repository, head_oid
@@ -1335,106 +1398,191 @@ class GitHubSource:
         argv = (
             "gh",
             "api",
-            "--repo",
-            self._repository,
             "--paginate",
             "--slurp",
             endpoint,
         )
         _, stdout, _ = _invoke(argv, self._timeout, self._runner)
-        try:
-            pages = json.loads(_require_non_blank(stdout, argv, "GitHub check-runs API"))
-        except json.JSONDecodeError as error:
-            raise SourceMalformed("GitHub check-runs API returned malformed JSON") from error
+        pages = _parse_json_value(stdout, argv, "GitHub check-runs API")
         if isinstance(pages, Mapping):
             pages = [pages]
         if not isinstance(pages, list) or not pages:
             raise SourceMalformed("GitHub check-runs API returned no pages")
+        names = set(required_names)
+        if not all(isinstance(name, str) and name for name in names):
+            raise SourceMalformed("required check names are malformed")
+        total_count = None
+        seen_ids = set()
+        seen_pages = set()
+        workflow_cache = {}
         candidates = []
         for page in pages:
             if not isinstance(page, Mapping) or not isinstance(page.get("check_runs"), list):
                 raise SourceMalformed("GitHub check-runs API page is malformed")
+            page_total = _require_nonnegative_int(page.get("total_count"), "check-run total_count", argv)
+            if total_count is None:
+                total_count = page_total
+            elif page_total != total_count:
+                raise SourceMalformed("GitHub check-runs pages disagree on total_count")
+            page_ids = tuple(
+                _require_positive_int(raw.get("id"), "check-run id", argv)
+                for raw in page["check_runs"]
+                if isinstance(raw, Mapping)
+            )
+            if page_ids in seen_pages:
+                raise SourceMalformed("GitHub check-runs pagination replayed a page")
+            seen_pages.add(page_ids)
             for raw in page["check_runs"]:
                 if not isinstance(raw, Mapping):
                     raise SourceMalformed("GitHub check-runs API contains a non-object candidate")
+                raw_id = _require_positive_int(raw.get("id"), "check-run id", argv)
+                if raw_id in seen_ids:
+                    raise SourceMalformed("GitHub check-runs pages contain duplicate check-run ids")
+                seen_ids.add(raw_id)
+                if names and raw.get("name") not in names:
+                    continue
                 candidates.append(
                     self._check_run_candidate(
                         raw,
                         head_oid=head_oid,
                         workflow_path=workflow_path,
                         workflow_action=workflow_action,
-                        workflow_id=workflow_id,
+                        workflow_cache=workflow_cache,
                     )
                 )
+        if total_count != len(seen_ids):
+            raise SourceMalformed("GitHub check-runs pagination is truncated or over-counted")
         return tuple(candidates)
 
     def _read_run_artifacts(self, run_id: int) -> Tuple[Mapping, ...]:
         endpoint = "repos/{0}/actions/runs/{1}/artifacts?per_page=100".format(
             self._repository, run_id
         )
-        argv = (
-            "gh",
-            "api",
-            "--repo",
-            self._repository,
-            "--paginate",
-            "--slurp",
-            endpoint,
-        )
+        argv = ("gh", "api", "--paginate", "--slurp", endpoint)
         _, stdout, _ = _invoke(argv, self._timeout, self._runner)
-        try:
-            pages = json.loads(_require_non_blank(stdout, argv, "GitHub artifacts API"))
-        except json.JSONDecodeError as error:
-            raise SourceMalformed("GitHub artifacts API returned malformed JSON") from error
+        pages = _parse_json_value(stdout, argv, "GitHub artifacts API")
         if isinstance(pages, Mapping):
             pages = [pages]
         if not isinstance(pages, list) or not pages:
             raise SourceMalformed("GitHub artifacts API returned no pages")
+        total_count = None
+        seen_ids = set()
+        seen_pages = set()
         artifacts = []
         for page in pages:
             if not isinstance(page, Mapping) or not isinstance(page.get("artifacts"), list):
                 raise SourceMalformed("GitHub artifacts API page is malformed")
+            page_total = _require_nonnegative_int(page.get("total_count"), "artifact total_count", argv)
+            if total_count is None:
+                total_count = page_total
+            elif page_total != total_count:
+                raise SourceMalformed("GitHub artifact pages disagree on total_count")
+            page_ids = tuple(
+                _require_positive_int(item.get("id"), "artifact id", argv)
+                for item in page["artifacts"]
+                if isinstance(item, Mapping)
+            )
+            if page_ids in seen_pages:
+                raise SourceMalformed("GitHub artifact pagination replayed a page")
+            seen_pages.add(page_ids)
             for artifact in page["artifacts"]:
                 if not isinstance(artifact, Mapping):
                     raise SourceMalformed("GitHub artifacts API contains a non-object artifact")
+                artifact_id = _require_positive_int(artifact.get("id"), "artifact id", argv)
+                if artifact_id in seen_ids:
+                    raise SourceMalformed("GitHub artifact pages contain duplicate artifact ids")
+                seen_ids.add(artifact_id)
                 artifacts.append(artifact)
+        if total_count != len(seen_ids):
+            raise SourceMalformed("GitHub artifact pagination is truncated or over-counted")
         return tuple(artifacts)
 
-    def _download_snapshot_record(self, run_id: int, artifact_name: str) -> Mapping:
+    def _download_snapshot_record(
+        self,
+        artifact_id: int,
+        artifact_name: str,
+        *,
+        expected_size: int,
+        expected_digest: Optional[str] = None,
+    ) -> Mapping:
         if self._artifact_reader is not None:
-            record = self._artifact_reader(run_id, artifact_name)
-            if isinstance(record, str):
+            record = self._artifact_reader(artifact_id, artifact_name)
+            if isinstance(record, bytes):
+                if len(record) > MAX_SNAPSHOT_ARTIFACT_BYTES:
+                    raise SourceMalformed("snapshot artifact exceeds the byte limit")
+                if expected_digest is not None:
+                    actual = "sha256:" + hashlib.sha256(record).hexdigest()
+                    if actual != expected_digest:
+                        raise SourceMalformed("snapshot artifact digest mismatch")
                 try:
-                    record = json.loads(record)
-                except json.JSONDecodeError as error:
+                    record = strict_json_loads(record, "snapshot artifact")
+                except StrictJsonError as error:
                     raise SourceMalformed("snapshot artifact contains malformed JSON") from error
+            elif isinstance(record, str):
+                try:
+                    record = strict_json_loads(record, "snapshot artifact")
+                except StrictJsonError as error:
+                    raise SourceMalformed("snapshot artifact contains malformed JSON") from error
+            elif expected_digest is not None:
+                raise SourceMalformed("snapshot artifact digest cannot be validated")
             if not isinstance(record, Mapping):
                 raise SourceMalformed("snapshot artifact must contain one JSON object")
             return record
         with tempfile.TemporaryDirectory(prefix="pr-closure-artifact-") as directory:
+            output = os.path.join(directory, "snapshot.zip")
             argv = (
-                "gh",
-                "run",
-                "download",
-                str(run_id),
-                "--repo",
-                self._repository,
-                "--name",
-                artifact_name,
-                "--dir",
-                directory,
+                "gh", "api",
+                "repos/{0}/actions/artifacts/{1}/zip".format(self._repository, artifact_id),
+                "--output", output,
             )
             _, stdout, _ = _invoke(argv, self._timeout, self._runner)
+            if os.path.lexists(output) and (os.path.islink(output) or not os.path.isfile(output)):
+                raise SourceMalformed("snapshot archive is not a regular file")
+            if os.path.isfile(output):
+                archive_size = os.path.getsize(output)
+                if expected_size and archive_size > expected_size:
+                    raise SourceMalformed("snapshot archive exceeds its validated metadata size")
+                if archive_size > MAX_SNAPSHOT_ARTIFACT_BYTES:
+                    raise SourceMalformed("snapshot archive exceeds the byte limit")
+                if expected_digest is not None:
+                    digest = "sha256:" + hashlib.sha256(Path(output).read_bytes()).hexdigest()
+                    if digest != expected_digest:
+                        raise SourceMalformed("snapshot artifact digest mismatch")
+                try:
+                    with zipfile.ZipFile(output) as archive:
+                        members = archive.infolist()
+                        if len(members) != 1:
+                            raise SourceMalformed("snapshot archive must contain exactly one file")
+                        member = members[0]
+                        member_name = member.filename
+                        member_path = Path(member_name)
+                        mode = (member.external_attr >> 16) & 0o170000
+                        if mode == 0o120000 or member.is_dir() or member_path.is_absolute() or ".." in member_path.parts:
+                            raise SourceMalformed("snapshot archive contains an unsafe path")
+                        if member.file_size > MAX_SNAPSHOT_ARTIFACT_BYTES:
+                            raise SourceMalformed("snapshot archive file exceeds the byte limit")
+                        record = strict_json_loads(archive.read(member), "snapshot artifact")
+                except (OSError, zipfile.BadZipFile, StrictJsonError) as error:
+                    raise SourceMalformed("snapshot archive is malformed") from error
+                if not isinstance(record, Mapping):
+                    raise SourceMalformed("snapshot artifact must contain one JSON object")
+                return record
             files = []
             for root, _dirs, names in os.walk(directory):
                 for name in names:
                     path = os.path.join(root, name)
-                    if os.path.isfile(path):
+                    if os.path.islink(path) or not os.path.isfile(path):
+                        raise SourceMalformed("snapshot artifact contains a symlink or non-regular file")
+                    if os.path.realpath(path) != os.path.abspath(path):
+                        raise SourceMalformed("snapshot artifact path escapes its download directory")
+                    if os.path.getsize(path) > MAX_SNAPSHOT_ARTIFACT_BYTES:
+                        raise SourceMalformed("snapshot artifact file exceeds the byte limit")
+                    if os.path.basename(path) != os.path.basename(output):
                         files.append(path)
-            if not files and stdout.strip().startswith("{"):
+            if not files and not os.path.exists(output) and stdout.strip().startswith("{"):
                 try:
-                    record = json.loads(stdout)
-                except json.JSONDecodeError as error:
+                    record = strict_json_loads(stdout, "snapshot artifact")
+                except StrictJsonError as error:
                     raise SourceMalformed("snapshot artifact contains malformed JSON") from error
                 if not isinstance(record, Mapping):
                     raise SourceMalformed("snapshot artifact must contain one JSON object")
@@ -1442,9 +1590,9 @@ class GitHubSource:
             if len(files) != 1:
                 raise SourceMalformed("snapshot artifact must contain exactly one file")
             try:
-                raw = Path(files[0]).read_text(encoding="utf-8")
-                record = json.loads(raw)
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raw = Path(files[0]).read_bytes()
+                record = strict_json_loads(raw, "snapshot artifact")
+            except (OSError, UnicodeDecodeError, StrictJsonError) as error:
                 raise SourceMalformed("snapshot artifact contains malformed JSON") from error
             if not isinstance(record, Mapping):
                 raise SourceMalformed("snapshot artifact must contain one JSON object")
@@ -1465,7 +1613,22 @@ class GitHubSource:
         artifact_id = _require_positive_int(matches[0].get("id"), "artifact id", ())
         if matches[0].get("expired") is True:
             raise SourceMalformed("snapshot artifact {0} is expired".format(name))
-        record = self._download_snapshot_record(run_id, name)
+        size_in_bytes = matches[0].get("size_in_bytes")
+        if not isinstance(size_in_bytes, int) or isinstance(size_in_bytes, bool) or size_in_bytes < 0:
+            raise SourceMalformed("snapshot artifact size is malformed")
+        if size_in_bytes > MAX_SNAPSHOT_ARTIFACT_BYTES:
+            raise SourceMalformed("snapshot artifact exceeds the byte limit")
+        digest = matches[0].get("digest")
+        if digest is not None and (
+            not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+        ):
+            raise SourceMalformed("snapshot artifact digest is malformed")
+        record = self._download_snapshot_record(
+            artifact_id,
+            name,
+            expected_size=size_in_bytes,
+            expected_digest=digest,
+        )
         expected = {
             "pr_number",
             "head_sha",
@@ -1516,7 +1679,6 @@ class GitHubSource:
         )
         if snapshot_run_id != run_id or snapshot_attempt != run_attempt:
             raise SourceMalformed("snapshot artifact run identity mismatch")
-        _ = artifact_id  # identity is validated before the record is trusted
         return LivePrSnapshot(
             pr_number=record["pr_number"],
             head_sha=head_sha,
@@ -1546,7 +1708,9 @@ class GitHubSource:
             pr.head_oid,
             workflow_path=workflow_path,
             workflow_action=workflow_action,
+            required_names=required_checks,
         )
+        central_workflow_id = self._workflow_id(workflow_path) if live_checks else None
         facts = select_check_run_candidates(
             candidates,
             required_checks,
@@ -1559,6 +1723,14 @@ class GitHubSource:
             check = selected.get(name)
             if check is None:
                 reasons.append("live PR check {0} has no selected run".format(name))
+                continue
+            if (
+                central_workflow_id is None
+                or check.workflow_id != central_workflow_id
+                or not _workflow_path_matches(check.workflow_path, workflow_path)
+                or check.workflow_action != workflow_action
+            ):
+                reasons.append("live PR check {0} has mismatched workflow provenance".format(name))
                 continue
             try:
                 snapshot = self._read_snapshot(check.workflow_run_id, check.run_attempt)

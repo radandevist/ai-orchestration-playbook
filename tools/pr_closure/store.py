@@ -20,6 +20,7 @@ from pr_closure.contract import (
     legacy_command_sequence_digest,
 )
 from pr_closure.model import ClosureState
+from pr_closure.jsonio import StrictJsonError, loads as strict_json_loads
 from pr_closure.secure_paths import (
     SecurePathError,
     append_contained_file as secure_append_contained_file,
@@ -327,8 +328,8 @@ def _serialize(record: Mapping) -> bytes:
 def _parse_json_bytes(raw: bytes, path: Path, label: str) -> dict:
     """Parse a JSON object from the exact bytes an authority check hashed."""
     try:
-        parsed = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        parsed = strict_json_loads(raw, label)
+    except StrictJsonError as error:
         raise MalformedEvidence(f"malformed {label}: {path}: {error}") from error
     return _require_json_object(parsed, f"{label}: {path}")
 
@@ -1428,8 +1429,8 @@ class RunStore:
             if not line.strip():
                 raise MalformedEvidence(f"blank line in stream anchor head at line {number}")
             try:
-                record = json.loads(line)
-            except json.JSONDecodeError as error:
+                record = strict_json_loads(line, "stream anchor head record")
+            except StrictJsonError as error:
                 raise MalformedEvidence(
                     f"malformed stream anchor head at line {number}: {error}"
                 ) from error
@@ -1559,8 +1560,8 @@ class RunStore:
             if not line.strip():
                 raise MalformedEvidence(f"blank line in events at line {number}: {path}")
             try:
-                parsed = json.loads(line)
-            except json.JSONDecodeError as error:
+                parsed = strict_json_loads(line, f"event at line {number}")
+            except StrictJsonError as error:
                 raise MalformedEvidence(
                     f"malformed event at line {number}: {path}: {error}"
                 ) from error

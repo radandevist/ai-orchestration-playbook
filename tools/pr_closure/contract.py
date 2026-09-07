@@ -154,7 +154,7 @@ PROJECT_CONFIG_ALLOWED_KEYS = tuple(field.name for field in PROJECT_CONFIG_FIELD
 PROJECT_CONFIG_REQUIRED_KEYS = tuple(
     field.name
     for field in PROJECT_CONFIG_FIELDS
-    if field.name not in ("ci_required_checks", "model_routes", "review_policy")
+    if field.name not in ("model_routes", "review_policy")
 )
 
 CONFIG_SEMANTIC_ASYMMETRIES = (
