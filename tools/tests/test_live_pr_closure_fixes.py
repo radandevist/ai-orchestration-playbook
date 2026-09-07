@@ -840,6 +840,64 @@ class LivePrFixTests(unittest.TestCase):
             [call[-1] for call in runner.calls],
         )
 
+    def test_full_reader_malformed_newer_candidate_poisoning_variants(self):
+        endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
+        for field, value in (
+            ("status", "provider-garbage"),
+            ("conclusion", "provider-garbage"),
+            ("started_at", "provider-garbage"),
+        ):
+            with self.subTest(field=field):
+                old = check("ci-final-gate", run_id=201, check_id=101, suite_id=301)
+                newer = check(
+                    "ci-final-gate",
+                    run_id=202,
+                    check_id=102,
+                    suite_id=302,
+                    start="2026-09-07T11:00:00Z",
+                )
+                newer[field] = value
+                responses = {
+                    "gh api repos/owner/repo/actions/workflows/ci.yml": (
+                        0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), ""
+                    ),
+                    "gh api " + endpoint + "&page=1&per_page=100": (
+                        0, json.dumps({"total_count": 2, "check_runs": [old, newer]}), ""
+                    ),
+                    "gh api repos/owner/repo/actions/runs/201": (
+                        0, json.dumps(run(run_id=201, suite_id=301)), ""
+                    ),
+                    "gh api repos/owner/repo/actions/runs/201/attempts/1": (
+                        0, json.dumps(run(run_id=201, suite_id=301)), ""
+                    ),
+                }
+                source = GitHubSource(
+                    "owner/repo",
+                    42,
+                    runner=Runner(responses),
+                    artifact_reader=lambda *_: snapshot(),
+                )
+                source._read_run_artifacts = lambda run_id: (
+                    {
+                        "id": 501,
+                        "name": "ci-pr-snapshot-201-1",
+                        "expired": False,
+                        "size_in_bytes": 256,
+                    },
+                )
+
+                facts = source.read_live_ci(
+                    pr(),
+                    required_checks=("ci-final-gate",),
+                    live_checks=("ci-final-gate",),
+                    workflow_path=".github/workflows/ci.yml",
+                    workflow_action="pull_request",
+                )
+
+                self.assertEqual(CiState.UNKNOWN, facts.ci_state)
+                self.assertIsNone(facts.check_run_id)
+                self.assertIsNone(facts.workflow_run_id)
+
     def test_current_attempt_mutations_cannot_fall_back_to_old_green_candidate(self):
         endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
         mutations = {

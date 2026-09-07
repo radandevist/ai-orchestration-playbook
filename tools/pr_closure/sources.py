@@ -1477,7 +1477,7 @@ class GitHubSource:
         workflow_cache: Optional[dict] = None,
     ) -> CheckRunCandidate:
         name = raw.get("name") if isinstance(raw.get("name"), str) else "<malformed>"
-        authoritative = False
+        authoritative = True
         try:
             check_id = _require_positive_int(raw.get("id"), "check-run id", ())
             run_head = _require_commit(raw.get("head_sha"), "check-run head_sha", ())
