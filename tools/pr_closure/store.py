@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import threading
 import time
@@ -177,18 +178,63 @@ _POLICY_ADOPTION_EVENT_KEYS = frozenset(
     )
 )
 
-_PROJECT_LOCK_STATE = threading.local()
-_EVENT_OPERATIONAL_FILES = frozenset(
+_STREAM_ANCHOR_IDENTITY_KEYS = frozenset(
     (
+        "schema_version",
+        "project",
+        "pr",
+        "stream_id",
+        "events_path",
+        "events_device",
+        "events_inode",
+        "initial_size",
+        "initial_sha256",
+        "initial_event_count",
+    )
+)
+_STREAM_ANCHOR_HEAD_KEYS = frozenset(
+    (
+        "schema_version",
+        "record_type",
+        "phase",
+        "project",
+        "pr",
+        "stream_id",
+        "operation_id",
+        "anchor_device",
+        "anchor_inode",
+        "identity_device",
+        "identity_inode",
+        "head_device",
+        "head_inode",
+        "events_device",
+        "events_inode",
+        "previous_size",
+        "previous_sha256",
+        "previous_event_count",
+        "new_size",
+        "new_sha256",
+        "new_event_count",
+        "line_size",
+        "line_sha256",
+    )
+)
+_STREAM_ANCHOR_PHASES = frozenset(("PREPARE", "COMMIT", "ABORT"))
+_EMPTY_STREAM_DIGEST = hashlib.sha256(b"").hexdigest()
+_EVENT_STORE_OPERATIONAL_ENTRIES = frozenset(
+    (
+        "verification",
+        "reviews",
+        "retirements",
+        "reviews-retirement-staging",
+        "reviews-retired",
+        ".policy-adoption.lock",
         "heavy-job.lock",
         "heavy-job.meta.json",
-        ".events-authoritative",
-        ".policy-adoption.lock",
-        "verification",
     )
 )
 
-
+_PROJECT_LOCK_STATE = threading.local()
 def _resolve(path: str) -> str:
     return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
 
@@ -341,8 +387,17 @@ class RunStore:
         return self._base / "events.jsonl"
 
     @property
-    def _events_marker_path(self) -> Path:
-        return self._base / ".events-authoritative"
+    def stream_anchor_dir(self) -> Path:
+        """External binding directory that cannot be replaced with the PR tree."""
+        return self._root / ".event-stream-anchors" / self._project / str(self._pr)
+
+    @property
+    def stream_anchor_identity_path(self) -> Path:
+        return self.stream_anchor_dir / "identity.json"
+
+    @property
+    def stream_anchor_head_path(self) -> Path:
+        return self.stream_anchor_dir / "head.jsonl"
 
     @contextmanager
     def _policy_adoption_lock(self, *, exclusive=True):
@@ -696,7 +751,7 @@ class RunStore:
         lane_id = _require_lifecycle_text(lane_id, "lane_id")
 
         prior_strategies = set()
-        for event in self.read_events():
+        for event in self._read_authoritative_events():
             if event["event_type"] != REPAIR_STRATEGY_EVENT:
                 continue
             prior_root_cause = _require_lifecycle_text(
@@ -761,7 +816,7 @@ class RunStore:
             "staged_config_digest": staged_config_digest,
             "projected_enforced_config_digest": projected_config_digest,
         }
-        for event in self.read_events():
+        for event in self._read_authoritative_events():
             if event["event_type"] != POLICY_ACTIVATION_EVENT or event["commit"] != commit:
                 continue
             if all(event.get(key) == value for key, value in payload.items()):
@@ -783,7 +838,7 @@ class RunStore:
             (commit + staged_config_digest + projected_config_digest).encode("ascii")
         ).hexdigest()
         matches = []
-        for event in self.read_events():
+        for event in self._read_authoritative_events():
             if (
                 event["event_type"] == POLICY_ACTIVATION_EVENT
                 and event["commit"] == commit
@@ -801,7 +856,7 @@ class RunStore:
         commit = _require_commit(commit)
         projected_config_digest = _require_digest(projected_config_digest)
         matches = []
-        for event in self.read_events():
+        for event in self._read_authoritative_events():
             if (
                 event["event_type"] != POLICY_ACTIVATION_EVENT
                 or event["commit"] != commit
@@ -915,11 +970,53 @@ class RunStore:
                 return ()
             return self._project_policy_adoption_events_unlocked()
 
+    def _external_anchor_pr_numbers(self) -> Tuple[int, ...]:
+        root = self._root / ".event-stream-anchors"
+        project_dir = root / self._project
+        for directory in (root, project_dir):
+            try:
+                entry = directory.lstat()
+            except FileNotFoundError:
+                return ()
+            except OSError as error:
+                raise MalformedEvidence("cannot validate external stream anchors") from error
+            if not stat.S_ISDIR(entry.st_mode) or directory.is_symlink():
+                raise MalformedEvidence(
+                    "external stream anchor parent must be a real directory: {0}".format(
+                        directory
+                    )
+                )
+        try:
+            children = sorted(project_dir.iterdir(), key=lambda child: child.name)
+        except OSError as error:
+            raise MalformedEvidence("cannot enumerate external stream anchors") from error
+        numbers = []
+        for child in children:
+            if re.fullmatch(r"[1-9][0-9]*", child.name) is None:
+                raise MalformedEvidence(
+                    "external stream anchor child must be a positive PR directory: {0}".format(
+                        child
+                    )
+                )
+            if child.is_symlink() or not child.is_dir():
+                raise MalformedEvidence(
+                    "external stream anchor PR entry must be a real directory: {0}".format(
+                        child
+                    )
+                )
+            numbers.append(int(child.name))
+        return tuple(numbers)
+
     def _project_policy_adoption_events_unlocked(self) -> Tuple[dict, ...]:
         project_dir = self._root / self._project
+        external_prs = set(self._external_anchor_pr_numbers())
         try:
             entry = project_dir.lstat()
         except FileNotFoundError:
+            if external_prs:
+                raise MalformedEvidence(
+                    "project event store is missing while an external stream anchor exists"
+                )
             return ()
         except OSError as error:
             raise MalformedEvidence(
@@ -936,6 +1033,7 @@ class RunStore:
             raise MalformedEvidence(
                 "cannot enumerate project adoption root: {0}".format(project_dir)
             ) from error
+        local_prs = set()
         for child in children:
             if child.name == ".policy-adoption.lock":
                 if child.is_symlink() or not child.is_file():
@@ -955,14 +1053,16 @@ class RunStore:
                 raise MalformedEvidence(
                     "project adoption PR directory number is invalid: {0}".format(child)
                 ) from error
+            local_prs.add(child_pr)
             if child.is_symlink() or not child.is_dir():
                 raise MalformedEvidence(
                     "project adoption PR entry must be a real directory: {0}".format(
                         child
                     )
                 )
+        for child_pr in sorted(local_prs | external_prs):
             child_store = RunStore(self._root, self._project, child_pr)
-            child_events = child_store.read_events()
+            child_events = child_store._read_authoritative_events()
             activations = {
                 event["event_id"]: event
                 for event in child_events
@@ -1235,87 +1335,218 @@ class RunStore:
             except StoreError:
                 fail(f"malformed content_digest: {digest!r}")
 
-    def _events_parent_has_authoritative_entries(self) -> bool:
-        """Return whether an existing PR directory proves an event stream was in use."""
-        marker = self._events_marker_path
+    def _stream_anchor_identity(self) -> Optional[dict]:
+        """Read the immutable external identity, without creating migration state."""
+        directory = self.stream_anchor_dir
         try:
-            marker_entry = marker.lstat()
+            entry = directory.lstat()
         except FileNotFoundError:
-            pass
+            return None
         except OSError as error:
+            raise MalformedEvidence(f"cannot validate stream anchor: {directory}") from error
+        if not stat.S_ISDIR(entry.st_mode) or directory.is_symlink():
+            raise MalformedEvidence(f"stream anchor must be a real directory: {directory}")
+        try:
+            children = {child.name for child in directory.iterdir()}
+        except OSError as error:
+            raise MalformedEvidence(f"cannot enumerate stream anchor: {directory}") from error
+        allowed = {"identity.json", "head.jsonl"}
+        unknown = children - allowed
+        if unknown:
             raise MalformedEvidence(
-                f"cannot validate events marker: {marker}: {error}"
+                "stream anchor contains unknown entry(s): {0}".format(sorted(unknown))
+            )
+        if "identity.json" not in children:
+            if children:
+                raise MalformedEvidence("stream anchor identity is missing")
+            return None
+        try:
+            raw, _digest = read_contained_file(
+                self.stream_anchor_identity_path, self._root, "stream anchor identity"
+            )
+        except (OSError, SecurePathError) as error:
+            raise MalformedEvidence(
+                f"cannot read stream anchor identity: {self.stream_anchor_identity_path}"
             ) from error
-        else:
-            if not stat.S_ISREG(marker_entry.st_mode) or marker_entry.st_nlink != 1:
+        identity = _parse_json_bytes(
+            raw, self.stream_anchor_identity_path, "stream anchor identity"
+        )
+        if frozenset(identity) != _STREAM_ANCHOR_IDENTITY_KEYS:
+            raise MalformedEvidence("stream anchor identity keys are not exact")
+        if identity.get("schema_version") != 1:
+            raise MalformedEvidence("unsupported stream anchor identity schema")
+        if identity.get("project") != self._project or identity.get("pr") != self._pr:
+            raise MalformedEvidence("stream anchor identity does not bind project and PR")
+        if _DIGEST_RE.fullmatch(identity.get("stream_id", "")) is None:
+            raise MalformedEvidence("stream anchor identity has an invalid stream_id")
+        if identity.get("events_path") != _resolve(os.fspath(self.events_path)):
+            raise MalformedEvidence("stream anchor identity does not bind events path")
+        for key in ("events_device", "events_inode", "initial_size", "initial_event_count"):
+            value = identity.get(key)
+            if type(value) is not int or value < 0:
+                raise MalformedEvidence("stream anchor identity has invalid {0}".format(key))
+        if _DIGEST_RE.fullmatch(identity.get("initial_sha256", "")) is None:
+            raise MalformedEvidence("stream anchor identity has an invalid initial digest")
+        if identity["initial_size"] == 0 and identity["initial_sha256"] != _EMPTY_STREAM_DIGEST:
+            raise MalformedEvidence("empty stream anchor has a non-empty initial digest")
+        identity_entry = self.stream_anchor_identity_path.lstat()
+        if not stat.S_ISREG(identity_entry.st_mode) or identity_entry.st_nlink != 1:
+            raise MalformedEvidence("stream anchor identity must be a single-link regular file")
+        return {
+            "identity": identity,
+            "anchor_identity": (entry.st_dev, entry.st_ino),
+            "identity_identity": (identity_entry.st_dev, identity_entry.st_ino),
+        }
+
+    @staticmethod
+    def _anchor_operation_id(record: Mapping) -> str:
+        value = dict(record)
+        value.pop("operation_id", None)
+        value.pop("phase", None)
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _parse_anchor_head(
+        self, raw: bytes, path: Path, anchor: dict, events_identity, head_identity
+    ):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise MalformedEvidence(f"stream anchor head is not UTF-8: {path}") from error
+        lines = text.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        state = {
+            "size": anchor["identity"]["initial_size"],
+            "sha256": anchor["identity"]["initial_sha256"],
+            "event_count": anchor["identity"]["initial_event_count"],
+        }
+        pending = None
+        seen_operations = set()
+        for number, line in enumerate(lines, start=1):
+            if not line.strip():
+                raise MalformedEvidence(f"blank line in stream anchor head at line {number}")
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
                 raise MalformedEvidence(
-                    f"events marker must be a single-link regular file: {marker}"
-                )
-            return True
-        try:
-            entry = self._base.lstat()
-        except FileNotFoundError:
-            return False
-        except OSError as error:
-            raise MalformedEvidence(
-                f"cannot validate events parent: {self._base}: {error}"
-            ) from error
-        if not stat.S_ISDIR(entry.st_mode) or self._base.is_symlink():
-            raise MalformedEvidence(
-                f"events parent must be a real directory: {self._base}"
-            )
-        try:
-            return any(
-                child.name not in _EVENT_OPERATIONAL_FILES
-                for child in self._base.iterdir()
-            )
-        except OSError as error:
-            raise MalformedEvidence(
-                f"cannot enumerate events parent: {self._base}: {error}"
-            ) from error
+                    f"malformed stream anchor head at line {number}: {error}"
+                ) from error
+            record = _require_json_object(record, "stream anchor head record")
+            if frozenset(record) != _STREAM_ANCHOR_HEAD_KEYS:
+                raise MalformedEvidence("stream anchor head record keys are not exact")
+            if record.get("schema_version") != 1 or record.get("record_type") != "event-update":
+                raise MalformedEvidence("unsupported stream anchor head record")
+            if record.get("project") != self._project or record.get("pr") != self._pr:
+                raise MalformedEvidence("stream anchor head record does not bind project and PR")
+            if record.get("stream_id") != anchor["identity"]["stream_id"]:
+                raise MalformedEvidence("stream anchor head stream identity disagrees")
+            if record.get("phase") not in _STREAM_ANCHOR_PHASES:
+                raise MalformedEvidence("stream anchor head phase is invalid")
+            operation_id = record.get("operation_id")
+            if _DIGEST_RE.fullmatch(operation_id or "") is None:
+                raise MalformedEvidence("stream anchor head operation_id is invalid")
+            if self._anchor_operation_id(record) != operation_id:
+                raise MalformedEvidence("stream anchor head operation is not envelope-bound")
+            if (
+                (record["anchor_device"], record["anchor_inode"]) != anchor["anchor_identity"]
+                or (record["identity_device"], record["identity_inode"]) != anchor["identity_identity"]
+                or (record["head_device"], record["head_inode"]) != head_identity
+                or (record["events_device"], record["events_inode"]) != events_identity
+            ):
+                raise MalformedEvidence("stream anchor head identity disagrees with its files")
+            for key in (
+                "anchor_device", "anchor_inode", "identity_device", "identity_inode",
+                "head_device", "head_inode",
+                "events_device", "events_inode", "previous_size", "previous_event_count",
+                "new_size", "new_event_count", "line_size",
+            ):
+                value = record.get(key)
+                if type(value) is not int or value < 0:
+                    raise MalformedEvidence("stream anchor head has invalid {0}".format(key))
+            for key in ("previous_sha256", "new_sha256", "line_sha256"):
+                if _DIGEST_RE.fullmatch(record.get(key, "")) is None:
+                    raise MalformedEvidence("stream anchor head has invalid {0}".format(key))
+            if (
+                record["previous_size"] != state["size"]
+                or record["previous_sha256"] != state["sha256"]
+                or record["previous_event_count"] != state["event_count"]
+            ):
+                raise MalformedEvidence("stream anchor head previous state disagrees")
+            if record["new_size"] != record["previous_size"] + record["line_size"]:
+                raise MalformedEvidence("stream anchor head size transition is invalid")
+            if record["new_event_count"] != record["previous_event_count"] + 1:
+                raise MalformedEvidence("stream anchor head event count transition is invalid")
+            if record["phase"] == "PREPARE":
+                if pending is not None or operation_id in seen_operations:
+                    raise MalformedEvidence("stream anchor head has consecutive prepares")
+                seen_operations.add(operation_id)
+                pending = record
+            else:
+                if pending is None or record["operation_id"] != pending["operation_id"]:
+                    raise MalformedEvidence("stream anchor head completion has no matching prepare")
+                for key in _STREAM_ANCHOR_HEAD_KEYS - {"phase", "operation_id"}:
+                    if record[key] != pending[key]:
+                        raise MalformedEvidence("stream anchor head completion disagrees with prepare")
+                if record["phase"] == "COMMIT":
+                    state = {
+                        "size": record["new_size"],
+                        "sha256": record["new_sha256"],
+                        "event_count": record["new_event_count"],
+                    }
+                pending = None
+        return state, pending
 
-    def _events_marker_present(self) -> bool:
-        marker = self._events_marker_path
+    def _read_stream_snapshot(self, anchor: dict):
         try:
-            entry = marker.lstat()
-        except FileNotFoundError:
-            return False
-        except OSError as error:
-            raise MalformedEvidence(
-                f"cannot validate events marker: {marker}: {error}"
-            ) from error
+            raw, digest = read_contained_file(self.events_path, self._root, "events")
+        except (OSError, SecurePathError) as error:
+            raise MalformedEvidence(f"cannot read anchored events: {self.events_path}") from error
+        entry = self.events_path.lstat()
+        events_identity = (entry.st_dev, entry.st_ino)
         if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
-            raise MalformedEvidence(
-                f"events marker must be a single-link regular file: {marker}"
+            raise MalformedEvidence("anchored events must be a single-link regular file")
+        identity = anchor["identity"]
+        if events_identity != (identity["events_device"], identity["events_inode"]):
+            raise MalformedEvidence("events file identity disagrees with external anchor")
+        return raw, digest, events_identity
+
+    def _read_anchor_state(self, anchor: dict):
+        raw, digest, events_identity = self._read_stream_snapshot(anchor)
+        head_path = self.stream_anchor_head_path
+        head_identity = None
+        try:
+            head_raw, _head_digest = read_contained_file(head_path, self._root, "stream anchor head")
+            head_entry = head_path.lstat()
+            if not stat.S_ISREG(head_entry.st_mode) or head_entry.st_nlink != 1:
+                raise MalformedEvidence("stream anchor head must be a single-link regular file")
+            head_identity = (head_entry.st_dev, head_entry.st_ino)
+            state, pending = self._parse_anchor_head(
+                head_raw, head_path, anchor, events_identity, head_identity
             )
-        return True
-
-    def _create_events_marker(self) -> None:
-        try:
-            secure_atomic_create(self._events_marker_path, b"")
-        except (OSError, SecurePathError) as error:
-            raise MalformedEvidence(
-                f"cannot establish events marker: {self._events_marker_path}"
-            ) from error
-        self._events_marker_present()
-
-    def read_events(self) -> Tuple[dict, ...]:
-        """Return every stored event in file order, raising on any malformed line."""
-        with self._policy_adoption_lock(exclusive=False) as acquired:
-            if not acquired:
-                return ()
-            return self._read_events_unlocked()
-
-    def _read_events_unlocked(self) -> Tuple[dict, ...]:
-        path = self.events_path
-        try:
-            raw, _digest = read_contained_file(path, self._root, "events")
         except FileNotFoundError:
-            if self._events_parent_has_authoritative_entries():
-                raise MalformedEvidence(f"authoritative events file is missing: {path}")
-            return ()
+            state, pending = (
+                {
+                    "size": anchor["identity"]["initial_size"],
+                    "sha256": anchor["identity"]["initial_sha256"],
+                    "event_count": anchor["identity"]["initial_event_count"],
+                },
+                None,
+            )
         except (OSError, SecurePathError) as error:
-            raise MalformedEvidence(f"cannot read events: {path}: {error}") from error
+            raise MalformedEvidence("cannot read stream anchor head") from error
+        return raw, digest, events_identity, head_identity, state, pending
+
+    def _anchored_events_bytes(self, anchor: dict):
+        raw, digest, _events_identity, _head_identity, state, pending = self._read_anchor_state(anchor)
+        if pending is not None:
+            raise MalformedEvidence("stream anchor update is incomplete; replay is required")
+        if (len(raw), digest) != (state["size"], state["sha256"]):
+            raise MalformedEvidence("events head does not match the external stream anchor")
+        return raw, state["event_count"]
+
+    def _parse_events_bytes(self, raw: bytes, path: Path) -> Tuple[dict, ...]:
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError as error:
@@ -1345,45 +1576,309 @@ class RunStore:
             events.append(event)
         return tuple(events)
 
+    def read_events(self) -> Tuple[dict, ...]:
+        """Read events, retaining an unanchored historical parser for migration diagnostics."""
+        with self._policy_adoption_lock(exclusive=False) as acquired:
+            if not acquired:
+                return ()
+            return self._read_events_unlocked(require_anchor=False)
+
+    def _read_authoritative_events(self) -> Tuple[dict, ...]:
+        with self._policy_adoption_lock(exclusive=False) as acquired:
+            if not acquired:
+                return ()
+            return self._read_events_unlocked(require_anchor=True)
+
+    def _read_events_unlocked(self, *, require_anchor=False) -> Tuple[dict, ...]:
+        anchor = self._stream_anchor_identity()
+        if anchor is None:
+            try:
+                raw, _digest = read_contained_file(self.events_path, self._root, "events")
+            except FileNotFoundError:
+                if require_anchor and self._base.exists():
+                    try:
+                        if any(
+                            child.name not in _EVENT_STORE_OPERATIONAL_ENTRIES
+                            for child in self._base.iterdir()
+                        ):
+                            raise MalformedEvidence(
+                                "unanchored event stream requires explicit migration"
+                            )
+                    except OSError as error:
+                        raise MalformedEvidence("cannot inspect unanchored event store") from error
+                return ()
+            except (OSError, SecurePathError) as error:
+                raise MalformedEvidence(f"cannot read events: {self.events_path}: {error}") from error
+            if not raw:
+                return ()
+            if require_anchor:
+                raise MalformedEvidence("unanchored event stream requires explicit migration")
+            return self._parse_events_bytes(raw, self.events_path)
+        raw, event_count = self._anchored_events_bytes(anchor)
+        events = self._parse_events_bytes(raw, self.events_path)
+        if len(events) != event_count:
+            raise MalformedEvidence("external stream anchor event count disagrees")
+        return events
+
     def current_commit(self) -> Optional[str]:
         """Most recent recorded pushed commit, or None before the first commit event."""
         current = None
-        for event in self.read_events():
+        for event in self._read_authoritative_events():
             if event["event_type"] == COMMIT_EVENT:
                 current = event["commit"]
         return current
 
     def _append_line(self, line: bytes) -> None:
         with self._policy_adoption_lock():
-            marker_present = self._events_marker_present()
-            expected_identity = None
-            try:
-                entry = self.events_path.lstat()
-                expected_identity = (entry.st_dev, entry.st_ino)
-                create = False
-            except FileNotFoundError:
-                if self._events_parent_has_authoritative_entries():
-                    raise MalformedEvidence(
-                        f"authoritative events file is missing: {self.events_path}"
+            anchor = self._stream_anchor_identity()
+            if anchor is None:
+                self._initialize_stream_anchor_locked()
+                anchor = self._stream_anchor_identity()
+            if anchor is None:
+                raise MalformedEvidence("stream anchor initialization did not persist")
+            if not line:
+                self._read_anchor_state(anchor)
+                return
+            raw, digest, events_identity, head_identity, state, pending = self._read_anchor_state(anchor)
+            if pending is not None:
+                self._replay_pending_anchor_locked(anchor, pending, events_identity, state, head_identity)
+                anchor = self._stream_anchor_identity()
+                raw, digest, events_identity, head_identity, state, pending = self._read_anchor_state(anchor)
+                if pending is not None:
+                    raise MalformedEvidence("stream anchor replay did not complete")
+            if (len(raw), digest) != (state["size"], state["sha256"]):
+                raise MalformedEvidence("events head does not match the external stream anchor")
+            if head_identity is None:
+                try:
+                    secure_append_contained_file(
+                        self.stream_anchor_head_path,
+                        self._root,
+                        b"",
+                        "stream anchor head",
+                        create=True,
                     )
-                create = True
+                except (OSError, SecurePathError) as error:
+                    raise MalformedEvidence("cannot initialize stream anchor head") from error
+                head_entry = self.stream_anchor_head_path.lstat()
+                head_identity = (head_entry.st_dev, head_entry.st_ino)
+            new_raw = raw + line
+            new_digest = hashlib.sha256(new_raw).hexdigest()
+            operation = self._anchor_update_record(
+                anchor,
+                events_identity,
+                head_identity,
+                state,
+                {
+                    "size": len(new_raw),
+                    "sha256": new_digest,
+                    "event_count": state["event_count"] + 1,
+                },
+                line,
+                "PREPARE",
+            )
+            self._append_anchor_record(operation, head_identity, create=head_identity is None)
             try:
                 secure_append_contained_file(
                     self.events_path,
                     self._root,
                     line,
                     "events",
-                    create=create,
-                    expected_identity=expected_identity,
+                    create=False,
+                    expected_identity=events_identity,
                 )
             except PermissionError:
+                self._replay_pending_anchor_locked(
+                    anchor, operation, events_identity, state, head_identity
+                )
                 raise
             except (OSError, SecurePathError) as error:
+                self._replay_pending_anchor_locked(
+                    anchor, operation, events_identity, state, head_identity
+                )
                 raise MalformedEvidence(
                     f"cannot append events: {self.events_path}: {error}"
                 ) from error
-            if not marker_present:
-                self._create_events_marker()
+            current_raw, current_digest, current_identity = self._read_stream_snapshot(anchor)
+            if (
+                current_identity != events_identity
+                or (len(current_raw), current_digest)
+                != (operation["new_size"], operation["new_sha256"])
+            ):
+                raise MalformedEvidence("events changed before stream anchor commit")
+            completion = dict(operation)
+            completion["phase"] = "COMMIT"
+            completion["operation_id"] = self._anchor_operation_id(completion)
+            if completion["operation_id"] != operation["operation_id"]:
+                raise MalformedEvidence("stream anchor completion identity changed")
+            self._append_anchor_record(completion, head_identity, create=False)
+
+    def _initialize_stream_anchor_locked(self, initial_raw: bytes = b"") -> None:
+        """Create the external identity for a new or explicitly migrated stream."""
+        try:
+            current_raw, _digest = read_contained_file(
+                self.events_path, self._root, "events"
+            )
+        except FileNotFoundError:
+            if initial_raw:
+                raise MalformedEvidence("cannot migrate a missing event stream")
+            try:
+                secure_append_contained_file(
+                    self.events_path, self._root, b"", "events", create=True
+                )
+            except (OSError, SecurePathError) as error:
+                raise MalformedEvidence("cannot initialize event stream") from error
+            current_raw = b""
+        except (OSError, SecurePathError) as error:
+            raise MalformedEvidence("cannot inspect event stream for anchoring") from error
+        if current_raw != initial_raw:
+            raise MalformedEvidence("event stream changed before anchoring")
+        entry = self.events_path.lstat()
+        if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+            raise MalformedEvidence("events must be a single-link regular file")
+        ensure_directory(self.stream_anchor_dir)
+        identity = {
+            "schema_version": 1,
+            "project": self._project,
+            "pr": self._pr,
+            "stream_id": secrets.token_hex(32),
+            "events_path": _resolve(os.fspath(self.events_path)),
+            "events_device": entry.st_dev,
+            "events_inode": entry.st_ino,
+            "initial_size": len(current_raw),
+            "initial_sha256": hashlib.sha256(current_raw).hexdigest(),
+            "initial_event_count": len(self._parse_events_bytes(current_raw, self.events_path))
+            if current_raw
+            else 0,
+        }
+        raw = _serialize(identity)
+        try:
+            created = secure_atomic_create(self.stream_anchor_identity_path, raw)
+        except (OSError, SecurePathError) as error:
+            raise MalformedEvidence("cannot persist stream anchor identity") from error
+        if not created:
+            existing = self._stream_anchor_identity()
+            if existing is None or existing["identity"] != identity:
+                raise EvidenceConflict("stream anchor identity already exists with different bytes")
+        try:
+            secure_atomic_create(self.stream_anchor_head_path, b"")
+        except (OSError, SecurePathError) as error:
+            raise MalformedEvidence("cannot initialize stream anchor head") from error
+
+    def _anchor_update_record(
+        self, anchor, events_identity, head_identity, previous, new, line, phase
+    ) -> dict:
+        if head_identity is None:
+            raise MalformedEvidence("stream anchor head identity is missing before update")
+        anchor_device, anchor_inode = anchor["anchor_identity"]
+        identity_device, identity_inode = anchor["identity_identity"]
+        head_device, head_inode = head_identity
+        record = {
+            "schema_version": 1,
+            "record_type": "event-update",
+            "phase": phase,
+            "project": self._project,
+            "pr": self._pr,
+            "stream_id": anchor["identity"]["stream_id"],
+            "anchor_device": anchor_device,
+            "anchor_inode": anchor_inode,
+            "identity_device": identity_device,
+            "identity_inode": identity_inode,
+            "head_device": head_device,
+            "head_inode": head_inode,
+            "events_device": events_identity[0],
+            "events_inode": events_identity[1],
+            "previous_size": previous["size"],
+            "previous_sha256": previous["sha256"],
+            "previous_event_count": previous["event_count"],
+            "new_size": new["size"],
+            "new_sha256": new["sha256"],
+            "new_event_count": new["event_count"],
+            "line_size": len(line),
+            "line_sha256": hashlib.sha256(line).hexdigest(),
+        }
+        record["operation_id"] = self._anchor_operation_id(record)
+        return record
+
+    def _append_anchor_record(self, record: dict, expected_identity, *, create):
+        raw = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+        try:
+            secure_append_contained_file(
+                self.stream_anchor_head_path,
+                self._root,
+                raw,
+                "stream anchor head",
+                create=create,
+                expected_identity=expected_identity,
+            )
+        except (OSError, SecurePathError) as error:
+            raise MalformedEvidence("cannot update stream anchor head") from error
+
+    def _replay_pending_anchor_locked(
+        self, anchor, pending, events_identity, state, head_identity
+    ) -> None:
+        raw, digest, current_identity = self._read_stream_snapshot(anchor)
+        previous = {
+            "size": pending["previous_size"],
+            "sha256": pending["previous_sha256"],
+            "event_count": pending["previous_event_count"],
+        }
+        new = {
+            "size": pending["new_size"],
+            "sha256": pending["new_sha256"],
+            "event_count": pending["new_event_count"],
+        }
+        if current_identity != events_identity:
+            raise MalformedEvidence("pending stream update has a different event inode")
+        if (len(raw), digest) == (new["size"], new["sha256"]):
+            completion = dict(pending)
+            completion["phase"] = "COMMIT"
+        elif (len(raw), digest) == (previous["size"], previous["sha256"]):
+            completion = dict(pending)
+            completion["phase"] = "ABORT"
+        else:
+            raise MalformedEvidence("pending stream update has an unrecognized event head")
+        completion["operation_id"] = self._anchor_operation_id(completion)
+        if completion["operation_id"] != pending["operation_id"]:
+            raise MalformedEvidence("pending stream update identity changed")
+        self._append_anchor_record(completion, head_identity, create=False)
+
+    def recover_event_stream(self) -> None:
+        """Replay a crash-pending anchor update without accepting a truncation."""
+        with self._policy_adoption_lock():
+            anchor = self._stream_anchor_identity()
+            if anchor is None:
+                return
+            _raw, _digest, events_identity, head_identity, _state, pending = self._read_anchor_state(anchor)
+            if pending is not None:
+                self._replay_pending_anchor_locked(
+                    anchor, pending, events_identity, _state, head_identity
+                )
+            self._anchored_events_bytes(anchor)
+
+    def migrate_event_stream(self) -> bool:
+        """Explicitly bind one valid legacy stream; never upgrades policy authority."""
+        with self._policy_adoption_lock():
+            anchor = self._stream_anchor_identity()
+            if anchor is not None:
+                self._anchored_events_bytes(anchor)
+                return False
+            try:
+                raw, _digest = read_contained_file(self.events_path, self._root, "legacy events")
+            except FileNotFoundError:
+                return False
+            except (OSError, SecurePathError) as error:
+                raise MalformedEvidence("cannot read legacy event stream for migration") from error
+            if not raw:
+                return False
+            events = self._parse_events_bytes(raw, self.events_path)
+            if len(events) == 0:
+                return False
+            self._initialize_stream_anchor_locked(raw)
+            anchor = self._stream_anchor_identity()
+            if anchor is None:
+                raise MalformedEvidence("legacy event stream migration did not persist its anchor")
+            self._anchored_events_bytes(anchor)
+            return True
 
     # -- verification records ---------------------------------------------
 
@@ -1604,7 +2099,7 @@ class RunStore:
         commit = _require_commit(commit)
         retirement_id = _require_component(retirement_id, "retirement_id")
         if events is None:
-            events = self.read_events()
+            events = self._read_authoritative_events()
         selected = [
             event
             for event in events
@@ -1792,7 +2287,7 @@ class RunStore:
         if actual_digest != expected_sha256:
             raise EvidenceConflict("retirement source digest does not match expected_sha256")
         self.validate_event_relations(commit)
-        events = self.read_events()
+        events = self._read_authoritative_events()
         staging_path = self.retirement_staging_path(commit, retirement_id)
         final_path = self.retirement_final_path(commit, retirement_id)
         if staging_path.exists() or staging_path.is_symlink():
@@ -1873,28 +2368,28 @@ class RunStore:
                 event.get("event_type") == RETIREMENT_COPIED_EVENT
                 and event.get("retirement_id") == retirement_id
                 and event.get("commit") == commit
-                for event in self.read_events()
+                for event in self._read_authoritative_events()
             ):
                 raise EvidenceConflict("pre-existing retirement staging lacks its matching COPIED event")
         self._append_retirement_transition(RETIREMENT_PREPARED_EVENT, envelope, commit, events)
-        events = self.read_events()
+        events = self._read_authoritative_events()
         staging = self.retirement_staging_path(commit, retirement_id)
         if not staging.exists():
             self._atomic_create(staging, raw)
         self._append_retirement_transition(RETIREMENT_COPIED_EVENT, envelope, commit, events)
-        events = self.read_events()
+        events = self._read_authoritative_events()
         if final_path.exists() and not any(
             event.get("event_type") == RETIREMENT_COMMITTED_EVENT
             and event.get("retirement_id") == retirement_id
             and event.get("commit") == commit
-            for event in self.read_events()
+            for event in self._read_authoritative_events()
         ):
             raise EvidenceConflict("pre-existing retirement final lacks its matching COMMITTED event")
         if not final_path.exists():
             self._append_retirement_transition(RETIREMENT_COMMITTED_EVENT, envelope, commit, events)
-            events = self.read_events()
+            events = self._read_authoritative_events()
         self._move_no_replace(source, self.retirement_final_path(commit, retirement_id), expected_sha256)
-        self._append_retirement_transition(RETIREMENT_FINALIZED_EVENT, envelope, commit, self.read_events())
+        self._append_retirement_transition(RETIREMENT_FINALIZED_EVENT, envelope, commit, self._read_authoritative_events())
         return self.retirement_status(commit, retirement_id)
 
     def recover_retirement(self, retirement_id, commit) -> dict:
@@ -1905,7 +2400,7 @@ class RunStore:
         envelope = self._read_retirement_envelope(commit, retirement_id)
         if envelope is None:
             raise MalformedEvidence("retirement envelope does not exist")
-        events = self.read_events()
+        events = self._read_authoritative_events()
         original_review_events = [
             event
             for event in events
@@ -1953,7 +2448,7 @@ class RunStore:
             self._append_retirement_transition(
                 RETIREMENT_PREPARED_EVENT, envelope, commit, events
             )
-            events = self.read_events()
+            events = self._read_authoritative_events()
             event_types.append(RETIREMENT_PREPARED_EVENT)
 
         if RETIREMENT_COPIED_EVENT not in event_types:
@@ -1965,7 +2460,7 @@ class RunStore:
                 self._atomic_create(staging, raw)
                 staging_raw = raw
             self._append_retirement_transition(
-                RETIREMENT_COPIED_EVENT, envelope, commit, self.read_events()
+                RETIREMENT_COPIED_EVENT, envelope, commit, self._read_authoritative_events()
             )
             event_types.append(RETIREMENT_COPIED_EVENT)
 
@@ -1975,7 +2470,7 @@ class RunStore:
                     "retirement final exists before its matching COMMITTED event"
                 )
             self._append_retirement_transition(
-                RETIREMENT_COMMITTED_EVENT, envelope, commit, self.read_events()
+                RETIREMENT_COMMITTED_EVENT, envelope, commit, self._read_authoritative_events()
             )
             event_types.append(RETIREMENT_COMMITTED_EVENT)
 
@@ -1987,7 +2482,7 @@ class RunStore:
                     )
                 self._move_no_replace(source, final, envelope["expected_sha256"])
             self._append_retirement_transition(
-                RETIREMENT_FINALIZED_EVENT, envelope, commit, self.read_events()
+                RETIREMENT_FINALIZED_EVENT, envelope, commit, self._read_authoritative_events()
             )
         return self.retirement_status(commit, retirement_id)
 
@@ -2050,7 +2545,7 @@ class RunStore:
         supersede green authority.
         """
         commit = _require_commit(commit)
-        events = self.read_events()
+        events = self._read_authoritative_events()
         commit_events = [event for event in events if event["commit"] == commit]
         self._validate_all_retirements(commit, events)
 
@@ -2129,7 +2624,7 @@ class RunStore:
 
     def _retirement_records(self, commit, events=None):
         if events is None:
-            events = self.read_events()
+            events = self._read_authoritative_events()
         records = []
         retirement_ids = {
             event.get("retirement_id")
@@ -2355,7 +2850,7 @@ class RunStore:
                 expected_commands, expected_verification_command_timeout_seconds
             )
         self.validate_event_relations(commit)
-        events = self.read_events()
+        events = self._read_authoritative_events()
         best = None
         best_timestamp = None
         for path in self.verification_paths(commit):
@@ -2549,12 +3044,16 @@ class RunStore:
         try:
             self.events_path.lstat()
         except FileNotFoundError:
-            if self._events_parent_has_authoritative_entries():
-                raise MalformedEvidence(
-                    f"authoritative events file is missing: {self.events_path}"
-                )
+            if self._base.exists():
+                try:
+                    if any(self._base.iterdir()):
+                        raise MalformedEvidence(
+                            "authoritative events file is missing; explicit stream migration is required"
+                        )
+                except OSError as error:
+                    raise MalformedEvidence("cannot inspect the event store before record creation") from error
             self._append_line(b"")
-        events = self.read_events()
+        events = self._read_authoritative_events()
         created = self._atomic_create(target, line)
         if not created:
             existing = self._read_existing_for_compare(target)

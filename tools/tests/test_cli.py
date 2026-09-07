@@ -945,6 +945,49 @@ class CliExitCodeTests(CliTestCase):
         )
         self.assertEqual(pre_adoption_bytes, legacy_only.read_bytes())
 
+    def test_regular_event_prefix_replacement_blocks_public_status_and_import(self):
+        self.set_git(head=COMMIT_A, local=COMMIT_A, remote=COMMIT_A)
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config()
+        verification = self.run_cli(
+            "record-verification", "--config", config, "--pr", str(PR)
+        )
+        self.assertEqual(0, verification.returncode, verification.stderr)
+        legacy_path = self.write_review()
+        imported = self.run_cli(
+            "import-review", "--config", config, "--pr", str(PR), "--review", legacy_path
+        )
+        self.assertEqual(0, imported.returncode, imported.stderr)
+
+        store = RunStore(self.state_dir, PROJECT, PR)
+        pre_adoption_bytes = store.events_path.read_bytes()
+        activation = store.record_policy_activation(COMMIT_A, "1" * 64, "2" * 64)
+        store.record_policy_adoption(
+            REPOSITORY,
+            COMMIT_A,
+            policy_id="policy-v1",
+            policy_digest="3" * 64,
+            staged_config_digest="1" * 64,
+            enforced_config_digest="2" * 64,
+            activation_event_id=activation["event_id"],
+            transition_kind="initial-adoption",
+        )
+
+        archived = Path(self.state_dir) / "adopted-events.jsonl"
+        store.events_path.replace(archived)
+        store.events_path.write_bytes(pre_adoption_bytes)
+
+        status = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(3, status.returncode, status.stdout + status.stderr)
+        replacement_review = self.write_review(commit=COMMIT_A)
+        imported_after_replacement = self.run_cli(
+            "import-review",
+            "--config", config,
+            "--pr", str(PR),
+            "--review", replacement_review,
+        )
+        self.assertEqual(3, imported_after_replacement.returncode)
+
     def test_enforced_policy_requires_the_adopted_enforced_config_digest(self):
         policy, staged_config = self.adopt_active_policy_at_tip_a()
         self.set_git(head=COMMIT_A, local=COMMIT_A, remote=COMMIT_A)

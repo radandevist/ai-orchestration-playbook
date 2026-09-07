@@ -6,12 +6,14 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from pr_closure.contract import command_sequence_digest, legacy_command_sequence_digest
 from pr_closure.model import ClosureState
+from pr_closure.secure_paths import read_contained_file
 from pr_closure.store import (
     COMMIT_EVENT,
     REPAIR_STRATEGY_EVENT,
@@ -479,8 +481,10 @@ class AppendOnlyEventTests(StoreTestCase):
 
 
 class AuthoritativeEventStreamTests(StoreTestCase):
-    def _adopted_store(self):
-        store = RunStore(self.root, "proj", 42)
+    def _adopted_store(self, root=None):
+        if root is None:
+            root = self.root
+        store = RunStore(root, "proj", 42)
         store.record_commit(COMMIT_A, self.durable_file("tip"))
         store.write_review(COMMIT_A, "legacy", _review_record())
         pre_adoption_bytes = store.events_path.read_bytes()
@@ -605,6 +609,177 @@ class AuthoritativeEventStreamTests(StoreTestCase):
 
         self.assertEqual(original, archived.read_bytes())
         self.assertEqual(original, store.events_path.read_bytes())
+
+    def test_event_stream_regular_prefix_replacement_cannot_hide_adoption(self):
+        store, pre_adoption_bytes = self._adopted_store()
+        archived = self.root / "adopted-events.jsonl"
+        store.events_path.replace(archived)
+        store.events_path.write_bytes(pre_adoption_bytes)
+
+        with self.assertRaises(MalformedEvidence):
+            store.read_events()
+        with self.assertRaises(MalformedEvidence):
+            store.current_policy_adoption("owner/repo")
+        with self.assertRaises(MalformedEvidence):
+            store.append_event("commit", COMMIT_B, self.durable_file("new-tip"))
+        self.assertEqual(pre_adoption_bytes, store.events_path.read_bytes())
+        self.assertTrue(archived.exists())
+
+    def test_project_ancestor_replacement_cannot_hide_external_stream_anchor(self):
+        store, _pre_adoption_bytes = self._adopted_store()
+        project_dir = self.root / "proj"
+        replacement = self.root / "project-replacement"
+        shutil.copytree(project_dir, replacement)
+        project_dir.rename(self.root / "project-archived")
+        replacement.rename(project_dir)
+
+        with self.assertRaises(MalformedEvidence):
+            store.read_events()
+        with self.assertRaises(MalformedEvidence):
+            store.current_policy_adoption("owner/repo")
+
+    def test_stream_replacement_between_anchor_check_and_read_fails_closed(self):
+        store, _pre_adoption_bytes = self._adopted_store()
+        archived = self.root / "adopted-events.jsonl"
+        original_read = read_contained_file
+        swapped = False
+
+        from pr_closure import store as store_module
+
+        def swap_after_anchor_read(path, root, label):
+            nonlocal swapped
+            result = original_read(path, root, label)
+            if label == "stream anchor identity" and not swapped:
+                swapped = True
+                store.events_path.replace(archived)
+                store.events_path.write_bytes(archived.read_bytes())
+            return result
+
+        with unittest.mock.patch.object(
+            store_module, "read_contained_file", side_effect=swap_after_anchor_read
+        ):
+            with self.assertRaises(MalformedEvidence):
+                store.read_events()
+
+    def test_external_anchor_identity_replacement_fails_closed(self):
+        store, _pre_adoption_bytes = self._adopted_store()
+        identity = json.loads(store.stream_anchor_identity_path.read_text())
+        identity["pr"] = 43
+        store.stream_anchor_identity_path.write_text(_serialize(identity).decode())
+
+        with self.assertRaises(MalformedEvidence):
+            store.read_events()
+
+    def test_external_anchor_head_prefix_replacement_fails_closed(self):
+        store, _pre_adoption_bytes = self._adopted_store()
+        archived = self.root / "adopted-head.jsonl"
+        store.stream_anchor_head_path.replace(archived)
+        store.stream_anchor_head_path.write_bytes(b"")
+
+        with self.assertRaises(MalformedEvidence):
+            store.read_events()
+
+    def test_external_anchor_head_regular_replacement_fails_closed(self):
+        store, _pre_adoption_bytes = self._adopted_store()
+        archived = self.root / "adopted-head.jsonl"
+        store.stream_anchor_head_path.replace(archived)
+        store.stream_anchor_head_path.write_bytes(archived.read_bytes())
+
+        with self.assertRaises(MalformedEvidence):
+            store.read_events()
+
+    def test_external_anchor_symlink_and_nonregular_shapes_fail_closed(self):
+        for shape in ("identity-symlink", "head-symlink", "identity-fifo"):
+            with self.subTest(shape=shape):
+                root = Path(tempfile.mkdtemp(dir=CACHE_BASE))
+                self.addCleanup(lambda root=root: shutil.rmtree(root, ignore_errors=True))
+                store, _pre_adoption_bytes = self._adopted_store(root)
+                if shape == "identity-symlink":
+                    target = root / "identity-copy.json"
+                    target.write_bytes(store.stream_anchor_identity_path.read_bytes())
+                    store.stream_anchor_identity_path.unlink()
+                    store.stream_anchor_identity_path.symlink_to(target)
+                elif shape == "head-symlink":
+                    target = root / "head-copy.jsonl"
+                    target.write_bytes(store.stream_anchor_head_path.read_bytes())
+                    store.stream_anchor_head_path.unlink()
+                    store.stream_anchor_head_path.symlink_to(target)
+                else:
+                    store.stream_anchor_identity_path.unlink()
+                    os.mkfifo(store.stream_anchor_identity_path)
+                with self.assertRaises(MalformedEvidence):
+                    store.read_events()
+
+    def test_external_anchor_duplicate_envelope_fails_closed(self):
+        store, _pre_adoption_bytes = self._adopted_store()
+        raw = store.stream_anchor_head_path.read_bytes()
+        store.stream_anchor_head_path.write_bytes(raw + raw[: raw.index(b"\n") + 1])
+
+        with self.assertRaises(MalformedEvidence):
+            store.read_events()
+
+    def test_external_anchor_hardlink_is_not_authoritative(self):
+        store, _pre_adoption_bytes = self._adopted_store()
+        archived = self.root / "adopted-head.jsonl"
+        store.stream_anchor_head_path.replace(archived)
+        os.link(archived, store.stream_anchor_head_path)
+
+        with self.assertRaises(MalformedEvidence):
+            store.read_events()
+
+    def test_legacy_stream_requires_explicit_migration_for_authority(self):
+        store = RunStore(self.root, "legacy", 42)
+        store.events_path.parent.mkdir(parents=True)
+        legacy = {
+            "schema_version": 1,
+            "timestamp": "2026-08-08T12:00:00+00:00",
+            "project": "legacy",
+            "pr": 42,
+            "commit": COMMIT_A,
+            "event_type": COMMIT_EVENT,
+            "evidence_path": self.durable_file("legacy-tip"),
+        }
+        store.events_path.write_bytes((json.dumps(legacy, sort_keys=True) + "\n").encode())
+
+        self.assertEqual((legacy,), store.read_events())
+        with self.assertRaises(MalformedEvidence):
+            store.current_commit()
+        self.assertTrue(store.migrate_event_stream())
+        self.assertFalse(store.migrate_event_stream())
+        self.assertEqual(COMMIT_A, store.current_commit())
+
+    def test_crash_before_event_append_replays_without_accepting_truncation(self):
+        store = RunStore(self.root, "crash-before-event", 42)
+        original = store._append_anchor_record
+
+        def crash_after_prepare(record, expected_identity, *, create):
+            original(record, expected_identity, create=create)
+            if record["phase"] == "PREPARE":
+                raise RuntimeError("simulated crash")
+
+        with unittest.mock.patch.object(store, "_append_anchor_record", side_effect=crash_after_prepare):
+            with self.assertRaises(RuntimeError):
+                store.record_commit(COMMIT_A, self.durable_file("tip"))
+        replayed = RunStore(self.root, "crash-before-event", 42)
+        replayed.recover_event_stream()
+        replayed.record_commit(COMMIT_A, self.durable_file("tip"))
+        self.assertEqual([COMMIT_EVENT], [event["event_type"] for event in replayed.read_events()])
+
+    def test_crash_after_event_append_replays_one_canonical_event(self):
+        store = RunStore(self.root, "crash-after-event", 42)
+        original = store._append_anchor_record
+
+        def crash_before_commit(record, expected_identity, *, create):
+            if record["phase"] == "COMMIT":
+                raise RuntimeError("simulated crash")
+            original(record, expected_identity, create=create)
+
+        with unittest.mock.patch.object(store, "_append_anchor_record", side_effect=crash_before_commit):
+            with self.assertRaises(RuntimeError):
+                store.record_commit(COMMIT_A, self.durable_file("tip"))
+        replayed = RunStore(self.root, "crash-after-event", 42)
+        replayed.recover_event_stream()
+        self.assertEqual(1, len(replayed.read_events()))
 
 
 class AtomicRecordWriteTests(StoreTestCase):
