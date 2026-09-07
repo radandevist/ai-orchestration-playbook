@@ -20,6 +20,7 @@ from pr_closure.registries import (
 )
 from pr_closure.review import ReviewValidationError, validate_review
 from pr_closure.secure_paths import SecurePathError, read_contained_file
+from pr_closure.jsonio import StrictJsonError, loads as strict_json_loads
 
 
 def _resolve_legacy_model(value, registry_version, aliases):
@@ -118,7 +119,7 @@ def _producer_output_inventory(participant, root, source_kind):
                 isinstance(declared_envelope_digest, str)
                 and envelope_digest == declared_envelope_digest
             )
-            envelope = json.loads(envelope_raw.decode("utf-8"))
+            envelope = strict_json_loads(envelope_raw, "legacy provenance envelope")
             if isinstance(envelope, dict):
                 details["path"] = envelope.get("producer_output_path")
                 details["declared_sha256"] = envelope.get("producer_output_sha256")
@@ -127,7 +128,7 @@ def _producer_output_inventory(participant, root, source_kind):
             SecurePathError,
             TypeError,
             UnicodeDecodeError,
-            json.JSONDecodeError,
+            StrictJsonError,
         ):
             pass
     output_path = details["path"]
@@ -182,7 +183,7 @@ def _verify_legacy_output_chain(
     )
     if envelope_digest != participant["sha256"]:
         raise ValueError("provenance envelope digest mismatch")
-    envelope = json.loads(envelope_raw.decode("utf-8"))
+    envelope = strict_json_loads(envelope_raw, "legacy provenance envelope")
     if not isinstance(envelope, dict) or frozenset(envelope) != _ENVELOPE_KEYS:
         raise ValueError("provenance envelope keys are not exact")
     if type(envelope.get("schema_version")) is not int or envelope["schema_version"] != 1:
@@ -224,7 +225,7 @@ def _verify_legacy_output_chain(
     )
     if actual_manifest_digest != manifest_digest:
         raise ValueError("authoritative run manifest digest mismatch")
-    manifest = json.loads(manifest_raw.decode("utf-8"))
+    manifest = strict_json_loads(manifest_raw, "authoritative run manifest")
     if not isinstance(manifest, dict) or frozenset(manifest) != _MANIFEST_KEYS:
         raise ValueError("authoritative run manifest keys are not exact")
     if type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 1:
@@ -389,8 +390,8 @@ def inventory_active_tip(
     for path in store.review_paths(commit):
         raw, raw_sha256 = store._read_bound_bytes(path, "legacy review record")
         try:
-            record = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            record = strict_json_loads(raw, "legacy review record")
+        except StrictJsonError as error:
             raise ValueError("legacy review record is not valid UTF-8 JSON") from error
         if not isinstance(record, dict):
             raise ValueError("legacy review record must be a JSON object")

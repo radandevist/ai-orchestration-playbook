@@ -19,6 +19,7 @@
     "heavy_job_limit",
     "verification_command_timeout_seconds",
     "tracking_projection",
+    "ci_required_checks",
     "ci_live_pr_checks",
     "ci_required_checks_source",
     "ci_live_pr_workflow"

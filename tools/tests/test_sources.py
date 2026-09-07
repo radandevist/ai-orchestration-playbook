@@ -768,11 +768,11 @@ class GitHubCandidateTipTests(TempDirTestCase):
         raw = json.dumps(candidate_config()).encode()
         encoded = base64.b64encode(raw).decode()
         content_key = (
-            "gh api --repo owner/repo repos/owner/repo/contents/"
+            "gh api repos/owner/repo/contents/"
             ".ai/project-closure-v1.json?ref=" + COMMIT_A
         )
         tree_key = (
-            "gh api --repo owner/repo repos/owner/repo/git/trees/"
+            "gh api repos/owner/repo/git/trees/"
             + COMMIT_A
             + "?recursive=1"
         )
@@ -815,11 +815,11 @@ class GitHubCandidateTipTests(TempDirTestCase):
     def test_candidate_config_blob_tree_mismatch_fails_closed(self):
         raw = base64.b64encode(json.dumps(candidate_config()).encode()).decode()
         content_key = (
-            "gh api --repo owner/repo repos/owner/repo/contents/"
+            "gh api repos/owner/repo/contents/"
             ".ai/project-closure-v1.json?ref=" + COMMIT_A
         )
         tree_key = (
-            "gh api --repo owner/repo repos/owner/repo/git/trees/"
+            "gh api repos/owner/repo/git/trees/"
             + COMMIT_A
             + "?recursive=1"
         )
@@ -852,22 +852,23 @@ class GitHubCandidateTipTests(TempDirTestCase):
 
     def test_check_run_reads_all_pages_and_validates_workflow_provenance(self):
         workflow_key = (
-            "gh api --repo owner/repo repos/owner/repo/actions/workflows/"
-            ".github/workflows/ci.yml"
+            "gh api repos/owner/repo/actions/workflows?per_page=100"
         )
         check_key = (
-            "gh api --repo owner/repo --paginate --slurp repos/owner/repo/commits/"
+            "gh api --paginate --slurp repos/owner/repo/commits/"
             + COMMIT_A
             + "/check-runs?filter=all&per_page=100"
         )
-        run_key = "gh api --repo owner/repo repos/owner/repo/actions/runs/201"
+        run_key = "gh api repos/owner/repo/actions/runs/201"
+        attempt_key = "gh api repos/owner/repo/actions/runs/201/attempts/2"
         run = {
             "id": 201,
             "workflow_id": 77,
-            "path": ".github/workflows/ci.yml",
+            "path": ".github/workflows/ci.yml@main",
             "event": "pull_request",
             "run_attempt": 2,
             "head_sha": COMMIT_A,
+            "check_suite_id": 301,
         }
         raw = {
             "id": 101,
@@ -882,16 +883,16 @@ class GitHubCandidateTipTests(TempDirTestCase):
             "check_suite": {"id": 301},
         }
         runner = RecordingRunner({
-            workflow_key: (0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), ""),
+            workflow_key: (0, json.dumps({"total_count": 1, "workflows": [{"id": 77, "path": ".github/workflows/ci.yml"}]}), ""),
             check_key: (
                 0,
                 json.dumps([
-                    {"check_runs": [raw]},
-                    {"check_runs": []},
+                    {"total_count": 1, "check_runs": [raw]},
                 ]),
                 "",
             ),
             run_key: (0, json.dumps(run), ""),
+            attempt_key: (0, json.dumps(dict(run, check_suite_id=301)), ""),
         })
         candidates = GitHubSource("owner/repo", 42, runner=runner).read_check_run_candidates(
             COMMIT_A,
@@ -924,18 +925,16 @@ class GitHubLiveCiTests(TempDirTestCase):
         )
 
     def runner(self, artifacts, extra_raw=()):
-        workflow_key = (
-            "gh api --repo owner/repo repos/owner/repo/actions/workflows/"
-            ".github/workflows/ci.yml"
-        )
+        workflow_key = "gh api repos/owner/repo/actions/workflows?per_page=100"
         check_key = (
-            "gh api --repo owner/repo --paginate --slurp repos/owner/repo/commits/"
+            "gh api --paginate --slurp repos/owner/repo/commits/"
             + COMMIT_A
             + "/check-runs?filter=all&per_page=100"
         )
-        run_key = "gh api --repo owner/repo repos/owner/repo/actions/runs/201"
+        run_key = "gh api repos/owner/repo/actions/runs/201"
+        attempt_key = "gh api repos/owner/repo/actions/runs/201/attempts/1"
         artifacts_key = (
-            "gh api --repo owner/repo --paginate --slurp "
+            "gh api --paginate --slurp "
             "repos/owner/repo/actions/runs/201/artifacts?per_page=100"
         )
         raw = {
@@ -951,10 +950,10 @@ class GitHubLiveCiTests(TempDirTestCase):
             "check_suite": {"id": 301},
         }
         responses = {
-            workflow_key: (0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), ""),
+            workflow_key: (0, json.dumps({"total_count": 1, "workflows": [{"id": 77, "path": ".github/workflows/ci.yml"}]}), ""),
             check_key: (
                 0,
-                json.dumps([{"check_runs": [*extra_raw, raw]}]),
+                json.dumps([{"total_count": len(extra_raw) + 1, "check_runs": [*extra_raw, raw]}]),
                 "",
             ),
             run_key: (
@@ -962,16 +961,30 @@ class GitHubLiveCiTests(TempDirTestCase):
                 json.dumps({
                     "id": 201,
                     "workflow_id": 77,
-                    "path": ".github/workflows/ci.yml",
+                    "path": ".github/workflows/ci.yml@main",
                     "event": "pull_request",
                     "run_attempt": 1,
                     "head_sha": COMMIT_A,
+                    "check_suite_id": 301,
+                }),
+                "",
+            ),
+            attempt_key: (
+                0,
+                json.dumps({
+                    "id": 201,
+                    "workflow_id": 77,
+                    "path": ".github/workflows/ci.yml@main",
+                    "event": "pull_request",
+                    "run_attempt": 1,
+                    "head_sha": COMMIT_A,
+                    "check_suite_id": 301,
                 }),
                 "",
             ),
             artifacts_key: (
                 0,
-                json.dumps([{"artifacts": artifacts}]),
+                json.dumps([{"total_count": len(artifacts), "artifacts": artifacts}]),
                 "",
             ),
         }
@@ -999,7 +1012,7 @@ class GitHubLiveCiTests(TempDirTestCase):
         source = GitHubSource(
             "owner/repo",
             42,
-            runner=self.runner([{"id": 501, "name": "ci-pr-snapshot-201-1", "expired": False}]),
+            runner=self.runner([{"id": 501, "name": "ci-pr-snapshot-201-1", "expired": False, "size_in_bytes": 256}]),
             artifact_reader=reader,
         )
         facts = source.read_live_ci(
@@ -1032,7 +1045,7 @@ class GitHubLiveCiTests(TempDirTestCase):
             "owner/repo",
             42,
             runner=self.runner(
-                [{"id": 501, "name": "ci-pr-snapshot-201-1", "expired": False}],
+                [{"id": 501, "name": "ci-pr-snapshot-201-1", "expired": False, "size_in_bytes": 256}],
                 extra_raw=(older_required,),
             ),
             artifact_reader=lambda _run, _name: self.snapshot(),
@@ -1050,8 +1063,8 @@ class GitHubLiveCiTests(TempDirTestCase):
 
     def test_missing_or_duplicate_snapshot_is_unverified(self):
         for artifacts in ([], [
-            {"id": 501, "name": "ci-pr-snapshot-201-1", "expired": False},
-            {"id": 502, "name": "ci-pr-snapshot-201-1", "expired": False},
+            {"id": 501, "name": "ci-pr-snapshot-201-1", "expired": False, "size_in_bytes": 256},
+            {"id": 502, "name": "ci-pr-snapshot-201-1", "expired": False, "size_in_bytes": 256},
         ]):
             with self.subTest(artifacts=artifacts):
                 source = GitHubSource(

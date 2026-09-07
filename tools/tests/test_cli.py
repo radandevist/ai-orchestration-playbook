@@ -6,6 +6,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import zipfile
 import tempfile
 import threading
 import time
@@ -126,6 +127,7 @@ import hashlib
 import json
 import os
 import sys
+import zipfile
 from pathlib import Path
 
 
@@ -171,7 +173,7 @@ def main():
         sys.stdout.write(json.dumps(data))
         return 0
     if len(args) >= 2 and args[0] == "api":
-        endpoint = args[-1]
+        endpoint = next((arg for arg in args[1:] if arg.startswith("repos/")), args[-1])
         repository = args[args.index("--repo") + 1] if "--repo" in args else "owner/repo"
         custom = control.get("api", {}).get(endpoint)
         if custom is not None:
@@ -202,10 +204,10 @@ def main():
                 }],
             }))
             return 0
-        if "/actions/workflows/" in endpoint:
+        if "/actions/workflows?" in endpoint:
             sys.stdout.write(json.dumps({
-                "id": 77,
-                "path": ".github/workflows/ci.yml",
+                "total_count": 1,
+                "workflows": [{"id": 77, "path": ".github/workflows/ci.yml"}],
             }))
             return 0
         if "/commits/" in endpoint and "/check-runs?" in endpoint:
@@ -229,7 +231,20 @@ def main():
                     "app": {"slug": "github-actions"},
                     "check_suite": {"id": 300 + index},
                 })
-            sys.stdout.write(json.dumps([{"check_runs": runs}]))
+            sys.stdout.write(json.dumps([{"total_count": len(runs), "check_runs": runs}]))
+            return 0
+        if "/actions/runs/" in endpoint and "/attempts/" in endpoint:
+            run_id = int(endpoint.split("/actions/runs/", 1)[1].split("/", 1)[0])
+            attempt = int(endpoint.rsplit("/", 1)[1])
+            sys.stdout.write(json.dumps({
+                "id": run_id,
+                "workflow_id": 77,
+                "path": ".github/workflows/ci.yml@main",
+                "event": "pull_request",
+                "run_attempt": attempt,
+                "head_sha": head,
+                "check_suite_id": 300 + (run_id - 200),
+            }))
             return 0
         if (
             "/actions/runs/" in endpoint
@@ -239,10 +254,11 @@ def main():
             sys.stdout.write(json.dumps({
                 "id": run_id,
                 "workflow_id": 77,
-                "path": ".github/workflows/ci.yml",
+                "path": ".github/workflows/ci.yml@main",
                 "event": "pull_request",
                 "run_attempt": 1,
                 "head_sha": head,
+                "check_suite_id": 300 + (run_id - 200),
             }))
             return 0
         if "/actions/runs/" in endpoint and "/artifacts" in endpoint:
@@ -254,8 +270,33 @@ def main():
                         "id": 500 + index,
                         "name": "ci-pr-snapshot-{}-1".format(run_id),
                         "expired": False,
+                        "size_in_bytes": 64 * 1024,
                     })
-            sys.stdout.write(json.dumps([{"artifacts": artifacts}]))
+            sys.stdout.write(json.dumps([{"total_count": len(artifacts), "artifacts": artifacts}]))
+            return 0
+        if "/actions/artifacts/" in endpoint and endpoint.endswith("/zip"):
+            output = args[args.index("--output") + 1]
+            data = control.get("data", {})
+            event_sha = data.get("potentialMergeCommit", {}).get("oid", "b" * 40)
+            record = {
+                "pr_number": data.get("number", 42),
+                "head_sha": data.get("headRefOid", "a" * 40),
+                "base_ref_name": data.get("baseRefName", "develop"),
+                "potential_merge_commit_oid": event_sha,
+                "body_sha256": hashlib.sha256(data.get("body", "").encode()).hexdigest(),
+                "is_draft": data.get("isDraft", False),
+                "event_name": "pull_request",
+                "event_sha": event_sha,
+                "workflow_path": ".github/workflows/ci.yml",
+                "workflow_id": 77,
+                "workflow_action": "pull_request",
+                "run_id": 201,
+                "run_attempt": 1,
+            }
+            if isinstance(data.get("snapshot"), dict):
+                record = dict(data["snapshot"])
+            with zipfile.ZipFile(output, "w") as archive:
+                archive.writestr("snapshot.json", json.dumps(record))
             return 0
         sys.stderr.write("fake gh: unscripted api endpoint\n")
         return 127

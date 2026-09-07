@@ -280,6 +280,17 @@ class ClosureSnapshot:
     worktree_clean: Optional[bool] = None
     local_verification: Optional[bool] = None
     ci_state: CiState = CiState.UNKNOWN
+    ci_check_run_id: Optional[int] = None
+    ci_workflow_run_id: Optional[int] = None
+    ci_check_suite_id: Optional[int] = None
+    ci_base_ref_name: Optional[str] = None
+    ci_potential_merge_commit_oid: Optional[str] = None
+    ci_event_sha: Optional[str] = None
+    ci_workflow_path: Optional[str] = None
+    ci_workflow_id: Optional[int] = None
+    ci_workflow_action: Optional[str] = None
+    ci_run_attempt: Optional[int] = None
+    ci_snapshot_body_sha256: Optional[str] = None
     fixing_lane_active: bool = False
     review_owned: bool = False
     review_verdict: Optional[Verdict] = None

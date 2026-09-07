@@ -7,6 +7,7 @@ from typing import Mapping
 
 from pr_closure.model import ProvenanceParticipant, ReviewRecord
 from pr_closure.secure_paths import SecurePathError, read_contained_file
+from pr_closure.jsonio import StrictJsonError, loads as strict_json_loads
 
 
 class ProvenanceValidationError(ValueError):
@@ -56,8 +57,8 @@ def _manifest_path(closure_root: Path, run_ref: str) -> str:
 
 def _json_object(raw: bytes, label: str) -> Mapping:
     try:
-        value = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        value = strict_json_loads(raw, label)
+    except StrictJsonError as error:
         raise ProvenanceValidationError(label + " is not valid UTF-8 JSON") from error
     if not isinstance(value, dict):
         raise ProvenanceValidationError(label + " must be a JSON object")
