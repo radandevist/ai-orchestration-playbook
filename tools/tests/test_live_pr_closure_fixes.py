@@ -53,15 +53,6 @@ class Runner:
                     item_key = "artifacts" if "/artifacts" in endpoint else "check_runs"
                     empty = {"total_count": pages[0].get("total_count", 0), item_key: []}
                     entry = (0, json.dumps(pages[page]) if page < len(pages) else json.dumps(empty), entry[2])
-        if entry is None and "/actions/runs/" in key and "/attempts/" not in key and "/artifacts" not in key:
-            run_id = key.rsplit("/actions/runs/", 1)[1]
-            attempt_entries = []
-            for candidate_key, candidate_entry in self.responses.items():
-                prefix = "gh api repos/owner/repo/actions/runs/{0}/attempts/".format(run_id)
-                if candidate_key.startswith(prefix) and isinstance(candidate_entry, tuple):
-                    attempt_entries.append((int(candidate_key.rsplit("/", 1)[1]), candidate_entry))
-            if attempt_entries:
-                entry = max(attempt_entries, key=lambda item: item[0])[1]
         return entry or (127, "", "unscripted")
 
 
@@ -221,14 +212,12 @@ class LivePrFixTests(unittest.TestCase):
             "gh api repos/owner/repo/actions/runs/201": (
                 0, json.dumps(run(attempt=2, suite_id=302)), ""
             ),
-            "gh api repos/owner/repo/actions/runs/201/attempts/1": (
-                0, json.dumps(run(attempt=1, suite_id=301)), ""
-            ),
             "gh api repos/owner/repo/actions/runs/201/attempts/2": (
                 0, json.dumps(run(attempt=2, suite_id=302)), ""
             ),
         }
-        candidates = GitHubSource("owner/repo", 42, runner=Runner(responses)).read_check_run_candidates(
+        runner = Runner(responses)
+        candidates = GitHubSource("owner/repo", 42, runner=runner).read_check_run_candidates(
             HEAD_A,
             workflow_path=".github/workflows/ci.yml",
             workflow_action="pull_request",
@@ -236,25 +225,27 @@ class LivePrFixTests(unittest.TestCase):
         )
         self.assertEqual(1, len(candidates))
         self.assertIsNotNone(candidates[0].result)
-        self.assertEqual(1, candidates[0].result.run_attempt)
+        self.assertFalse(candidates[0].authoritative)
+        self.assertEqual(2, candidates[0].result.run_attempt)
+        self.assertNotIn(
+            "repos/owner/repo/actions/runs/201/attempts/1",
+            [call[-1] for call in runner.calls],
+        )
 
-    def test_provider_faithful_workflow_run_attempt_rejects_zero_or_multiple_suite_matches(self):
+    def test_provider_faithful_current_run_and_attempt_suite_must_match(self):
         endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
-        for suite_ids in ((999, 302), (301, 301)):
-            with self.subTest(suite_ids=suite_ids):
-                candidate = check("ci-final-gate", suite_id=301)
+        for run_suite_id, attempt_suite_id in ((999, 302), (302, 999)):
+            with self.subTest(run_suite_id=run_suite_id, attempt_suite_id=attempt_suite_id):
+                candidate = check("ci-final-gate", suite_id=302)
                 responses = {
                     "gh api " + endpoint + "&page=1&per_page=100": (
                         0, json.dumps({"total_count": 1, "check_runs": [candidate]}), ""
                     ),
                     "gh api repos/owner/repo/actions/runs/201": (
-                        0, json.dumps(run(attempt=2, suite_id=suite_ids[1])), ""
-                    ),
-                    "gh api repos/owner/repo/actions/runs/201/attempts/1": (
-                        0, json.dumps(run(attempt=1, suite_id=suite_ids[0])), ""
+                        0, json.dumps(run(attempt=2, suite_id=run_suite_id)), ""
                     ),
                     "gh api repos/owner/repo/actions/runs/201/attempts/2": (
-                        0, json.dumps(run(attempt=2, suite_id=suite_ids[1])), ""
+                        0, json.dumps(run(attempt=2, suite_id=attempt_suite_id)), ""
                     ),
                 }
                 candidates = GitHubSource("owner/repo", 42, runner=Runner(responses)).read_check_run_candidates(
@@ -264,7 +255,7 @@ class LivePrFixTests(unittest.TestCase):
                     required_names=("ci-final-gate",),
                 )
                 self.assertIsNone(candidates[0].result)
-                self.assertIn("check-suite", candidates[0].error)
+                self.assertIn("current workflow attempt", candidates[0].error)
 
     def test_provider_faithful_current_run_suite_must_match_current_attempt(self):
         endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
@@ -539,7 +530,7 @@ class LivePrFixTests(unittest.TestCase):
         self.assertIsNone(candidates[0].result)
         self.assertNotIn("/attempts/", " ".join(call[-1] for call in runner.calls))
 
-    def test_run_attempt_boundary_of_twenty_enumerates_exactly_twenty_attempts(self):
+    def test_run_attempt_boundary_of_twenty_reads_only_current_attempt(self):
         endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
         candidate = check("ci-final-gate", suite_id=320)
         responses = {
@@ -550,17 +541,26 @@ class LivePrFixTests(unittest.TestCase):
                 0, json.dumps(run(attempt=20, suite_id=320)), ""
             ),
         }
-        for attempt in range(1, 21):
-            responses[
-                "gh api repos/owner/repo/actions/runs/201/attempts/{0}".format(attempt)
-            ] = (0, json.dumps(run(attempt=attempt, suite_id=320 if attempt == 20 else 300 + attempt)), "")
-        candidates = GitHubSource("owner/repo", 42, runner=Runner(responses)).read_check_run_candidates(
+        responses[
+            "gh api repos/owner/repo/actions/runs/201/attempts/20"
+        ] = (0, json.dumps(run(attempt=20, suite_id=320)), "")
+        runner = Runner(responses)
+        candidates = GitHubSource("owner/repo", 42, runner=runner).read_check_run_candidates(
             HEAD_A,
             workflow_path=".github/workflows/ci.yml",
             workflow_action="pull_request",
             required_names=("ci-final-gate",),
         )
         self.assertEqual(20, candidates[0].result.run_attempt)
+        self.assertEqual(
+            1,
+            sum(call[-1] == "repos/owner/repo/actions/runs/201" for call in runner.calls),
+        )
+        attempt_calls = [call[-1] for call in runner.calls if "/attempts/" in call[-1]]
+        self.assertEqual(
+            ["repos/owner/repo/actions/runs/201/attempts/20"],
+            attempt_calls,
+        )
 
     def test_artifact_download_streams_exact_id_without_text_or_output_flag(self):
         archive = io.BytesIO()
@@ -595,7 +595,7 @@ class LivePrFixTests(unittest.TestCase):
         self.assertNotIn("--output", observed["argv"])
         self.assertEqual(64 * 1024, observed["limit"])
 
-    def test_same_run_historical_candidate_is_bound_to_its_own_attempt(self):
+    def test_same_run_historical_candidate_is_non_authoritative_without_old_attempt_read(self):
         endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
         old = check("ci-final-gate", check_id=101, suite_id=301, start="2026-09-07T10:00:00Z")
         current = check(
@@ -610,21 +610,24 @@ class LivePrFixTests(unittest.TestCase):
             "gh api repos/owner/repo/actions/runs/201": (
                 0, json.dumps(run(attempt=2, suite_id=302)), ""
             ),
-            "gh api repos/owner/repo/actions/runs/201/attempts/1": (
-                0, json.dumps(run(attempt=1, suite_id=301)), ""
-            ),
             "gh api repos/owner/repo/actions/runs/201/attempts/2": (
                 0, json.dumps(run(attempt=2, suite_id=302)), ""
             ),
         }
-        candidates = GitHubSource("owner/repo", 42, runner=Runner(responses)).read_check_run_candidates(
+        runner = Runner(responses)
+        candidates = GitHubSource("owner/repo", 42, runner=runner).read_check_run_candidates(
             HEAD_A,
             workflow_path=".github/workflows/ci.yml",
             workflow_action="pull_request",
             required_names=("ci-final-gate",),
         )
-        self.assertEqual({1, 2}, {candidate.result.run_attempt for candidate in candidates})
+        self.assertEqual({2}, {candidate.result.run_attempt for candidate in candidates})
         self.assertTrue(all(candidate.result is not None for candidate in candidates))
+        self.assertEqual([False, True], [candidate.authoritative for candidate in candidates])
+        self.assertNotIn(
+            "repos/owner/repo/actions/runs/201/attempts/1",
+            [call[-1] for call in runner.calls],
+        )
 
     def test_full_reader_same_run_attempt_sequence_uses_current_attempt(self):
         endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
@@ -648,23 +651,20 @@ class LivePrFixTests(unittest.TestCase):
                     "gh api repos/owner/repo/actions/runs/201": (
                         0, json.dumps(run(attempt=2, suite_id=302)), ""
                     ),
-                    "gh api repos/owner/repo/actions/runs/201/attempts/1": (
-                        0, json.dumps(run(attempt=1, suite_id=301)), ""
-                    ),
                     "gh api repos/owner/repo/actions/runs/201/attempts/2": (
                         0, json.dumps(run(attempt=2, suite_id=302)), ""
                     ),
                 }
+                runner = Runner(responses)
                 source = GitHubSource(
-                    "owner/repo", 42, runner=Runner(responses),
+                    "owner/repo", 42, runner=runner,
                     artifact_reader=lambda *_: snapshot(
-                        attempt=1 if status is None else 2
+                        attempt=2
                     ),
                 )
-                snapshot_attempt = 1 if status is None else 2
                 source._read_run_artifacts = lambda _run_id: ({
                     "id": 501,
-                    "name": "ci-pr-snapshot-201-{0}".format(snapshot_attempt),
+                    "name": "ci-pr-snapshot-201-2",
                     "expired": False,
                     "size_in_bytes": 256,
                 },)
@@ -678,6 +678,10 @@ class LivePrFixTests(unittest.TestCase):
                 self.assertEqual(expected, facts.ci_state)
                 self.assertEqual(102, facts.check_run_id)
                 self.assertEqual(2, facts.run_attempt)
+                self.assertNotIn(
+                    "repos/owner/repo/actions/runs/201/attempts/1",
+                    [call[-1] for call in runner.calls],
+                )
 
     def test_full_reader_same_run_old_success_is_not_authoritative_without_current_check(self):
         endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
@@ -709,23 +713,20 @@ class LivePrFixTests(unittest.TestCase):
                     "gh api repos/owner/repo/actions/runs/201": (
                         0, json.dumps(run(attempt=2, suite_id=302)), ""
                     ),
-                    "gh api repos/owner/repo/actions/runs/201/attempts/1": (
-                        0, json.dumps(run(attempt=1, suite_id=301)), ""
-                    ),
                     "gh api repos/owner/repo/actions/runs/201/attempts/2": (
                         0, json.dumps(run(attempt=2, suite_id=302)), ""
                     ),
                 }
+                runner = Runner(responses)
                 source = GitHubSource(
-                    "owner/repo", 42, runner=Runner(responses),
+                    "owner/repo", 42, runner=runner,
                     artifact_reader=lambda *_: snapshot(
-                        attempt=1 if status is None else 2
+                        attempt=2
                     ),
                 )
-                snapshot_attempt = 1 if status is None else 2
                 source._read_run_artifacts = lambda _run_id: ({
                     "id": 501,
-                    "name": "ci-pr-snapshot-201-{0}".format(snapshot_attempt),
+                    "name": "ci-pr-snapshot-201-2",
                     "expired": False,
                     "size_in_bytes": 256,
                 },)
@@ -737,6 +738,107 @@ class LivePrFixTests(unittest.TestCase):
                     workflow_action="pull_request",
                 )
                 self.assertEqual(expected, facts.ci_state)
+                self.assertNotIn(
+                    "repos/owner/repo/actions/runs/201/attempts/1",
+                    [call[-1] for call in runner.calls],
+                )
+
+    def test_full_reader_current_green_survives_unavailable_historical_attempt(self):
+        endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
+        old = check("ci-final-gate", check_id=101, suite_id=301)
+        current = check("ci-final-gate", check_id=102, suite_id=302, start="2026-09-07T11:00:00Z")
+        responses = {
+            "gh api repos/owner/repo/actions/workflows/ci.yml": (
+                0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), ""
+            ),
+            "gh api " + endpoint + "&page=1&per_page=100": (
+                0, json.dumps({"total_count": 2, "check_runs": [old, current]}), ""
+            ),
+            "gh api repos/owner/repo/actions/runs/201": (
+                0, json.dumps(run(attempt=2, suite_id=302)), ""
+            ),
+            "gh api repos/owner/repo/actions/runs/201/attempts/1": (
+                1, "", "HTTP 503"
+            ),
+            "gh api repos/owner/repo/actions/runs/201/attempts/2": (
+                0, json.dumps(run(attempt=2, suite_id=302)), ""
+            ),
+        }
+        runner = Runner(responses)
+        source = GitHubSource(
+            "owner/repo", 42, runner=runner,
+            artifact_reader=lambda *_: snapshot(attempt=2),
+        )
+        source._read_run_artifacts = lambda _run_id: ({
+            "id": 501,
+            "name": "ci-pr-snapshot-201-2",
+            "expired": False,
+            "size_in_bytes": 256,
+        },)
+        try:
+            facts = source.read_live_ci(
+                pr(),
+                required_checks=("ci-final-gate",),
+                live_checks=("ci-final-gate",),
+                workflow_path=".github/workflows/ci.yml",
+                workflow_action="pull_request",
+            )
+        except (SourceMalformed, SourceUnavailable) as error:
+            self.fail("historical attempt blocked current evidence: {0}".format(error))
+        self.assertEqual(CiState.PASSING, facts.ci_state)
+        self.assertEqual(102, facts.check_run_id)
+        self.assertEqual(2, facts.run_attempt)
+        self.assertNotIn(
+            "repos/owner/repo/actions/runs/201/attempts/1",
+            [call[-1] for call in runner.calls],
+        )
+
+    def test_full_reader_current_green_survives_malformed_historical_attempt(self):
+        endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
+        old = check("ci-final-gate", check_id=101, suite_id=301)
+        current = check("ci-final-gate", check_id=102, suite_id=302, start="2026-09-07T11:00:00Z")
+        responses = {
+            "gh api repos/owner/repo/actions/workflows/ci.yml": (
+                0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), ""
+            ),
+            "gh api " + endpoint + "&page=1&per_page=100": (
+                0, json.dumps({"total_count": 2, "check_runs": [old, current]}), ""
+            ),
+            "gh api repos/owner/repo/actions/runs/201": (
+                0, json.dumps(run(attempt=2, suite_id=302)), ""
+            ),
+            "gh api repos/owner/repo/actions/runs/201/attempts/1": (
+                0, "{malformed", ""
+            ),
+            "gh api repos/owner/repo/actions/runs/201/attempts/2": (
+                0, json.dumps(run(attempt=2, suite_id=302)), ""
+            ),
+        }
+        runner = Runner(responses)
+        source = GitHubSource(
+            "owner/repo", 42, runner=runner,
+            artifact_reader=lambda *_: snapshot(attempt=2),
+        )
+        source._read_run_artifacts = lambda _run_id: ({
+            "id": 501,
+            "name": "ci-pr-snapshot-201-2",
+            "expired": False,
+            "size_in_bytes": 256,
+        },)
+        facts = source.read_live_ci(
+            pr(),
+            required_checks=("ci-final-gate",),
+            live_checks=("ci-final-gate",),
+            workflow_path=".github/workflows/ci.yml",
+            workflow_action="pull_request",
+        )
+        self.assertEqual(CiState.PASSING, facts.ci_state)
+        self.assertEqual(102, facts.check_run_id)
+        self.assertEqual(2, facts.run_attempt)
+        self.assertNotIn(
+            "repos/owner/repo/actions/runs/201/attempts/1",
+            [call[-1] for call in runner.calls],
+        )
 
     def test_current_attempt_mutations_cannot_fall_back_to_old_green_candidate(self):
         endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
@@ -782,11 +884,11 @@ class LivePrFixTests(unittest.TestCase):
                 )
                 self.assertIsNone(candidates[0].result)
 
-    def test_historical_attempt_head_sha_must_bind_to_pr_head(self):
+    def test_current_attempt_head_sha_must_bind_to_pr_head(self):
         endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
-        candidate = check("ci-final-gate", suite_id=301)
-        historical = run(attempt=1, suite_id=301)
-        historical["head_sha"] = HEAD_B
+        candidate = check("ci-final-gate", suite_id=302)
+        current_attempt = run(attempt=2, suite_id=302)
+        current_attempt["head_sha"] = HEAD_B
         responses = {
             "gh api " + endpoint + "&page=1&per_page=100": (
                 0, json.dumps({"total_count": 1, "check_runs": [candidate]}), ""
@@ -794,11 +896,8 @@ class LivePrFixTests(unittest.TestCase):
             "gh api repos/owner/repo/actions/runs/201": (
                 0, json.dumps(run(attempt=2, suite_id=302)), ""
             ),
-            "gh api repos/owner/repo/actions/runs/201/attempts/1": (
-                0, json.dumps(historical), ""
-            ),
             "gh api repos/owner/repo/actions/runs/201/attempts/2": (
-                0, json.dumps(run(attempt=2, suite_id=302)), ""
+                0, json.dumps(current_attempt), ""
             ),
         }
         candidates = GitHubSource("owner/repo", 42, runner=Runner(responses)).read_check_run_candidates(
@@ -808,9 +907,10 @@ class LivePrFixTests(unittest.TestCase):
             required_names=("ci-final-gate",),
         )
         self.assertIsNone(candidates[0].result)
+        self.assertTrue(candidates[0].authoritative)
         self.assertIn("attempt head", candidates[0].error)
 
-    def test_same_run_candidates_reuse_suite_and_attempt_reads(self):
+    def test_same_run_candidates_reuse_current_run_and_attempt_reads(self):
         endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
         first = check("ci-final-gate", check_id=101, suite_id=301)
         second = check("ci-companion", check_id=102, suite_id=301)
@@ -1027,17 +1127,14 @@ class LivePrFixTests(unittest.TestCase):
         responses = {
             check_key: (0, json.dumps([{"total_count": 1, "check_runs": [raw]}]), ""),
             run_key: (0, json.dumps(run(attempt=2, suite_id=999)), ""),
-            "gh api repos/owner/repo/actions/runs/201/attempts/1": (
-                0, json.dumps(run(attempt=1, suite_id=998)), ""
-            ),
-            attempt_key: (0, json.dumps(run(attempt=2, suite_id=999)), ""),
+            attempt_key: (0, json.dumps(run(attempt=2, suite_id=998)), ""),
         }
         candidates = GitHubSource("owner/repo", 42, runner=Runner(responses)).read_check_run_candidates(
             HEAD_A, workflow_path=".github/workflows/ci.yml", workflow_action="pull_request",
             required_names=("ci-final-gate",),
         )
         self.assertIsNone(candidates[0].result)
-        self.assertIn("check-suite", candidates[0].error)
+        self.assertIn("current workflow attempt", candidates[0].error)
 
     def test_pr_a_legacy_checks_and_central_live_gate_can_pass(self):
         checks = [check(name, check_id=100 + index) for index, name in enumerate((

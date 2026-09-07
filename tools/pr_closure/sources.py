@@ -1530,45 +1530,21 @@ class GitHubSource:
                 raise SourceMalformed(
                     "run attempt exceeds {0}".format(MAX_RUN_ATTEMPTS)
                 )
-            attempts = []
-            for attempt_number in range(1, run_attempt + 1):
-                attempt_workflow = cache.get((run_id, attempt_number))
-                if attempt_workflow is None:
-                    attempt_workflow = self._workflow_run(run_id, attempt_number)
-                    cache[(run_id, attempt_number)] = attempt_workflow
-                attempts.append(attempt_workflow)
-            current_attempt = attempts[-1]
+            current_attempt = cache.get((run_id, run_attempt))
+            if current_attempt is None:
+                current_attempt = self._workflow_run(run_id, run_attempt)
+                cache[(run_id, run_attempt)] = current_attempt
             current_suite_id = _require_positive_int(
                 current_attempt.get("check_suite_id"),
                 "current workflow check-suite id",
                 (),
             )
-            authoritative = current_suite_id == suite_id
-            _validate_current_attempt(workflow, current_attempt, run_id, run_attempt)
-            matching_attempts = [
-                attempt_workflow
-                for attempt_workflow in attempts
-                if _require_positive_int(
-                    attempt_workflow.get("check_suite_id"),
-                    "workflow check-suite id",
-                    (),
-                ) == suite_id
-            ]
-            if len(matching_attempts) != 1:
-                raise SourceMalformed(
-                    "check-suite must identify exactly one workflow-run attempt"
-                )
-            attempt_workflow = matching_attempts[0]
-            selected_attempt = _require_positive_int(
-                attempt_workflow.get("run_attempt"), "workflow attempt number", ()
+            authoritative = current_suite_id == suite_id == _require_positive_int(
+                workflow.get("check_suite_id"),
+                "workflow check-suite id",
+                (),
             )
-            authoritative = selected_attempt == run_attempt
-            if _require_positive_int(attempt_workflow.get("workflow_id"), "workflow id", ()) != base_workflow_id:
-                raise SourceMalformed("workflow attempt id mismatch")
-            if _require_positive_int(attempt_workflow.get("check_suite_id"), "workflow check-suite id", ()) != suite_id:
-                raise SourceMalformed("check-suite/workflow-run identity mismatch")
-            if _require_commit(attempt_workflow.get("head_sha"), "workflow attempt head_sha", ()) != head_oid:
-                raise SourceMalformed("workflow attempt head does not match PR head")
+            _validate_current_attempt(workflow, current_attempt, run_id, run_attempt)
             enforce_central = workflow_id is not None and (
                 central_names is None or name in central_names
             )
@@ -1578,12 +1554,12 @@ class GitHubSource:
                 raise SourceMalformed("workflow path mismatch")
             if enforce_central and event != workflow_action:
                 raise SourceMalformed("workflow event/action mismatch")
-            attempt_path = _require_non_empty_str(attempt_workflow.get("path"), "workflow attempt path", ())
-            if attempt_workflow.get("event") != event:
+            attempt_path = _require_non_empty_str(current_attempt.get("path"), "workflow attempt path", ())
+            if current_attempt.get("event") != event:
                 raise SourceMalformed("workflow attempt event mismatch")
             if enforce_central and not _workflow_path_matches(attempt_path, workflow_path):
                 raise SourceMalformed("workflow attempt path mismatch")
-            if enforce_central and attempt_workflow.get("event") != workflow_action:
+            if enforce_central and current_attempt.get("event") != workflow_action:
                 raise SourceMalformed("workflow attempt event/action mismatch")
             outcome = _classify_check("check_run", status, conclusion)
             return CheckRunCandidate(
@@ -1605,7 +1581,7 @@ class GitHubSource:
                     workflow_path=actual_workflow_path,
                     workflow_action=event,
                     workflow_event=event,
-                    run_attempt=selected_attempt,
+                    run_attempt=run_attempt,
                 ),
                 authoritative=authoritative,
             )
