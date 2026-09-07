@@ -66,6 +66,13 @@ def active_config():
 
 
 class ReviewPolicyTests(unittest.TestCase):
+    def test_registered_publyapp_review_cannot_use_the_generic_policy_default(self):
+        record = v1_record()
+        record["repository"] = "PublyApp/publyapp"
+        record["reviewer_family"] = "claude"
+        with self.assertRaises(ReviewValidationError):
+            validate_review(record)
+
     def test_generated_v2_schema_accepts_the_exact_record(self):
         validator = Draft202012Validator(review_json_schema_v2())
         self.assertTrue(validator.is_valid(v2_record()))

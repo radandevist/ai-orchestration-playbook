@@ -77,6 +77,50 @@ def active_policy_config():
 
 
 class PolicyConfigTests(unittest.TestCase):
+    def test_registered_publyapp_exact_policy_is_valid_without_adoption_state(self):
+        raw = active_policy_config()
+        raw["repository"] = "PublyApp/publyapp"
+        config = validate_project_config(raw)
+        self.assertEqual("PublyApp/publyapp", config.repository)
+
+    def test_registered_publyapp_policy_cannot_be_missing_disabled_or_weakened(self):
+        cases = []
+
+        missing = valid_config()
+        missing["repository"] = "PublyApp/publyapp"
+        cases.append(missing)
+
+        disabled = valid_config()
+        disabled["repository"] = "PublyApp/publyapp"
+        disabled["review_policy"] = {
+            "mode": None,
+            "owner_authorization": None,
+            "forbidden_reviewer_families": [],
+            "same_family_exceptions": [],
+        }
+        disabled["model_routes"] = []
+        cases.append(disabled)
+
+        weakened = active_policy_config()
+        weakened["repository"] = "PublyApp/publyapp"
+        weakened["review_policy"]["forbidden_reviewer_families"] = []
+        cases.append(weakened)
+
+        route_removed = active_policy_config()
+        route_removed["repository"] = "PublyApp/publyapp"
+        route_removed["model_routes"].pop()
+        cases.append(route_removed)
+
+        exception_changed = active_policy_config()
+        exception_changed["repository"] = "PublyApp/publyapp"
+        exception_changed["review_policy"]["owner_authorization"] += " changed"
+        cases.append(exception_changed)
+
+        for raw in cases:
+            with self.subTest(raw=raw):
+                with self.assertRaises(ConfigValidationError):
+                    validate_project_config(raw)
+
     def test_generated_schema_accepts_disabled_and_active_policy_shapes(self):
         validator = Draft202012Validator(project_json_schema())
         self.assertTrue(validator.is_valid(valid_config()))

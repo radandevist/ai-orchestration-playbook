@@ -4,6 +4,16 @@
 **Status:** Design specification
 **Scope:** Shared `tools/pr_closure` gate, with the PublyApp policy as the first adopter
 
+## Authority reset (2026-09-07)
+
+This specification is superseded wherever it treats project adoption events, an external stream
+anchor, or local configuration as the sole policy authority. The immutable versioned repository
+policy registry is now the floor for the exact `PublyApp/publyapp` repository. Local policy config,
+adoption, activation, and event records may document or tighten migration state but cannot omit,
+disable, weaken, or replace that floor. The event anchor remains only for append integrity and
+crash recovery; it is not a monotonic policy-authority mechanism against rollback of the complete
+local trust set. Unknown repositories retain the generic explicit-config behavior.
+
 ## Goal
 
 Make the review-family rule express the owner-approved PublyApp exception precisely:
@@ -181,8 +191,9 @@ Configuration validation is fail-closed:
 The owner-authorized policy has three effective modes:
 
 - **disabled** — `review_policy` is absent or exactly empty. Existing schema-v1 cross-family
-  authority remains unchanged only for a project with no durable policy adoption. After adoption,
-  the same configuration is a missing-policy transition and cannot authorize any review.
+  authority remains unchanged for an unregistered project with no policy floor. For
+  `PublyApp/publyapp`, the compiled registry floor makes disabled or absent policy configuration
+  invalid before any review can authorize.
 - **staged** — the full candidate policy is loaded and strictly validated. `import-review` may
   import schema-v2 records that satisfy that candidate policy, and retirement/recovery operations
   may migrate existing evidence. Forbidden reviewer families already apply to new imports, so a
@@ -205,11 +216,11 @@ schema-v1 artifact, no incomplete retirement, no forbidden reviewer, and at leas
 active schema-v2 review at the exact pushed tip. Its result is only `ELIGIBLE` or a typed refusal;
 it can never emit an approval state. The eligibility record binds the tip, current staged-config
 digest, and projected enforced-config digest obtained by changing only `mode`. After `ELIGIBLE`, the
-config may change only to that exact enforced digest, and the project-scoped adoption event must
-append the exact staged-to-enforced transition against the prior adoption leaf. Normal `status` and
-`import-review` must then independently derive the result from that adoption chain. Any other
-config, policy identity, repository, or tip change makes the transition stale; policy removal is
-never a rollback.
+  config may change only to that exact enforced digest. A project-scoped adoption event may record
+the staged-to-enforced transition, but it is audit/migration evidence and is not required to
+establish the registered repository's policy floor. Normal `status` and `import-review` independently
+enforce the immutable floor plus their ordinary evidence gates. Any other config, policy identity,
+repository, or tip change makes the transition stale; policy removal is never a rollback.
 
 #### Canonical model identity registry
 
@@ -313,10 +324,11 @@ participant's complete endpoint identity to match both its durable manifest and 
 artifact's declared launcher-registry version. Unknown runner names, alternate invocation aliases,
 and plausible strings are rejected; the validator never synthesizes an endpoint or route.
 
-#### Single machine-readable route authority
+#### Immutable floor plus machine-readable route configuration
 
-For a staged or enforced project policy, `ProjectConfig.model_routes` is the sole authority for
-allowed implementer models and their review routes. The dispatcher loads it to select the
+For a staged or enforced project policy, `ProjectConfig.model_routes` is the explicit route
+configuration, and a registered repository's immutable policy registry is its mandatory floor.
+The dispatcher loads the effective route set to select the
 implementation runner/model and the required review runner/model. Import, status, and
 policy-transition checks load the same normalized objects to validate provenance and reviewer
 choice. The adapter Markdown may explain the routes but cannot authorize one, and neither dispatch
@@ -329,8 +341,9 @@ staged or enforced mode. With policy disabled and no durable adoption, schema-v2
 consults no `model_routes` entry. It verifies each claimed participant independently against the
 launcher registry and its immutable manifest, then applies the generic cross-family rule. It
 neither authorizes dispatch nor invents a reviewer pairing that is absent from project
-configuration. After adoption, a disabled or absent policy is not a compatibility path: the
-adoption invariant rejects it before this validation can grant authority.
+configuration. For `PublyApp/publyapp`, a disabled or absent policy is invalid even when adoption
+evidence is missing or rolled back. For an unregistered repository, the existing generic
+compatibility path remains available.
 
 For PublyApp, the table above authorizes exactly two implementation routes today:
 
@@ -521,7 +534,7 @@ The version/policy matrix is normative:
 
 | Artifact | Policy | `import-review` | `status` |
 |---|---|---|---|
-| schema v1 | disabled, never adopted | Existing v1 validator; write only if cross-family | Existing v1 validator; accepted cross-family review remains authority |
+| schema v1 | disabled, unregistered | Existing v1 validator; write only if cross-family | Existing v1 validator; accepted cross-family review remains authority |
 | schema v1 | disabled after adoption | Reject before write | Fail closed; no legacy authority |
 | schema v1 | staged or enforced | Reject before write | `UNVERIFIED` until schema-v2 replacement and retirement |
 | schema v2 | disabled | Cross-family validator; each participant must match its immutable manifest and launcher-registry identity; no project route lookup | Identical validator; no route is inferred and same-family remains forbidden |
@@ -530,24 +543,25 @@ The version/policy matrix is normative:
 
 An empty policy means `mode` and `owner_authorization` are `None` and both collections in
 `ReviewPolicy` are empty at configuration-validation time; it is semantically identical to an
-absent `review_policy` only before durable project adoption. After adoption, the persisted policy
-identity and transition chain are additional authority inputs. A project name, repository name,
-schema-v2 support, or staged import cannot implicitly activate approval authority.
+absent `review_policy` only for an unregistered repository. The exact `PublyApp/publyapp` registry
+entry requires its immutable floor regardless of adoption evidence. A project name, schema-v2
+support, or staged import cannot implicitly activate approval authority.
 
 The policy is loaded and validated once with `ProjectConfig`; its normalized immutable value is
 passed through both paths. `model_routes` concordance is evaluated only for staged or enforced
 policy. The disabled schema-v2 branch requires the configured route table to be empty and validates
 only the generic cross-family rule plus the two independently registered, manifest-backed launcher
 identities; it cannot synthesize or persist a project route. A policy change invalidates no bytes
-and silently upgrades no record. Once a project-scoped policy adoption exists, removing, emptying,
-disabling, or changing that policy is a typed fail-closed state rather than a legacy fallback. If a durable record or its provenance no longer satisfies the
+and silently upgrades no record. For a registered repository, removing, emptying, disabling, or
+changing the floor policy is a typed fail-closed state rather than a legacy fallback, independent
+of adoption events. If a durable record or its provenance no longer satisfies the
 enforced policy, status returns a typed malformed/unverified error rather than treating another
 review or a projection as approval evidence. Import validates provenance before creating the
 review event, and status validates the same envelope, path, registry versions, model IDs, runner and
 invocation identities, reviewed commit, and digest before considering
 the review verdict. Staged import calls this same validator but cannot bypass the mode-level
-`UNVERIFIED` status result. If adoption exists and the loaded policy is absent, empty, disabled,
-or has a different identity, both public paths fail closed before review authority is evaluated.
+`UNVERIFIED` status result. If the registered floor is absent from loaded configuration or has a
+different identity, both public paths fail closed before review authority is evaluated.
 
 The public schema and Python validator intentionally retain their existing semantic asymmetry:
 JSON Schema cannot compare resolved families or look up policy IDs, so those checks belong to the
@@ -829,39 +843,14 @@ and both the staged and projected enforced config digests. The rollout then chan
 status derivation. Failure at either step leaves or restores staged mode; it never falls back to
 Claude or treats staged evidence as approval.
 
-Rollback is a verified transition to a different enforced policy, never policy removal. The target
-keeps owner authorization and `forbidden_reviewer_families: ["anthropic"]`, but has
-`same_family_exceptions: []`. Its sole `model_routes` table changes the GPT implementer route to the
-registered cross-family reviewer `deepseek-v4-flash`, runner `opencode`, invocation model
-`cline-pass/cline-pass/deepseek-v4-flash`, pinned to `models-v1` and `launchers-v1`, and
-`same_family_policy_id: null`. The DeepSeek implementer route continues to use exact
-`gpt-5.6-sol` through `codex` with the same pinned registry versions. Thus the final state cannot
-silently recover either Claude authority or the GPT-to-Sol exception.
-
-1. Replace the enforced policy and route table with an owner-authorized `mode: staged` form of that
-   exact rollback target. Status immediately becomes `UNVERIFIED`; the staged and projected
-   enforced digests are fixed before migration starts.
-2. At the exact current pushed tip, obtain a fresh cross-family schema-v2 review for every affected
-   GPT implementation from the route table's exact DeepSeek endpoint. Do not invent a provider,
-   model, or alternate route.
-3. Import each review through the staged target policy and validate its route-bound provenance
-   digest, local gates, CI, and live-tip binding. It remains non-authoritative while mode is staged.
-4. Retire the old same-family review and any forbidden-reviewer artifact through the complete
-   `ACTIVE -> PREPARED -> COPIED -> COMMITTED -> FINALIZED` protocol.
-5. Run `check-policy-activation` against the projected enforced rollback target. It uses the same
-   route, policy, and closure validators and requires the new cross-family reviews to be the sole
-   active review authority, no incomplete retirement, exact tip binding, and green non-review gates.
-   It records both staged and projected enforced config digests and can return only `ELIGIBLE`, never
-   approval.
-6. Change only `mode: staged` to `mode: enforced`, producing the proved target digest, then run normal
-   `status`; it must independently derive green under the enforced policy that still forbids
-   Anthropic and contains no same-family exception.
-
-If any step fails, remain in or restore the staged form of the rollback target and resume the same
-bounded migration; status stays `UNVERIFIED`. Never remove the policy, restore review authority from
-an incomplete retirement, delete the replacement, fall back to Claude, or reactivate retired
-evidence automatically. A separately audited restore operation would have to verify the original
-digest and append a new event; it is not part of ordinary rollback.
+For the registered `PublyApp/publyapp` repository, rollback of local state is not a policy
+transition. The released registry floor continues to require the exact current implementation
+routes, the owner-authorized Luna → Sol exception, and the Anthropic prohibition when local config,
+adoption events, event streams, or external anchors are absent, copied, replaced, or rolled back.
+A future policy change must be released as a new immutable registry version whose floor is at least
+as strong; local configuration cannot select a weaker rollback target. Migration may still use the
+staged mode and durable retirement protocol, but those records document progress and never replace
+the compiled floor.
 
 ## Non-goals
 

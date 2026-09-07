@@ -568,6 +568,165 @@ class CliTestCase(unittest.TestCase):
 
 
 class CliExitCodeTests(CliTestCase):
+    def test_registered_publyapp_empty_state_rejects_disabled_config(self):
+        self.set_git(head=COMMIT_A, local=COMMIT_A, remote=COMMIT_A)
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config(overrides={"repository": "PublyApp/publyapp"})
+
+        status = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+
+        self.assertEqual(2, status.returncode, status.stdout + status.stderr)
+        self.assertFalse(Path(self.state_dir, PROJECT).exists())
+
+    def test_registered_publyapp_exact_luna_to_sol_import_needs_no_adoption(self):
+        self.set_git(head=COMMIT_A, local=COMMIT_A, remote=COMMIT_A)
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        policy = active_policy_config()
+        policy["repository"] = "PublyApp/publyapp"
+        policy["review_policy"]["mode"] = "enforced"
+        config = self.write_config(
+            overrides={
+                "repository": policy["repository"],
+                "model_routes": policy["model_routes"],
+                "review_policy": policy["review_policy"],
+            }
+        )
+        verification = self.run_cli(
+            "record-verification", "--config", config, "--pr", str(PR)
+        )
+        self.assertEqual(0, verification.returncode, verification.stderr)
+        record = v2_record()
+        record.update(
+            {
+                "repository": "PublyApp/publyapp",
+                "pr_number": PR,
+                "reviewed_branch": BRANCH,
+                "reviewed_commit": COMMIT_A,
+            }
+        )
+        self.write_authoritative_v2_provenance(record)
+        review_path = os.path.join(self.root, "registered-luna-sol.json")
+        self._write_json(review_path, record)
+
+        imported = self.run_cli(
+            "import-review", "--config", config, "--pr", str(PR), "--review", review_path
+        )
+
+        self.assertEqual(0, imported.returncode, imported.stderr)
+
+    def test_registered_publyapp_event_and_head_prefix_rollback_cannot_restore_claude(self):
+        self.set_git(head=COMMIT_A, local=COMMIT_A, remote=COMMIT_A)
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        policy = active_policy_config()
+        policy["repository"] = "PublyApp/publyapp"
+        policy["review_policy"]["mode"] = "staged"
+        setup_config = self.write_config(
+            overrides={
+                "repository": policy["repository"],
+                "model_routes": policy["model_routes"],
+                "review_policy": policy["review_policy"],
+            }
+        )
+        verification = self.run_cli(
+            "record-verification", "--config", setup_config, "--pr", str(PR)
+        )
+        self.assertEqual(0, verification.returncode, verification.stderr)
+        store = RunStore(self.state_dir, PROJECT, PR)
+        legacy = json.loads(
+            Path(self.write_review(commit=COMMIT_A, repository="PublyApp/publyapp")).read_text()
+        )
+        store.write_review(COMMIT_A, "legacy-claude", legacy)
+        pre_events = store.events_path.read_bytes()
+        pre_head = store.stream_anchor_head_path.read_bytes()
+        activation = store.record_policy_activation(COMMIT_A, "1" * 64, "2" * 64)
+        store.record_policy_adoption(
+            "PublyApp/publyapp",
+            COMMIT_A,
+            policy_id="policy-v1",
+            policy_digest="3" * 64,
+            staged_config_digest="1" * 64,
+            enforced_config_digest="2" * 64,
+            activation_event_id=activation["event_id"],
+            transition_kind="initial-adoption",
+        )
+        store.events_path.write_bytes(pre_events)
+        store.stream_anchor_head_path.write_bytes(pre_head)
+
+        config = self.write_config(overrides={"repository": "PublyApp/publyapp"})
+        status = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        replacement_review = self.write_review(
+            commit=COMMIT_A,
+            repository="PublyApp/publyapp",
+        )
+        imported_after_rollback = self.run_cli(
+            "import-review",
+            "--config", config,
+            "--pr", str(PR),
+            "--review", replacement_review,
+        )
+
+        self.assertEqual(2, status.returncode, status.stdout + status.stderr)
+        self.assertEqual(2, imported_after_rollback.returncode)
+        self.assertFalse(
+            Path(self.state_dir, PROJECT, str(PR), "reviews", COMMIT_A, "review.json").exists()
+        )
+
+    def test_registered_publyapp_saved_pre_adoption_pr_and_anchor_cannot_restore_claude(self):
+        self.set_git(head=COMMIT_A, local=COMMIT_A, remote=COMMIT_A)
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        policy = active_policy_config()
+        policy["repository"] = "PublyApp/publyapp"
+        setup_config = self.write_config(
+            overrides={
+                "repository": policy["repository"],
+                "model_routes": policy["model_routes"],
+                "review_policy": policy["review_policy"],
+            }
+        )
+        verification = self.run_cli(
+            "record-verification", "--config", setup_config, "--pr", str(PR)
+        )
+        self.assertEqual(0, verification.returncode, verification.stderr)
+        store = RunStore(self.state_dir, PROJECT, PR)
+        legacy = json.loads(
+            Path(self.write_review(commit=COMMIT_A, repository="PublyApp/publyapp")).read_text()
+        )
+        store.write_review(COMMIT_A, "legacy-claude", legacy)
+        saved_pre_pr = Path(self.root) / "saved-pre-adoption-pr"
+        saved_pre_anchor = Path(self.root) / "saved-pre-adoption-anchor"
+        store.base_dir.rename(saved_pre_pr)
+        store.stream_anchor_dir.rename(saved_pre_anchor)
+
+        adopted = RunStore(self.state_dir, PROJECT, PR)
+        adopted.record_commit(COMMIT_A, str(Path(self.root) / "tip.json"))
+        adopted.write_review(COMMIT_A, "legacy-claude", legacy)
+        activation = adopted.record_policy_activation(COMMIT_A, "1" * 64, "2" * 64)
+        adopted.record_policy_adoption(
+            "PublyApp/publyapp",
+            COMMIT_A,
+            policy_id="policy-v1",
+            policy_digest="3" * 64,
+            staged_config_digest="1" * 64,
+            enforced_config_digest="2" * 64,
+            activation_event_id=activation["event_id"],
+            transition_kind="initial-adoption",
+        )
+        live_pr = Path(self.root) / "saved-adopted-pr"
+        live_anchor = Path(self.root) / "saved-adopted-anchor"
+        adopted.base_dir.rename(live_pr)
+        adopted.stream_anchor_dir.rename(live_anchor)
+        saved_pre_pr.rename(adopted.base_dir)
+        saved_pre_anchor.rename(adopted.stream_anchor_dir)
+
+        disabled_config = self.write_config(
+            overrides={"repository": "PublyApp/publyapp"}
+        )
+        status = self.run_cli(
+            "status", "--config", disabled_config, "--pr", str(PR), "--json"
+        )
+
+        self.assertEqual(2, status.returncode, status.stdout + status.stderr)
+
     def test_help_exits_zero(self):
         proc = self.run_cli("--help")
         self.assertEqual(0, proc.returncode, proc.stderr)

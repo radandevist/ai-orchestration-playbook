@@ -388,7 +388,7 @@ class RunStore:
 
     @property
     def stream_anchor_dir(self) -> Path:
-        """External binding directory that cannot be replaced with the PR tree."""
+        """External append-integrity and crash-recovery directory."""
         return self._root / ".event-stream-anchors" / self._project / str(self._pr)
 
     @property
@@ -959,11 +959,11 @@ class RunStore:
             fail("event_id is not bound to the complete transition identity")
 
     def project_policy_adoption_events(self) -> Tuple[dict, ...]:
-        """Read every project-scoped policy adoption transition.
+        """Read every project-scoped policy adoption transition for audit/migration.
 
-        Adoption is intentionally discovered across all PR event streams. A
-        later closure context therefore cannot make an earlier project policy
-        disappear merely by selecting a different tip or PR number.
+        Adoption is intentionally discovered across all PR event streams. These
+        events document lifecycle transitions but are not policy authority for a
+        repository with an immutable registry floor.
         """
         with self._policy_adoption_lock(exclusive=False) as acquired:
             if not acquired:
@@ -1096,7 +1096,7 @@ class RunStore:
             return self._current_policy_adoption_unlocked(repository)
 
     def _current_policy_adoption_unlocked(self, repository: str) -> Optional[dict]:
-        """Return the sole verified leaf of the project's adoption chain."""
+        """Return the sole verified audit leaf of the project's adoption chain."""
         if not isinstance(repository, str) or not repository.strip():
             raise MalformedEvidence("repository must be non-blank")
         events = self.project_policy_adoption_events()

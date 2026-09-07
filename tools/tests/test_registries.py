@@ -1,5 +1,7 @@
 import unittest
 
+import pr_closure.registries as registries
+
 from pr_closure.registries import (
     LAUNCHER_REGISTRIES,
     LAUNCHER_REGISTRY_GOLDEN_SHA256,
@@ -41,6 +43,35 @@ EXPECTED_LAUNCHERS_V1 = frozenset({
 
 
 class ReleasedRegistryTests(unittest.TestCase):
+    def test_publyapp_has_an_immutable_registered_policy_floor(self):
+        lookup = getattr(registries, "policy_floor_for", None)
+        self.assertIsNotNone(lookup)
+        floor = lookup("PublyApp/publyapp")
+        self.assertIsNotNone(floor)
+        self.assertEqual("project-policies-v1", floor.registry_version)
+        self.assertEqual(
+            "review-policy-f177780e94a565bb4dacea068faa3866986e186e297dfb2e5eedcf1181209e2f",
+            floor.policy_id,
+        )
+        self.assertEqual(
+            "f177780e94a565bb4dacea068faa3866986e186e297dfb2e5eedcf1181209e2f",
+            floor.policy_digest,
+        )
+        self.assertEqual("PublyApp/publyapp", floor.repository)
+        self.assertIsNone(lookup("owner/repo"))
+
+    def test_repository_policy_registry_is_released_and_immutable(self):
+        self.assertEqual("project-policies-v1", registries.REPOSITORY_POLICY_REGISTRIES["project-policies-v1"]["PublyApp/publyapp"].registry_version)
+        self.assertEqual(
+            "44deb1c04121c5cb5fdebd02b4c36263f259342acaa910cf989e016f3023fb45",
+            registries.REPOSITORY_POLICY_REGISTRY_GOLDEN_SHA256["project-policies-v1"],
+        )
+        verify_released_registries()
+        with self.assertRaises(TypeError):
+            registries.REPOSITORY_POLICY_REGISTRIES["project-policies-v1"]["PublyApp/publyapp"] = None
+        with self.assertRaises(TypeError):
+            registries.policy_floor_for("PublyApp/publyapp").definition["model_routes"][0]["reviewer_model"] = "claude-sonnet-5"
+
     def test_models_v1_is_the_complete_released_snapshot(self):
         self.assertEqual(EXPECTED_MODELS_V1, dict(MODEL_REGISTRIES["models-v1"]))
         self.assertEqual(
