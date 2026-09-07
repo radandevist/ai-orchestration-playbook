@@ -907,9 +907,6 @@ class GitHubCandidateTipTests(TempDirTestCase):
                 "",
             ),
             run_key: (0, json.dumps(run), ""),
-            "gh api repos/owner/repo/actions/runs/201/attempts/1": (
-                0, json.dumps(dict(run, run_attempt=1, check_suite_id=302)), ""
-            ),
             attempt_key: (0, json.dumps(dict(run, check_suite_id=301)), ""),
         })
         candidates = GitHubSource("owner/repo", 42, runner=runner).read_check_run_candidates(
@@ -921,6 +918,10 @@ class GitHubCandidateTipTests(TempDirTestCase):
         self.assertEqual(101, candidates[0].result.check_run_id)
         self.assertEqual(201, candidates[0].result.workflow_run_id)
         self.assertEqual(2, candidates[0].result.run_attempt)
+        self.assertNotIn(
+            "repos/owner/repo/actions/runs/201/attempts/1",
+            [call[-1] for call in runner.calls],
+        )
         self.assertIn("filter=all", check_key)
 
 
