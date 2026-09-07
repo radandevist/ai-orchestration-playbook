@@ -140,7 +140,16 @@ def main():
         if control.get("stderr"):
             sys.stderr.write(control["stderr"])
             return control.get("exit", 1)
-        data = dict(control.get("data", {}))
+        sequence = control.get("pr_sequence")
+        if isinstance(sequence, list):
+            index = control.get("pr_calls", 0)
+            control["pr_calls"] = index + 1
+            with open(os.environ["FAKE_GH_CONTROL"], "w") as handle:
+                json.dump(control, handle)
+            selected = sequence[min(index, len(sequence) - 1)]
+            data = dict(selected)
+        else:
+            data = dict(control.get("data", {}))
         data.setdefault("number", number)
         data.setdefault("headRefName", "feature/close")
         data.setdefault("baseRefName", "develop")
@@ -231,7 +240,22 @@ def main():
                     "app": {"slug": "github-actions"},
                     "check_suite": {"id": 300 + index},
                 })
-            sys.stdout.write(json.dumps([{"total_count": len(runs), "check_runs": runs}]))
+            sys.stdout.write(json.dumps({"total_count": len(runs), "check_runs": runs}))
+            return 0
+        if "/check-suites/" in endpoint:
+            suite_id = int(endpoint.rsplit("/", 1)[1])
+            run_id = 200 + (suite_id - 300)
+            sys.stdout.write(json.dumps({
+                "workflow_run": {
+                    "id": run_id,
+                    "workflow_id": 77,
+                    "path": ".github/workflows/ci.yml@main",
+                    "event": "pull_request",
+                    "run_attempt": 1,
+                    "head_sha": head,
+                    "check_suite_id": suite_id,
+                }
+            }))
             return 0
         if "/actions/runs/" in endpoint and "/attempts/" in endpoint:
             run_id = int(endpoint.split("/actions/runs/", 1)[1].split("/", 1)[0])
@@ -272,10 +296,9 @@ def main():
                         "expired": False,
                         "size_in_bytes": 64 * 1024,
                     })
-            sys.stdout.write(json.dumps([{"total_count": len(artifacts), "artifacts": artifacts}]))
+            sys.stdout.write(json.dumps({"total_count": len(artifacts), "artifacts": artifacts}))
             return 0
         if "/actions/artifacts/" in endpoint and endpoint.endswith("/zip"):
-            output = args[args.index("--output") + 1]
             data = control.get("data", {})
             event_sha = data.get("potentialMergeCommit", {}).get("oid", "b" * 40)
             record = {
@@ -295,8 +318,11 @@ def main():
             }
             if isinstance(data.get("snapshot"), dict):
                 record = dict(data["snapshot"])
-            with zipfile.ZipFile(output, "w") as archive:
+            import io
+            payload = io.BytesIO()
+            with zipfile.ZipFile(payload, "w") as archive:
                 archive.writestr("snapshot.json", json.dumps(record))
+            sys.stdout.buffer.write(payload.getvalue())
             return 0
         sys.stderr.write("fake gh: unscripted api endpoint\n")
         return 127
@@ -508,11 +534,14 @@ class CliTestCase(unittest.TestCase):
     def set_gh(self, **overrides):
         issues = overrides.pop("issues", None)
         candidate_config = overrides.pop("candidate_config", None)
+        pr_sequence = overrides.pop("pr_sequence", None)
         control = {"data": overrides}
         if issues is not None:
             control["issues"] = issues
         if candidate_config is not None:
             control["candidate_config"] = candidate_config
+        if pr_sequence is not None:
+            control["pr_sequence"] = pr_sequence
         self._write_json(self.gh_control, control)
 
     def set_gh_issues(self, issues, issue_stderr=None, issue_exit=1):
@@ -1533,6 +1562,20 @@ class CliExitCodeTests(CliTestCase):
 
 
 class StatusCommandTests(CliTestCase):
+    def test_status_final_pr_reread_rejects_sequential_live_change(self):
+        self.set_git()
+        self.set_gh(
+            pr_sequence=[
+                {"headRefOid": COMMIT_A, "body": "before"},
+                {"headRefOid": COMMIT_A, "body": "after"},
+            ],
+            statusCheckRollup=PASSING_ROLLUP,
+        )
+        config = self.write_config()
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(3, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("live PR changed", proc.stderr)
+
     def test_status_read_only_repeated_runs_change_nothing(self):
         self.set_git()
         self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)

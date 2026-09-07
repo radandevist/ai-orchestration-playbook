@@ -5,15 +5,18 @@ import hashlib
 import json
 import os
 import re
+import selectors
+import stat
 import subprocess
 import tempfile
+import time
 import urllib.parse
 import zipfile
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from enum import StrEnum
-from typing import Callable, Mapping, Optional, Sequence, Tuple
+from typing import BinaryIO, Callable, Mapping, Optional, Sequence, Tuple
 
 from pr_closure.contract import COMMIT_ID_PATTERN, REPOSITORY_PATTERN
 from pr_closure.jsonio import StrictJsonError, loads as strict_json_loads
@@ -131,6 +134,8 @@ def _describe_command(argv: Sequence[str]) -> str:
 
 CommandResult = Tuple[int, str, str]
 Runner = Callable[[Sequence[str], Optional[float]], CommandResult]
+BinaryCommandResult = Tuple[int, str]
+ArtifactRunner = Callable[[Sequence[str], Optional[float], BinaryIO, int], BinaryCommandResult]
 
 
 def default_runner(argv: Sequence[str], timeout: Optional[float] = None) -> CommandResult:
@@ -143,6 +148,74 @@ def default_runner(argv: Sequence[str], timeout: Optional[float] = None) -> Comm
         check=False,
     )
     return (proc.returncode, proc.stdout, proc.stderr)
+
+
+def default_artifact_runner(
+    argv: Sequence[str],
+    timeout: Optional[float],
+    output_path: BinaryIO,
+    max_bytes: int,
+) -> BinaryCommandResult:
+    """Stream binary stdout into a bounded caller-owned file without decoding it.
+
+    ``gh api`` follows the REST artifact redirect through its HTTP client. The
+    runner deliberately leaves redirect handling to that supported client path;
+    it only owns bounded byte streaming and process supervision.
+    """
+    process = subprocess.Popen(
+        list(argv),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+        close_fds=True,
+    )
+    selector = selectors.DefaultSelector()
+    assert process.stdout is not None
+    assert process.stderr is not None
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    stderr = bytearray()
+    written = 0
+    deadline = None if timeout is None else time.monotonic() + timeout
+    try:
+        while selector.get_map():
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                process.kill()
+                process.wait()
+                raise subprocess.TimeoutExpired(argv, timeout)
+            ready = selector.select(remaining)
+            if not ready:
+                process.kill()
+                process.wait()
+                raise subprocess.TimeoutExpired(argv, timeout)
+            for key, _ in ready:
+                chunk = key.fileobj.read1(64 * 1024)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                if key.data == "stdout":
+                    written += len(chunk)
+                    if written > max_bytes:
+                        process.kill()
+                        process.wait()
+                        raise SourceMalformed("snapshot archive exceeds the byte limit")
+                    output_path.write(chunk)
+                elif len(stderr) < 64 * 1024:
+                    stderr.extend(chunk[: 64 * 1024 - len(stderr)])
+        if deadline is None:
+            returncode = process.wait()
+        else:
+            returncode = process.wait(timeout=max(0, deadline - time.monotonic()))
+    except (BrokenPipeError, OSError):
+        process.kill()
+        process.wait()
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+    return returncode, stderr.decode("utf-8", errors="replace")
 
 
 def _invoke(argv: Tuple[str, ...], timeout, runner: Runner) -> CommandResult:
@@ -989,28 +1062,55 @@ def _require_nonnegative_int(value, label: str, argv) -> int:
     return value
 
 
-def _flatten_api_pages(data, label: str, argv) -> Tuple[dict, ...]:
-    """Normalize gh api --paginate --slurp output to object pages."""
-    if isinstance(data, dict):
-        return (data,)
-    if not isinstance(data, list) or not data:
-        raise SourceMalformed(
-            "{0} must be a non-empty object/page array for: {1}".format(
-                label, _describe_command(argv)
-            )
-        )
-    if all(isinstance(page, dict) for page in data):
-        return tuple(data)
-    pages = []
-    for page in data:
-        if not isinstance(page, dict):
-            raise SourceMalformed(
-                "{0} page must be an object for: {1}".format(
-                    label, _describe_command(argv)
-                )
-            )
-        pages.append(page)
-    return tuple(pages)
+def _read_explicit_pages(
+    source: "GitHubSource",
+    endpoint: str,
+    item_key: str,
+    item_label: str,
+) -> Tuple[Mapping, ...]:
+    """Read REST pages with only flags supported by gh 2.46.0."""
+    total_count = None
+    seen_ids = set()
+    seen_pages = set()
+    items = []
+    page = 1
+    while total_count is None or len(seen_ids) < total_count:
+        separator = "&" if "?" in endpoint else "?"
+        page_endpoint = "{0}{1}page={2}&per_page=100".format(endpoint, separator, page)
+        argv = ("gh", "api", page_endpoint)
+        data = source._api_json(page_endpoint, label=item_label)
+        raw_items = data.get(item_key)
+        if not isinstance(raw_items, list):
+            raise SourceMalformed("{0} page is malformed".format(item_label))
+        page_total = _require_nonnegative_int(data.get("total_count"), "{0} total_count".format(item_label), argv)
+        if total_count is None:
+            total_count = page_total
+        elif page_total != total_count:
+            raise SourceMalformed("{0} pages disagree on total_count".format(item_label))
+        page_ids = []
+        for item in raw_items:
+            if not isinstance(item, Mapping):
+                raise SourceMalformed("{0} contains a non-object item".format(item_label))
+            item_id = _require_positive_int(item.get("id"), "{0} id".format(item_label), argv)
+            if item_id in seen_ids:
+                raise SourceMalformed("{0} pages contain duplicate ids".format(item_label))
+            seen_ids.add(item_id)
+            page_ids.append(item_id)
+            items.append(item)
+        page_identity = tuple(page_ids)
+        if page_identity in seen_pages:
+            raise SourceMalformed("{0} pagination replayed a page".format(item_label))
+        seen_pages.add(page_identity)
+        if not raw_items:
+            if total_count == len(seen_ids):
+                break
+            raise SourceMalformed("{0} pagination is truncated".format(item_label))
+        if total_count == len(seen_ids):
+            break
+        page += 1
+    if total_count != len(seen_ids):
+        raise SourceMalformed("{0} pagination is truncated or over-counted".format(item_label))
+    return tuple(items)
 
 
 def _parse_actions_run_id(details_url: str, repository: str, argv) -> int:
@@ -1077,6 +1177,7 @@ class GitHubSource:
         runner: Optional[Runner] = None,
         timeout=None,
         artifact_reader: Optional[Callable[[int, str], Mapping]] = None,
+        artifact_runner: Optional[ArtifactRunner] = None,
     ):
         if not isinstance(repository, str) or _REPOSITORY_RE.fullmatch(repository) is None:
             raise SourceMalformed("repository must look like owner/repo: {0!r}".format(repository))
@@ -1087,6 +1188,7 @@ class GitHubSource:
         self._runner = runner or default_runner
         self._timeout = timeout
         self._artifact_reader = artifact_reader
+        self._artifact_runner = artifact_runner or default_artifact_runner
 
     @property
     def repository(self) -> str:
@@ -1180,16 +1282,12 @@ class GitHubSource:
             potential_merge_commit_oid=potential_merge_oid,
         )
 
-    def _api_json(self, endpoint: str, *, paginate: bool = False, label: str = "gh api"):
+    def _api_json(self, endpoint: str, *, label: str = "gh api"):
         argv = ["gh", "api"]
-        if paginate:
-            argv.extend(["--paginate", "--slurp"])
         argv.append(endpoint)
         argv = tuple(argv)
         _, stdout, _ = _invoke(argv, self._timeout, self._runner)
-        return _parse_json_object(stdout, argv, label) if not paginate else _parse_json_value(
-            stdout, argv, label
-        )
+        return _parse_json_object(stdout, argv, label)
 
     def read_candidate_tip_config(
         self,
@@ -1275,6 +1373,18 @@ class GitHubSource:
             raise SourceMalformed("workflow-run attempt identity mismatch")
         return data
 
+    def _check_suite_workflow_run(self, suite_id: int) -> Mapping:
+        endpoint = "repos/{0}/check-suites/{1}".format(self._repository, suite_id)
+        data = self._api_json(endpoint, label="GitHub check-suite API")
+        workflow_run = data.get("workflow_run")
+        if not isinstance(workflow_run, Mapping):
+            raise SourceMalformed("check-suite does not identify a workflow run")
+        if workflow_run.get("check_suite_id") is not None and _require_positive_int(
+            workflow_run.get("check_suite_id"), "workflow check-suite id", ()
+        ) != suite_id:
+            raise SourceMalformed("check-suite/workflow-run identity mismatch")
+        return workflow_run
+
     def _check_run_candidate(
         self,
         raw: Mapping,
@@ -1283,6 +1393,7 @@ class GitHubSource:
         workflow_path: str,
         workflow_action: str,
         workflow_id: Optional[int] = None,
+        central_names: Optional[Sequence[str]] = None,
         workflow_cache: Optional[dict] = None,
     ) -> CheckRunCandidate:
         name = raw.get("name") if isinstance(raw.get("name"), str) else "<malformed>"
@@ -1323,10 +1434,12 @@ class GitHubSource:
                 raise SourceMalformed("candidate check-suite identity is missing")
             suite_id = _require_positive_int(suite.get("id"), "check-suite id", ())
             cache = workflow_cache if workflow_cache is not None else {}
-            workflow = cache.get((run_id, None))
+            workflow = cache.get(("suite", suite_id))
             if workflow is None:
-                workflow = self._workflow_run(run_id)
-                cache[(run_id, None)] = workflow
+                workflow = self._check_suite_workflow_run(suite_id)
+                cache[("suite", suite_id)] = workflow
+            if _require_positive_int(workflow.get("id"), "workflow run id", ()) != run_id:
+                raise SourceMalformed("check-suite/workflow-run identity mismatch")
             base_workflow_id = _require_positive_int(workflow.get("workflow_id"), "workflow id", ())
             actual_workflow_path = _require_non_empty_str(workflow.get("path"), "workflow path", ())
             event = _require_non_empty_str(workflow.get("event"), "workflow event/action", ())
@@ -1344,16 +1457,19 @@ class GitHubSource:
                 raise SourceMalformed("check-suite/workflow-run identity mismatch")
             if _require_positive_int(workflow.get("check_suite_id"), "workflow check-suite id", ()) != suite_id:
                 raise SourceMalformed("check-suite/workflow-run identity mismatch")
-            if workflow_id is not None and base_workflow_id != workflow_id:
+            enforce_central = workflow_id is not None and (
+                central_names is None or name in central_names
+            )
+            if enforce_central and base_workflow_id != workflow_id:
                 raise SourceMalformed("workflow id mismatch")
-            if workflow_id is not None and not _workflow_path_matches(actual_workflow_path, workflow_path):
+            if enforce_central and not _workflow_path_matches(actual_workflow_path, workflow_path):
                 raise SourceMalformed("workflow path mismatch")
-            if workflow_id is not None and event != workflow_action:
+            if enforce_central and event != workflow_action:
                 raise SourceMalformed("workflow event/action mismatch")
             attempt_path = _require_non_empty_str(attempt_workflow.get("path"), "workflow attempt path", ())
-            if workflow_id is not None and not _workflow_path_matches(attempt_path, workflow_path):
+            if enforce_central and not _workflow_path_matches(attempt_path, workflow_path):
                 raise SourceMalformed("workflow attempt path mismatch")
-            if workflow_id is not None and attempt_workflow.get("event") != workflow_action:
+            if enforce_central and attempt_workflow.get("event") != workflow_action:
                 raise SourceMalformed("workflow attempt event/action mismatch")
             outcome = _classify_check("check_run", status, conclusion)
             return CheckRunCandidate(
@@ -1388,114 +1504,41 @@ class GitHubSource:
         workflow_path: str,
         workflow_action: str,
         required_names: Sequence[str] = (),
+        workflow_id: Optional[int] = None,
+        central_names: Optional[Sequence[str]] = None,
     ) -> Tuple[CheckRunCandidate, ...]:
         head_oid = _require_commit(head_oid, "PR head", ())
         endpoint = (
-            "repos/{0}/commits/{1}/check-runs?filter=all&per_page=100".format(
+            "repos/{0}/commits/{1}/check-runs?filter=all".format(
                 self._repository, head_oid
             )
         )
-        argv = (
-            "gh",
-            "api",
-            "--paginate",
-            "--slurp",
-            endpoint,
-        )
-        _, stdout, _ = _invoke(argv, self._timeout, self._runner)
-        pages = _parse_json_value(stdout, argv, "GitHub check-runs API")
-        if isinstance(pages, Mapping):
-            pages = [pages]
-        if not isinstance(pages, list) or not pages:
-            raise SourceMalformed("GitHub check-runs API returned no pages")
         names = set(required_names)
         if not all(isinstance(name, str) and name for name in names):
             raise SourceMalformed("required check names are malformed")
-        total_count = None
-        seen_ids = set()
-        seen_pages = set()
         workflow_cache = {}
         candidates = []
-        for page in pages:
-            if not isinstance(page, Mapping) or not isinstance(page.get("check_runs"), list):
-                raise SourceMalformed("GitHub check-runs API page is malformed")
-            page_total = _require_nonnegative_int(page.get("total_count"), "check-run total_count", argv)
-            if total_count is None:
-                total_count = page_total
-            elif page_total != total_count:
-                raise SourceMalformed("GitHub check-runs pages disagree on total_count")
-            page_ids = tuple(
-                _require_positive_int(raw.get("id"), "check-run id", argv)
-                for raw in page["check_runs"]
-                if isinstance(raw, Mapping)
-            )
-            if page_ids in seen_pages:
-                raise SourceMalformed("GitHub check-runs pagination replayed a page")
-            seen_pages.add(page_ids)
-            for raw in page["check_runs"]:
-                if not isinstance(raw, Mapping):
-                    raise SourceMalformed("GitHub check-runs API contains a non-object candidate")
-                raw_id = _require_positive_int(raw.get("id"), "check-run id", argv)
-                if raw_id in seen_ids:
-                    raise SourceMalformed("GitHub check-runs pages contain duplicate check-run ids")
-                seen_ids.add(raw_id)
-                if names and raw.get("name") not in names:
-                    continue
-                candidates.append(
-                    self._check_run_candidate(
-                        raw,
-                        head_oid=head_oid,
-                        workflow_path=workflow_path,
-                        workflow_action=workflow_action,
-                        workflow_cache=workflow_cache,
-                    )
+        for raw in _read_explicit_pages(self, endpoint, "check_runs", "GitHub check-runs API"):
+            if names and raw.get("name") not in names:
+                continue
+            candidates.append(
+                self._check_run_candidate(
+                    raw,
+                    head_oid=head_oid,
+                    workflow_path=workflow_path,
+                    workflow_action=workflow_action,
+                    workflow_id=workflow_id,
+                    central_names=central_names,
+                    workflow_cache=workflow_cache,
                 )
-        if total_count != len(seen_ids):
-            raise SourceMalformed("GitHub check-runs pagination is truncated or over-counted")
+            )
         return tuple(candidates)
 
     def _read_run_artifacts(self, run_id: int) -> Tuple[Mapping, ...]:
-        endpoint = "repos/{0}/actions/runs/{1}/artifacts?per_page=100".format(
+        endpoint = "repos/{0}/actions/runs/{1}/artifacts".format(
             self._repository, run_id
         )
-        argv = ("gh", "api", "--paginate", "--slurp", endpoint)
-        _, stdout, _ = _invoke(argv, self._timeout, self._runner)
-        pages = _parse_json_value(stdout, argv, "GitHub artifacts API")
-        if isinstance(pages, Mapping):
-            pages = [pages]
-        if not isinstance(pages, list) or not pages:
-            raise SourceMalformed("GitHub artifacts API returned no pages")
-        total_count = None
-        seen_ids = set()
-        seen_pages = set()
-        artifacts = []
-        for page in pages:
-            if not isinstance(page, Mapping) or not isinstance(page.get("artifacts"), list):
-                raise SourceMalformed("GitHub artifacts API page is malformed")
-            page_total = _require_nonnegative_int(page.get("total_count"), "artifact total_count", argv)
-            if total_count is None:
-                total_count = page_total
-            elif page_total != total_count:
-                raise SourceMalformed("GitHub artifact pages disagree on total_count")
-            page_ids = tuple(
-                _require_positive_int(item.get("id"), "artifact id", argv)
-                for item in page["artifacts"]
-                if isinstance(item, Mapping)
-            )
-            if page_ids in seen_pages:
-                raise SourceMalformed("GitHub artifact pagination replayed a page")
-            seen_pages.add(page_ids)
-            for artifact in page["artifacts"]:
-                if not isinstance(artifact, Mapping):
-                    raise SourceMalformed("GitHub artifacts API contains a non-object artifact")
-                artifact_id = _require_positive_int(artifact.get("id"), "artifact id", argv)
-                if artifact_id in seen_ids:
-                    raise SourceMalformed("GitHub artifact pages contain duplicate artifact ids")
-                seen_ids.add(artifact_id)
-                artifacts.append(artifact)
-        if total_count != len(seen_ids):
-            raise SourceMalformed("GitHub artifact pagination is truncated or over-counted")
-        return tuple(artifacts)
+        return _read_explicit_pages(self, endpoint, "artifacts", "GitHub artifacts API")
 
     def _download_snapshot_record(
         self,
@@ -1529,23 +1572,49 @@ class GitHubSource:
                 raise SourceMalformed("snapshot artifact must contain one JSON object")
             return record
         with tempfile.TemporaryDirectory(prefix="pr-closure-artifact-") as directory:
-            output = os.path.join(directory, "snapshot.zip")
+            output = Path(directory) / "snapshot.zip"
             argv = (
                 "gh", "api",
                 "repos/{0}/actions/artifacts/{1}/zip".format(self._repository, artifact_id),
-                "--output", output,
             )
-            _, stdout, _ = _invoke(argv, self._timeout, self._runner)
-            if os.path.lexists(output) and (os.path.islink(output) or not os.path.isfile(output)):
+            try:
+                with output.open("w+b") as output_stream:
+                    result = self._artifact_runner(
+                        argv, self._timeout, output_stream, MAX_SNAPSHOT_ARTIFACT_BYTES
+                    )
+            except (subprocess.TimeoutExpired, TimeoutError) as error:
+                raise SourceUnavailable(
+                    "source command timed out after {0!r}s: {1}".format(
+                        self._timeout, _describe_command(argv)
+                    )
+                ) from error
+            except OSError as error:
+                raise SourceUnavailable(
+                    "cannot run source command {0}: {1}".format(
+                        _describe_command(argv), redact(str(error))
+                    )
+                ) from error
+            if not isinstance(result, tuple) or len(result) != 2:
+                raise SourceMalformed("artifact runner returned an unexpected shape")
+            returncode, stderr = result
+            if not isinstance(returncode, int) or isinstance(returncode, bool) or not isinstance(stderr, str):
+                raise SourceMalformed("artifact runner returned malformed result")
+            if returncode != 0:
+                raise SourceUnavailable(
+                    "source command {0} exited with status {1}; stderr: {2}".format(
+                        _describe_command(argv), returncode, redact(stderr)
+                    )
+                )
+            if output.is_symlink() or (output.exists() and not output.is_file()):
                 raise SourceMalformed("snapshot archive is not a regular file")
-            if os.path.isfile(output):
-                archive_size = os.path.getsize(output)
-                if expected_size and archive_size > expected_size:
+            if output.is_file():
+                archive_size = output.stat().st_size
+                if archive_size > expected_size:
                     raise SourceMalformed("snapshot archive exceeds its validated metadata size")
                 if archive_size > MAX_SNAPSHOT_ARTIFACT_BYTES:
                     raise SourceMalformed("snapshot archive exceeds the byte limit")
                 if expected_digest is not None:
-                    digest = "sha256:" + hashlib.sha256(Path(output).read_bytes()).hexdigest()
+                    digest = "sha256:" + hashlib.sha256(output.read_bytes()).hexdigest()
                     if digest != expected_digest:
                         raise SourceMalformed("snapshot artifact digest mismatch")
                 try:
@@ -1557,7 +1626,12 @@ class GitHubSource:
                         member_name = member.filename
                         member_path = Path(member_name)
                         mode = (member.external_attr >> 16) & 0o170000
-                        if mode == 0o120000 or member.is_dir() or member_path.is_absolute() or ".." in member_path.parts:
+                        if (
+                            (mode and not stat.S_ISREG(mode))
+                            or member.is_dir()
+                            or member_path.is_absolute()
+                            or ".." in member_path.parts
+                        ):
                             raise SourceMalformed("snapshot archive contains an unsafe path")
                         if member.file_size > MAX_SNAPSHOT_ARTIFACT_BYTES:
                             raise SourceMalformed("snapshot archive file exceeds the byte limit")
@@ -1567,36 +1641,7 @@ class GitHubSource:
                 if not isinstance(record, Mapping):
                     raise SourceMalformed("snapshot artifact must contain one JSON object")
                 return record
-            files = []
-            for root, _dirs, names in os.walk(directory):
-                for name in names:
-                    path = os.path.join(root, name)
-                    if os.path.islink(path) or not os.path.isfile(path):
-                        raise SourceMalformed("snapshot artifact contains a symlink or non-regular file")
-                    if os.path.realpath(path) != os.path.abspath(path):
-                        raise SourceMalformed("snapshot artifact path escapes its download directory")
-                    if os.path.getsize(path) > MAX_SNAPSHOT_ARTIFACT_BYTES:
-                        raise SourceMalformed("snapshot artifact file exceeds the byte limit")
-                    if os.path.basename(path) != os.path.basename(output):
-                        files.append(path)
-            if not files and not os.path.exists(output) and stdout.strip().startswith("{"):
-                try:
-                    record = strict_json_loads(stdout, "snapshot artifact")
-                except StrictJsonError as error:
-                    raise SourceMalformed("snapshot artifact contains malformed JSON") from error
-                if not isinstance(record, Mapping):
-                    raise SourceMalformed("snapshot artifact must contain one JSON object")
-                return record
-            if len(files) != 1:
-                raise SourceMalformed("snapshot artifact must contain exactly one file")
-            try:
-                raw = Path(files[0]).read_bytes()
-                record = strict_json_loads(raw, "snapshot artifact")
-            except (OSError, UnicodeDecodeError, StrictJsonError) as error:
-                raise SourceMalformed("snapshot artifact contains malformed JSON") from error
-            if not isinstance(record, Mapping):
-                raise SourceMalformed("snapshot artifact must contain one JSON object")
-            return record
+            raise SourceMalformed("snapshot artifact download did not produce an archive")
 
     def _read_snapshot(self, run_id: int, run_attempt: int) -> LivePrSnapshot:
         name = "ci-pr-snapshot-{0}-{1}".format(run_id, run_attempt)
@@ -1704,13 +1749,15 @@ class GitHubSource:
         workflow_path: str,
         workflow_action: str,
     ) -> CiFacts:
+        central_workflow_id = self._workflow_id(workflow_path) if live_checks else None
         candidates = self.read_check_run_candidates(
             pr.head_oid,
             workflow_path=workflow_path,
             workflow_action=workflow_action,
             required_names=required_checks,
+            workflow_id=central_workflow_id,
+            central_names=live_checks,
         )
-        central_workflow_id = self._workflow_id(workflow_path) if live_checks else None
         facts = select_check_run_candidates(
             candidates,
             required_checks,

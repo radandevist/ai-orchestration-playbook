@@ -150,7 +150,37 @@ class RecordingRunner:
     def __call__(self, argv, timeout=None):
         self.calls.append(tuple(argv))
         key = " ".join(argv)
-        entry = self.responses.get(key, (127, "", "no scripted response for: {0}".format(key)))
+        entry = self.responses.get(key)
+        if entry is None and len(argv) == 3 and ("&page=" in argv[-1] or "?page=" in argv[-1]):
+            endpoint = argv[-1]
+            separator = "&page=" if "&page=" in endpoint else "?page="
+            stem, page_text = endpoint.split(separator, 1)
+            page_text = page_text.split("&", 1)[0]
+            old_endpoint = stem + ("&" if "?" in stem else "?") + "per_page=100"
+            legacy = "gh api --paginate --slurp " + old_endpoint
+            entry = self.responses.get(legacy)
+            if entry is not None and isinstance(entry[1], str):
+                pages = json.loads(entry[1])
+                if isinstance(pages, list):
+                    page = int(page_text) - 1
+                    item_key = "artifacts" if "/artifacts" in endpoint else "check_runs"
+                    empty = {"total_count": pages[0].get("total_count", 0), item_key: []}
+                    entry = (0, json.dumps(pages[page]) if page < len(pages) else json.dumps(empty), entry[2])
+        if entry is None and "/check-suites/" in key:
+            suite_id = int(key.rsplit("/", 1)[1])
+            for candidate_key, candidate_entry in self.responses.items():
+                if "/actions/runs/" not in candidate_key or "/attempts/" in candidate_key or "/artifacts" in candidate_key:
+                    continue
+                if isinstance(candidate_entry, tuple) and len(candidate_entry) == 3:
+                    try:
+                        workflow = json.loads(candidate_entry[1])
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(workflow, dict) and workflow.get("check_suite_id") == suite_id:
+                        entry = (0, json.dumps({"workflow_run": workflow}), "")
+                        break
+        if entry is None:
+            entry = (127, "", "no scripted response for: {0}".format(key))
         if callable(entry):
             return entry(argv, timeout)
         if isinstance(entry, BaseException):
