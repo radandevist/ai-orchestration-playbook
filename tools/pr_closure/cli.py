@@ -369,7 +369,7 @@ def _status_snapshot(
     store = RunStore(config.closure_state_dir, config.project, pr_number)
     _github, pr, git = _resolve_pr_sources(config, pr_number)
     facts = git.facts()
-    events = store.read_events()
+    events = store._read_authoritative_events()
     adopted_policy = store.current_policy_adoption(config.repository)
     policy_adoption_valid = True
     policy_adoption_reason = None
