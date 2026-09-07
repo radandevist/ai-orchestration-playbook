@@ -63,4 +63,3 @@ is bypassed.
 Update `PLAYBOOK.md`, `README.md`, and the PublyApp rollout/design plan language so that owner-
 mandated Sol-only adversarial reviews at high/xhigh are explicit, the versioned registry is the
 project policy floor, and event adoption is audit/migration evidence rather than the sole latch.
-
