@@ -27,6 +27,9 @@ _REPOSITORY_RE = re.compile(REPOSITORY_PATTERN)
 _NON_BLANK_RE = re.compile(r"\S")
 _WHITESPACE_RE = re.compile(r"\s")
 MAX_SNAPSHOT_ARTIFACT_BYTES = 64 * 1024
+MAX_COLLECTION_ITEMS = 1000
+MAX_COLLECTION_PAGES = 10
+MAX_RUN_ATTEMPTS = 20
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -676,6 +679,7 @@ class CheckRunCandidate:
     result: Optional[CheckResult]
     name: Optional[str] = None
     error: Optional[str] = None
+    authoritative: bool = True
 
     def __post_init__(self):
         if self.name is None and self.result is not None:
@@ -803,8 +807,11 @@ def select_check_run_candidates(
     reasons = []
     for name in tuple(required_checks):
         matching = [candidate for candidate in candidates if candidate.name == name]
+        matching = [candidate for candidate in matching if candidate.authoritative]
         if not matching:
-            reasons.append("required check {0} missing".format(name))
+            reasons.append(
+                "required check {0} missing from current workflow attempt".format(name)
+            )
             continue
         malformed = [candidate.error for candidate in matching if candidate.error]
         if malformed:
@@ -1075,6 +1082,12 @@ def _read_explicit_pages(
     items = []
     page = 1
     while total_count is None or len(seen_ids) < total_count:
+        if page > MAX_COLLECTION_PAGES:
+            raise SourceMalformed(
+                "{0} requires more than {1} pages".format(
+                    item_label, MAX_COLLECTION_PAGES
+                )
+            )
         separator = "&" if "?" in endpoint else "?"
         page_endpoint = "{0}{1}page={2}&per_page=100".format(endpoint, separator, page)
         argv = ("gh", "api", page_endpoint)
@@ -1083,6 +1096,18 @@ def _read_explicit_pages(
         if not isinstance(raw_items, list):
             raise SourceMalformed("{0} page is malformed".format(item_label))
         page_total = _require_nonnegative_int(data.get("total_count"), "{0} total_count".format(item_label), argv)
+        if page_total > MAX_COLLECTION_ITEMS:
+            raise SourceMalformed(
+                "{0} total_count exceeds {1} items".format(
+                    item_label, MAX_COLLECTION_ITEMS
+                )
+            )
+        if len(raw_items) > MAX_COLLECTION_ITEMS or len(items) + len(raw_items) > MAX_COLLECTION_ITEMS:
+            raise SourceMalformed(
+                "{0} collection exceeds {1} items".format(
+                    item_label, MAX_COLLECTION_ITEMS
+                )
+            )
         if total_count is None:
             total_count = page_total
         elif page_total != total_count:
@@ -1122,6 +1147,7 @@ def _parse_actions_run_id(details_url: str, repository: str, argv) -> int:
         )
     try:
         parsed = urllib.parse.urlsplit(details_url)
+        port = parsed.port
     except ValueError as error:
         raise SourceMalformed(
             "check-run details_url is malformed for: {0}".format(_describe_command(argv))
@@ -1130,6 +1156,7 @@ def _parse_actions_run_id(details_url: str, repository: str, argv) -> int:
     if (
         parsed.scheme != "https"
         or parsed.hostname != "github.com"
+        or (port is not None and port != 443)
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
@@ -1149,7 +1176,16 @@ def _parse_actions_run_id(details_url: str, repository: str, argv) -> int:
                 _describe_command(argv)
             )
         )
-    return _require_positive_int(int(match.group(1)), "workflow run id", argv)
+    try:
+        run_id = _require_positive_int(int(match.group(1)), "workflow run id", argv)
+        _require_positive_int(int(match.group(2)), "workflow job id", argv)
+    except (OverflowError, ValueError) as error:
+        raise SourceMalformed(
+            "check-run details_url carries an unrepresentable Actions run/job id for: {0}".format(
+                _describe_command(argv)
+            )
+        ) from error
+    return run_id
 
 
 def _workflow_path_matches(actual: object, configured: str) -> bool:
@@ -1159,6 +1195,50 @@ def _workflow_path_matches(actual: object, configured: str) -> bool:
         return False
     ref = actual[len(configured) + 1:]
     return bool(ref) and not any(char.isspace() or ord(char) < 32 for char in ref)
+
+
+def _normalize_workflow_path(value: object, label: str) -> str:
+    path = _require_non_empty_str(value, label, ())
+    if "@" not in path:
+        return path
+    workflow_path, ref = path.split("@", 1)
+    if not workflow_path or not ref or any(char.isspace() or ord(char) < 32 for char in ref):
+        raise SourceMalformed("{0} is not a qualified workflow path".format(label))
+    return workflow_path + "@" + ref
+
+
+def _validate_current_attempt(
+    current_workflow: Mapping,
+    current_attempt: Mapping,
+    run_id: int,
+    run_attempt: int,
+) -> None:
+    if _require_positive_int(current_workflow.get("id"), "workflow run id", ()) != run_id:
+        raise SourceMalformed("current workflow run identity mismatch")
+    if _require_positive_int(current_attempt.get("id"), "workflow attempt run id", ()) != run_id:
+        raise SourceMalformed("current workflow attempt run id mismatch")
+    if _require_positive_int(current_attempt.get("run_attempt"), "workflow attempt number", ()) != run_attempt:
+        raise SourceMalformed("current workflow attempt number mismatch")
+    for key, label in (
+        ("workflow_id", "workflow id"),
+        ("check_suite_id", "workflow check-suite id"),
+    ):
+        if _require_positive_int(current_attempt.get(key), label, ()) != _require_positive_int(
+            current_workflow.get(key), label, ()
+        ):
+            raise SourceMalformed("current workflow attempt {0} mismatch".format(key))
+    if _require_commit(current_attempt.get("head_sha"), "workflow attempt head_sha", ()) != _require_commit(
+        current_workflow.get("head_sha"), "workflow-run head_sha", ()
+    ):
+        raise SourceMalformed("current workflow attempt head mismatch")
+    if _normalize_workflow_path(current_attempt.get("path"), "workflow attempt path") != _normalize_workflow_path(
+        current_workflow.get("path"), "workflow path"
+    ):
+        raise SourceMalformed("current workflow attempt path mismatch")
+    if _require_non_empty_str(current_attempt.get("event"), "workflow attempt event", ()) != _require_non_empty_str(
+        current_workflow.get("event"), "workflow event", ()
+    ):
+        raise SourceMalformed("current workflow attempt event mismatch")
 
 
 class GitHubSource:
@@ -1397,6 +1477,7 @@ class GitHubSource:
         workflow_cache: Optional[dict] = None,
     ) -> CheckRunCandidate:
         name = raw.get("name") if isinstance(raw.get("name"), str) else "<malformed>"
+        authoritative = False
         try:
             check_id = _require_positive_int(raw.get("id"), "check-run id", ())
             run_head = _require_commit(raw.get("head_sha"), "check-run head_sha", ())
@@ -1445,6 +1526,10 @@ class GitHubSource:
             if run_head != head_oid or workflow_head != head_oid:
                 raise SourceMalformed("workflow/check candidate head does not match PR head")
             run_attempt = _require_positive_int(workflow.get("run_attempt"), "run attempt", ())
+            if run_attempt > MAX_RUN_ATTEMPTS:
+                raise SourceMalformed(
+                    "run attempt exceeds {0}".format(MAX_RUN_ATTEMPTS)
+                )
             attempts = []
             for attempt_number in range(1, run_attempt + 1):
                 attempt_workflow = cache.get((run_id, attempt_number))
@@ -1453,18 +1538,13 @@ class GitHubSource:
                     cache[(run_id, attempt_number)] = attempt_workflow
                 attempts.append(attempt_workflow)
             current_attempt = attempts[-1]
-            if _require_positive_int(
+            current_suite_id = _require_positive_int(
                 current_attempt.get("check_suite_id"),
                 "current workflow check-suite id",
                 (),
-            ) != _require_positive_int(
-                workflow.get("check_suite_id"),
-                "workflow check-suite id",
-                (),
-            ):
-                raise SourceMalformed(
-                    "current workflow attempt does not match current workflow run"
-                )
+            )
+            authoritative = current_suite_id == suite_id
+            _validate_current_attempt(workflow, current_attempt, run_id, run_attempt)
             matching_attempts = [
                 attempt_workflow
                 for attempt_workflow in attempts
@@ -1482,6 +1562,7 @@ class GitHubSource:
             selected_attempt = _require_positive_int(
                 attempt_workflow.get("run_attempt"), "workflow attempt number", ()
             )
+            authoritative = selected_attempt == run_attempt
             if _require_positive_int(attempt_workflow.get("workflow_id"), "workflow id", ()) != base_workflow_id:
                 raise SourceMalformed("workflow attempt id mismatch")
             if _require_positive_int(attempt_workflow.get("check_suite_id"), "workflow check-suite id", ()) != suite_id:
@@ -1525,10 +1606,16 @@ class GitHubSource:
                     workflow_action=event,
                     workflow_event=event,
                     run_attempt=selected_attempt,
-                )
+                ),
+                authoritative=authoritative,
             )
         except (SourceMalformed, TypeError, ValueError) as error:
-            return CheckRunCandidate(result=None, name=name, error=str(error))
+            return CheckRunCandidate(
+                result=None,
+                name=name,
+                error=str(error),
+                authoritative=authoritative,
+            )
 
     def read_check_run_candidates(
         self,
