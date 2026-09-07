@@ -16,6 +16,7 @@ from pr_closure.sources import (
     GitHubSource,
     PullRequestFacts,
     SourceMalformed,
+    SourceUnavailable,
     _parse_json_object,
 )
 from pr_closure.cli import _assert_git_binding_unchanged, _assert_live_pr_unchanged
@@ -51,19 +52,15 @@ class Runner:
                     item_key = "artifacts" if "/artifacts" in endpoint else "check_runs"
                     empty = {"total_count": pages[0].get("total_count", 0), item_key: []}
                     entry = (0, json.dumps(pages[page]) if page < len(pages) else json.dumps(empty), entry[2])
-        if entry is None and "/check-suites/" in key:
-            suite_id = int(key.rsplit("/", 1)[1])
+        if entry is None and "/actions/runs/" in key and "/attempts/" not in key and "/artifacts" not in key:
+            run_id = key.rsplit("/actions/runs/", 1)[1]
+            attempt_entries = []
             for candidate_key, candidate_entry in self.responses.items():
-                if "/actions/runs/" not in candidate_key or "/attempts/" in candidate_key or "/artifacts" in candidate_key:
-                    continue
-                if isinstance(candidate_entry, tuple) and len(candidate_entry) == 3:
-                    try:
-                        workflow = json.loads(candidate_entry[1])
-                    except (TypeError, ValueError):
-                        continue
-                    if isinstance(workflow, dict) and workflow.get("check_suite_id") == suite_id:
-                        entry = (0, json.dumps({"workflow_run": workflow}), "")
-                        break
+                prefix = "gh api repos/owner/repo/actions/runs/{0}/attempts/".format(run_id)
+                if candidate_key.startswith(prefix) and isinstance(candidate_entry, tuple):
+                    attempt_entries.append((int(candidate_key.rsplit("/", 1)[1]), candidate_entry))
+            if attempt_entries:
+                entry = max(attempt_entries, key=lambda item: item[0])[1]
         return entry or (127, "", "unscripted")
 
 
@@ -135,8 +132,8 @@ class LivePrFixTests(unittest.TestCase):
         check_key = "gh api --paginate --slurp repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all&per_page=100"
         responses = {
             check_key: (0, json.dumps([{"total_count": len(raw_checks), "check_runs": raw_checks}]), ""),
-            "gh api repos/owner/repo/actions/workflows?per_page=100": (
-                0, json.dumps({"total_count": 1, "workflows": [{"id": 77, "path": ".github/workflows/ci.yml"}]}), ""
+            "gh api repos/owner/repo/actions/workflows/ci.yml": (
+                0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), ""
             ),
         }
         for raw in raw_checks:
@@ -157,13 +154,222 @@ class LivePrFixTests(unittest.TestCase):
 
     def test_api_uses_documented_gh_argv_and_qualified_workflow_path(self):
         workflow_list = (
-            "gh api repos/owner/repo/actions/workflows?per_page=100",
-            (0, json.dumps({"total_count": 1, "workflows": [{"id": 77, "path": ".github/workflows/ci.yml"}]}), ""),
+            "gh api repos/owner/repo/actions/workflows/ci.yml",
+            (0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), ""),
         )
         runner = Runner(dict([workflow_list]))
         source = GitHubSource("owner/repo", 42, runner=runner)
         self.assertEqual(77, source._workflow_id(".github/workflows/ci.yml"))
         self.assertNotIn("--repo", runner.calls[0])
+
+    def test_workflow_direct_endpoint_rejects_returned_path_mismatch(self):
+        runner = Runner({
+            "gh api repos/owner/repo/actions/workflows/ci.yml": (
+                0, json.dumps({"id": 77, "path": ".github/workflows/other.yml"}), ""
+            ),
+        })
+        with self.assertRaises((SourceMalformed, SourceUnavailable)) as caught:
+            GitHubSource("owner/repo", 42, runner=runner)._workflow_id(
+                ".github/workflows/ci.yml"
+            )
+        self.assertIsInstance(caught.exception, SourceMalformed)
+
+    def test_workflow_direct_endpoint_rejects_page_one_when_total_count_exceeds_page(self):
+        runner = Runner({
+            "gh api repos/owner/repo/actions/workflows/ci.yml": (
+                0, json.dumps({"id": 77, "path": ".github/workflows/other.yml"}), ""
+            ),
+            "gh api repos/owner/repo/actions/workflows?page=1&per_page=100": (
+                0,
+                json.dumps({
+                    "total_count": 101,
+                    "workflows": [{"id": 77, "path": ".github/workflows/ci.yml"}],
+                }),
+                "",
+            ),
+        })
+        with self.assertRaises((SourceMalformed, SourceUnavailable)) as caught:
+            GitHubSource("owner/repo", 42, runner=runner)._workflow_id(
+                ".github/workflows/ci.yml"
+            )
+        self.assertIsInstance(caught.exception, SourceMalformed)
+        self.assertEqual(
+            ["repos/owner/repo/actions/workflows/ci.yml"],
+            [call[-1] for call in runner.calls],
+        )
+
+    def test_workflow_direct_endpoint_rejects_non_numeric_id(self):
+        runner = Runner({
+            "gh api repos/owner/repo/actions/workflows/ci.yml": (
+                0, json.dumps({"id": "77", "path": ".github/workflows/ci.yml"}), ""
+            ),
+        })
+        with self.assertRaises((SourceMalformed, SourceUnavailable)) as caught:
+            GitHubSource("owner/repo", 42, runner=runner)._workflow_id(
+                ".github/workflows/ci.yml"
+            )
+        self.assertIsInstance(caught.exception, SourceMalformed)
+
+    def test_provider_faithful_workflow_run_attempt_resolves_exact_check_suite(self):
+        endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
+        candidate = check("ci-final-gate", suite_id=301)
+        responses = {
+            "gh api " + endpoint + "&page=1&per_page=100": (
+                0, json.dumps({"total_count": 1, "check_runs": [candidate]}), ""
+            ),
+            "gh api repos/owner/repo/actions/runs/201": (
+                0, json.dumps(run(attempt=2, suite_id=302)), ""
+            ),
+            "gh api repos/owner/repo/actions/runs/201/attempts/1": (
+                0, json.dumps(run(attempt=1, suite_id=301)), ""
+            ),
+            "gh api repos/owner/repo/actions/runs/201/attempts/2": (
+                0, json.dumps(run(attempt=2, suite_id=302)), ""
+            ),
+        }
+        candidates = GitHubSource("owner/repo", 42, runner=Runner(responses)).read_check_run_candidates(
+            HEAD_A,
+            workflow_path=".github/workflows/ci.yml",
+            workflow_action="pull_request",
+            required_names=("ci-final-gate",),
+        )
+        self.assertEqual(1, len(candidates))
+        self.assertIsNotNone(candidates[0].result)
+        self.assertEqual(1, candidates[0].result.run_attempt)
+
+    def test_provider_faithful_workflow_run_attempt_rejects_zero_or_multiple_suite_matches(self):
+        endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
+        for suite_ids in ((999, 302), (301, 301)):
+            with self.subTest(suite_ids=suite_ids):
+                candidate = check("ci-final-gate", suite_id=301)
+                responses = {
+                    "gh api " + endpoint + "&page=1&per_page=100": (
+                        0, json.dumps({"total_count": 1, "check_runs": [candidate]}), ""
+                    ),
+                    "gh api repos/owner/repo/actions/runs/201": (
+                        0, json.dumps(run(attempt=2, suite_id=suite_ids[1])), ""
+                    ),
+                    "gh api repos/owner/repo/actions/runs/201/attempts/1": (
+                        0, json.dumps(run(attempt=1, suite_id=suite_ids[0])), ""
+                    ),
+                    "gh api repos/owner/repo/actions/runs/201/attempts/2": (
+                        0, json.dumps(run(attempt=2, suite_id=suite_ids[1])), ""
+                    ),
+                }
+                candidates = GitHubSource("owner/repo", 42, runner=Runner(responses)).read_check_run_candidates(
+                    HEAD_A,
+                    workflow_path=".github/workflows/ci.yml",
+                    workflow_action="pull_request",
+                    required_names=("ci-final-gate",),
+                )
+                self.assertIsNone(candidates[0].result)
+                self.assertIn("check-suite", candidates[0].error)
+
+    def test_provider_faithful_current_run_suite_must_match_current_attempt(self):
+        endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
+        candidate = check("ci-final-gate", suite_id=301)
+        responses = {
+            "gh api " + endpoint + "&page=1&per_page=100": (
+                0, json.dumps({"total_count": 1, "check_runs": [candidate]}), ""
+            ),
+            "gh api repos/owner/repo/actions/runs/201": (
+                0, json.dumps(run(attempt=2, suite_id=999)), ""
+            ),
+            "gh api repos/owner/repo/actions/runs/201/attempts/1": (
+                0, json.dumps(run(attempt=1, suite_id=301)), ""
+            ),
+            "gh api repos/owner/repo/actions/runs/201/attempts/2": (
+                0, json.dumps(run(attempt=2, suite_id=302)), ""
+            ),
+        }
+        candidates = GitHubSource("owner/repo", 42, runner=Runner(responses)).read_check_run_candidates(
+            HEAD_A,
+            workflow_path=".github/workflows/ci.yml",
+            workflow_action="pull_request",
+            required_names=("ci-final-gate",),
+        )
+        self.assertIsNone(candidates[0].result)
+        self.assertIn("current workflow attempt", candidates[0].error)
+
+    def test_attempt_head_sha_must_bind_to_pr_head(self):
+        endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
+        candidate = check("ci-final-gate", suite_id=301)
+        attempt = run(attempt=1, suite_id=301)
+        attempt["head_sha"] = HEAD_B
+        responses = {
+            "gh api " + endpoint + "&page=1&per_page=100": (
+                0, json.dumps({"total_count": 1, "check_runs": [candidate]}), ""
+            ),
+            "gh api repos/owner/repo/actions/runs/201": (
+                0, json.dumps(run(attempt=1, suite_id=301)), ""
+            ),
+            "gh api repos/owner/repo/actions/runs/201/attempts/1": (
+                0, json.dumps(attempt), ""
+            ),
+        }
+        candidates = GitHubSource("owner/repo", 42, runner=Runner(responses)).read_check_run_candidates(
+            HEAD_A,
+            workflow_path=".github/workflows/ci.yml",
+            workflow_action="pull_request",
+            required_names=("ci-final-gate",),
+        )
+        self.assertIsNone(candidates[0].result)
+        self.assertIn("attempt head", candidates[0].error)
+
+    def test_details_url_requires_expected_repo_and_exact_actions_job_shape(self):
+        endpoint = "repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all"
+        for details_url in (
+            "https://github.com/other/repo/actions/runs/201/job/9",
+            "https://github.com/owner/repo/actions/runs/201",
+            "https://github.com/owner/repo/actions/runs/201/jobs/9",
+            "https://github.com/owner/repo/actions/runs/0/job/9",
+        ):
+            with self.subTest(details_url=details_url):
+                candidate = check("ci-final-gate", suite_id=301)
+                candidate["details_url"] = details_url
+                runner = Runner({
+                    "gh api " + endpoint + "&page=1&per_page=100": (
+                        0, json.dumps({"total_count": 1, "check_runs": [candidate]}), ""
+                    ),
+                })
+                candidates = GitHubSource("owner/repo", 42, runner=runner).read_check_run_candidates(
+                    HEAD_A,
+                    workflow_path=".github/workflows/ci.yml",
+                    workflow_action="pull_request",
+                    required_names=("ci-final-gate",),
+                )
+                self.assertIsNone(candidates[0].result)
+                self.assertTrue(
+                    "details_url" in candidates[0].error
+                    or "workflow run id" in candidates[0].error
+                )
+
+    def test_artifact_expired_requires_exact_false_boolean(self):
+        source = GitHubSource(
+            "owner/repo", 42, runner=Runner({}), artifact_reader=lambda *_: snapshot()
+        )
+        for expired in (None, True, "false", 0, 1):
+            with self.subTest(expired=expired):
+                metadata = {
+                    "id": 501,
+                    "name": "ci-pr-snapshot-201-1",
+                    "size_in_bytes": 256,
+                }
+                if expired is not None:
+                    metadata["expired"] = expired
+                source._read_run_artifacts = lambda _run_id, metadata=metadata: (metadata,)
+                with self.assertRaises(SourceMalformed):
+                    source._read_snapshot(201, 1)
+
+        source._read_run_artifacts = lambda _run_id: ({
+            "id": 501,
+            "name": "ci-pr-snapshot-201-1",
+            "expired": False,
+            "size_in_bytes": 256,
+        },)
+        record = source._read_snapshot(201, 1)
+        self.assertEqual(42, record.pr_number)
+        self.assertEqual(1, record.run_attempt)
 
     def test_real_gh_help_has_only_supported_pagination_flags(self):
         result = subprocess.run(
@@ -183,8 +389,8 @@ class LivePrFixTests(unittest.TestCase):
         responses = {
             page_one: (0, json.dumps({"total_count": 2, "check_runs": [raw_one]}), ""),
             page_two: (0, json.dumps({"total_count": 2, "check_runs": [raw_two]}), ""),
-            "gh api repos/owner/repo/check-suites/301": (
-                0, json.dumps({"workflow_run": run(attempt=1, suite_id=301)}), ""
+            "gh api repos/owner/repo/actions/runs/201": (
+                0, json.dumps(run(attempt=1, suite_id=301)), ""
             ),
             "gh api repos/owner/repo/actions/runs/201/attempts/1": (
                 0, json.dumps(run(attempt=1, suite_id=301)), ""
@@ -246,11 +452,8 @@ class LivePrFixTests(unittest.TestCase):
             "gh api " + endpoint + "&page=1&per_page=100": (
                 0, json.dumps({"total_count": 2, "check_runs": [old, current]}), ""
             ),
-            "gh api repos/owner/repo/check-suites/301": (
-                0, json.dumps({"workflow_run": run(attempt=1, suite_id=301)}), ""
-            ),
-            "gh api repos/owner/repo/check-suites/302": (
-                0, json.dumps({"workflow_run": run(attempt=2, suite_id=302)}), ""
+            "gh api repos/owner/repo/actions/runs/201": (
+                0, json.dumps(run(attempt=2, suite_id=302)), ""
             ),
             "gh api repos/owner/repo/actions/runs/201/attempts/1": (
                 0, json.dumps(run(attempt=1, suite_id=301)), ""
@@ -281,17 +484,14 @@ class LivePrFixTests(unittest.TestCase):
                 current["status"] = status
                 current["conclusion"] = conclusion
                 responses = {
-                    "gh api repos/owner/repo/actions/workflows?per_page=100": (
-                        0, json.dumps({"total_count": 1, "workflows": [{"id": 77, "path": ".github/workflows/ci.yml"}]}), ""
+                    "gh api repos/owner/repo/actions/workflows/ci.yml": (
+                        0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), ""
                     ),
                     "gh api " + endpoint + "&page=1&per_page=100": (
                         0, json.dumps({"total_count": 2, "check_runs": [old, current]}), ""
                     ),
-                    "gh api repos/owner/repo/check-suites/301": (
-                        0, json.dumps({"workflow_run": run(attempt=1, suite_id=301)}), ""
-                    ),
-                    "gh api repos/owner/repo/check-suites/302": (
-                        0, json.dumps({"workflow_run": run(attempt=2, suite_id=302)}), ""
+                    "gh api repos/owner/repo/actions/runs/201": (
+                        0, json.dumps(run(attempt=2, suite_id=302)), ""
                     ),
                     "gh api repos/owner/repo/actions/runs/201/attempts/1": (
                         0, json.dumps(run(attempt=1, suite_id=301)), ""
@@ -329,8 +529,8 @@ class LivePrFixTests(unittest.TestCase):
             "gh api " + endpoint + "&page=1&per_page=100": (
                 0, json.dumps({"total_count": 2, "check_runs": [first, second]}), ""
             ),
-            "gh api repos/owner/repo/check-suites/301": (
-                0, json.dumps({"workflow_run": run(attempt=1, suite_id=301)}), ""
+            "gh api repos/owner/repo/actions/runs/201": (
+                0, json.dumps(run(attempt=1, suite_id=301)), ""
             ),
             "gh api repos/owner/repo/actions/runs/201/attempts/1": (
                 0, json.dumps(run(attempt=1, suite_id=301)), ""
@@ -345,7 +545,7 @@ class LivePrFixTests(unittest.TestCase):
         )
         self.assertEqual(
             1,
-            sum(call[-1] == "repos/owner/repo/check-suites/301" for call in runner.calls),
+            sum(call[-1] == "repos/owner/repo/actions/runs/201" for call in runner.calls),
         )
         self.assertEqual(
             1,
@@ -359,14 +559,14 @@ class LivePrFixTests(unittest.TestCase):
         workflow = run(suite_id=301)
         workflow["head_sha"] = HEAD_B
         responses = {
-            "gh api repos/owner/repo/actions/workflows?per_page=100": (
-                0, json.dumps({"total_count": 1, "workflows": [{"id": 77, "path": ".github/workflows/ci.yml"}]}), ""
+            "gh api repos/owner/repo/actions/workflows/ci.yml": (
+                0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), ""
             ),
             "gh api " + endpoint + "&page=1&per_page=100": (
                 0, json.dumps({"total_count": 1, "check_runs": [raw]}), ""
             ),
-            "gh api repos/owner/repo/check-suites/301": (
-                0, json.dumps({"workflow_run": workflow}), ""
+            "gh api repos/owner/repo/actions/runs/201": (
+                0, json.dumps(workflow), ""
             ),
             "gh api repos/owner/repo/actions/runs/201/attempts/1": (
                 0, json.dumps(workflow), ""
@@ -402,8 +602,8 @@ class LivePrFixTests(unittest.TestCase):
         foreign = check("ci-final-gate", check_id=101, run_id=201, suite_id=301, start="2026-09-07T10:00:00Z")
         central = check("ci-final-gate", check_id=102, run_id=202, suite_id=302, start="2026-09-07T11:00:00Z")
         responses = {
-            "gh api repos/owner/repo/actions/workflows?per_page=100": (
-                0, json.dumps({"total_count": 1, "workflows": [{"id": 77, "path": ".github/workflows/ci.yml"}]}), ""
+            "gh api repos/owner/repo/actions/workflows/ci.yml": (
+                0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), ""
             ),
             "gh api " + endpoint + "&page=1&per_page=100": (
                 0, json.dumps({"total_count": 2, "check_runs": [foreign, central]}), ""
@@ -416,8 +616,8 @@ class LivePrFixTests(unittest.TestCase):
             run_id = int(item["details_url"].split("/runs/")[1].split("/", 1)[0])
             workflow = run(run_id, suite_id=suite, attempt=attempt, path=path)
             workflow["workflow_id"] = workflow_id
-            responses[f"gh api repos/owner/repo/check-suites/{suite}"] = (
-                0, json.dumps({"workflow_run": workflow}), ""
+            responses[f"gh api repos/owner/repo/actions/runs/{run_id}"] = (
+                0, json.dumps(workflow), ""
             )
             responses[f"gh api repos/owner/repo/actions/runs/{run_id}/attempts/{attempt}"] = (
                 0, json.dumps(workflow), ""
@@ -438,8 +638,8 @@ class LivePrFixTests(unittest.TestCase):
         central = check("ci-final-gate", check_id=101, run_id=201, suite_id=301, start="2026-09-07T10:00:00Z")
         foreign = check("ci-final-gate", check_id=102, run_id=202, suite_id=302, start="2026-09-07T11:00:00Z")
         responses = {
-            "gh api repos/owner/repo/actions/workflows?per_page=100": (
-                0, json.dumps({"total_count": 1, "workflows": [{"id": 77, "path": ".github/workflows/ci.yml"}]}), ""
+            "gh api repos/owner/repo/actions/workflows/ci.yml": (
+                0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), ""
             ),
             "gh api " + endpoint + "&page=1&per_page=100": (
                 0, json.dumps({"total_count": 2, "check_runs": [central, foreign]}), ""
@@ -452,8 +652,8 @@ class LivePrFixTests(unittest.TestCase):
             run_id = int(item["details_url"].split("/runs/")[1].split("/", 1)[0])
             workflow = run(run_id, suite_id=suite, path=path)
             workflow["workflow_id"] = workflow_id
-            responses[f"gh api repos/owner/repo/check-suites/{suite}"] = (
-                0, json.dumps({"workflow_run": workflow}), ""
+            responses[f"gh api repos/owner/repo/actions/runs/{run_id}"] = (
+                0, json.dumps(workflow), ""
             )
             responses[f"gh api repos/owner/repo/actions/runs/{run_id}/attempts/1"] = (
                 0, json.dumps(workflow), ""
@@ -517,6 +717,9 @@ class LivePrFixTests(unittest.TestCase):
         responses = {
             check_key: (0, json.dumps([{"total_count": 1, "check_runs": [raw]}]), ""),
             run_key: (0, json.dumps(run(attempt=2)), ""),
+            "gh api repos/owner/repo/actions/runs/201/attempts/1": (
+                0, json.dumps(run(attempt=1, suite_id=302)), ""
+            ),
             attempt_key: (0, json.dumps(run(attempt=2, suite_id=301)), ""),
         }
         candidates = GitHubSource("owner/repo", 42, runner=Runner(responses)).read_check_run_candidates(
@@ -535,6 +738,9 @@ class LivePrFixTests(unittest.TestCase):
         responses = {
             check_key: (0, json.dumps([{"total_count": 1, "check_runs": [raw]}]), ""),
             run_key: (0, json.dumps(run(attempt=2, suite_id=999)), ""),
+            "gh api repos/owner/repo/actions/runs/201/attempts/1": (
+                0, json.dumps(run(attempt=1, suite_id=998)), ""
+            ),
             attempt_key: (0, json.dumps(run(attempt=2, suite_id=999)), ""),
         }
         candidates = GitHubSource("owner/repo", 42, runner=Runner(responses)).read_check_run_candidates(
@@ -568,7 +774,7 @@ class LivePrFixTests(unittest.TestCase):
         responses["gh api --paginate --slurp repos/owner/repo/actions/runs/201/artifacts?per_page=100"] = (
             0, json.dumps([{"total_count": 1, "artifacts": [{"id": 501, "name": "ci-pr-snapshot-201-1", "expired": False, "size_in_bytes": 256}]}]), ""
         )
-        responses["gh api repos/owner/repo/actions/workflows?per_page=100"] = (0, json.dumps({"total_count": 1, "workflows": [{"id": 77, "path": ".github/workflows/ci.yml"}]}), "")
+        responses["gh api repos/owner/repo/actions/workflows/ci.yml"] = (0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), "")
         source = GitHubSource("owner/repo", 42, runner=Runner(responses), artifact_reader=lambda *_: snapshot())
         facts = source.read_live_ci(
             pr(),
@@ -643,7 +849,7 @@ class LivePrFixTests(unittest.TestCase):
             required_names=("ci-final-gate",),
         )
         self.assertEqual(1, len(candidates))
-        self.assertEqual(1, len([call for call in runner.calls if "/actions/runs/" in " ".join(call)]))
+        self.assertEqual(2, len([call for call in runner.calls if "/actions/runs/" in " ".join(call)]))
 
     def test_provider_error_is_not_converted_to_passing_evidence(self):
         key = "gh api --paginate --slurp repos/owner/repo/commits/" + HEAD_A + "/check-runs?filter=all&per_page=100"

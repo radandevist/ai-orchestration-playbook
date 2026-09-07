@@ -166,19 +166,6 @@ class RecordingRunner:
                     item_key = "artifacts" if "/artifacts" in endpoint else "check_runs"
                     empty = {"total_count": pages[0].get("total_count", 0), item_key: []}
                     entry = (0, json.dumps(pages[page]) if page < len(pages) else json.dumps(empty), entry[2])
-        if entry is None and "/check-suites/" in key:
-            suite_id = int(key.rsplit("/", 1)[1])
-            for candidate_key, candidate_entry in self.responses.items():
-                if "/actions/runs/" not in candidate_key or "/attempts/" in candidate_key or "/artifacts" in candidate_key:
-                    continue
-                if isinstance(candidate_entry, tuple) and len(candidate_entry) == 3:
-                    try:
-                        workflow = json.loads(candidate_entry[1])
-                    except (TypeError, ValueError):
-                        continue
-                    if isinstance(workflow, dict) and workflow.get("check_suite_id") == suite_id:
-                        entry = (0, json.dumps({"workflow_run": workflow}), "")
-                        break
         if entry is None:
             entry = (127, "", "no scripted response for: {0}".format(key))
         if callable(entry):
@@ -881,9 +868,7 @@ class GitHubCandidateTipTests(TempDirTestCase):
             GitHubSource("owner/repo", 42, runner=runner).read_candidate_tip_config(COMMIT_A)
 
     def test_check_run_reads_all_pages_and_validates_workflow_provenance(self):
-        workflow_key = (
-            "gh api repos/owner/repo/actions/workflows?per_page=100"
-        )
+        workflow_key = "gh api repos/owner/repo/actions/workflows/ci.yml"
         check_key = (
             "gh api --paginate --slurp repos/owner/repo/commits/"
             + COMMIT_A
@@ -913,7 +898,7 @@ class GitHubCandidateTipTests(TempDirTestCase):
             "check_suite": {"id": 301},
         }
         runner = RecordingRunner({
-            workflow_key: (0, json.dumps({"total_count": 1, "workflows": [{"id": 77, "path": ".github/workflows/ci.yml"}]}), ""),
+            workflow_key: (0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), ""),
             check_key: (
                 0,
                 json.dumps([
@@ -922,6 +907,9 @@ class GitHubCandidateTipTests(TempDirTestCase):
                 "",
             ),
             run_key: (0, json.dumps(run), ""),
+            "gh api repos/owner/repo/actions/runs/201/attempts/1": (
+                0, json.dumps(dict(run, run_attempt=1, check_suite_id=302)), ""
+            ),
             attempt_key: (0, json.dumps(dict(run, check_suite_id=301)), ""),
         })
         candidates = GitHubSource("owner/repo", 42, runner=runner).read_check_run_candidates(
@@ -955,7 +943,7 @@ class GitHubLiveCiTests(TempDirTestCase):
         )
 
     def runner(self, artifacts, extra_raw=()):
-        workflow_key = "gh api repos/owner/repo/actions/workflows?per_page=100"
+        workflow_key = "gh api repos/owner/repo/actions/workflows/ci.yml"
         check_key = (
             "gh api --paginate --slurp repos/owner/repo/commits/"
             + COMMIT_A
@@ -980,7 +968,7 @@ class GitHubLiveCiTests(TempDirTestCase):
             "check_suite": {"id": 301},
         }
         responses = {
-            workflow_key: (0, json.dumps({"total_count": 1, "workflows": [{"id": 77, "path": ".github/workflows/ci.yml"}]}), ""),
+            workflow_key: (0, json.dumps({"id": 77, "path": ".github/workflows/ci.yml"}), ""),
             check_key: (
                 0,
                 json.dumps([{"total_count": len(extra_raw) + 1, "check_runs": [*extra_raw, raw]}]),

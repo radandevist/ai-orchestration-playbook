@@ -1142,10 +1142,10 @@ def _parse_actions_run_id(details_url: str, repository: str, argv) -> int:
             )
         )
     remainder = parsed.path[len(expected_prefix):]
-    match = re.fullmatch(r"([0-9]+)(?:/.*)?", remainder)
+    match = re.fullmatch(r"([0-9]+)/job/([0-9]+)", remainder)
     if match is None:
         raise SourceMalformed(
-            "check-run details_url must carry a numeric workflow-run id for: {0}".format(
+            "check-run details_url must carry an Actions run/job path for: {0}".format(
                 _describe_command(argv)
             )
         )
@@ -1343,18 +1343,26 @@ class GitHubSource:
         return raw
 
     def _workflow_id(self, path: str) -> int:
-        endpoint = "repos/{0}/actions/workflows?per_page=100".format(self._repository)
+        match = re.fullmatch(r"\.github/workflows/([^/]+)", path) if isinstance(path, str) else None
+        if match is None:
+            raise SourceMalformed(
+                "configured workflow path must be .github/workflows/<filename>"
+            )
+        filename = match.group(1)
+        if filename in (".", "..") or any(
+            char in filename for char in ("\\", "\x00")
+        ):
+            raise SourceMalformed(
+                "configured workflow path must be .github/workflows/<filename>"
+            )
+        endpoint = "repos/{0}/actions/workflows/{1}".format(
+            self._repository, urllib.parse.quote(filename, safe="")
+        )
         data = self._api_json(endpoint, label="GitHub workflow API")
-        workflows = data.get("workflows")
-        if not isinstance(workflows, list):
-            raise SourceMalformed("GitHub workflow list is malformed")
-        matches = [
-            workflow for workflow in workflows
-            if isinstance(workflow, Mapping) and workflow.get("path") == path
-        ]
-        if len(matches) != 1:
-            raise SourceMalformed("configured workflow path does not identify exactly one workflow")
-        return _require_positive_int(matches[0].get("id"), "workflow id", ())
+        workflow_id = _require_positive_int(data.get("id"), "workflow id", ())
+        if data.get("path") != path:
+            raise SourceMalformed("configured workflow path does not match provider response")
+        return workflow_id
 
 
     def _workflow_run(self, run_id: int, run_attempt: Optional[int] = None) -> Mapping:
@@ -1367,23 +1375,15 @@ class GitHubSource:
         data = self._api_json(endpoint, label="GitHub workflow-run API")
         if _require_positive_int(data.get("id"), "workflow run id", ()) != run_id:
             raise SourceMalformed("workflow-run identity mismatch")
-        if run_attempt is not None and _require_positive_int(
-            data.get("run_attempt"), "workflow run attempt", ()
-        ) != run_attempt:
+        actual_attempt = _require_positive_int(data.get("run_attempt"), "workflow run attempt", ())
+        if run_attempt is not None and actual_attempt != run_attempt:
             raise SourceMalformed("workflow-run attempt identity mismatch")
+        _require_positive_int(data.get("workflow_id"), "workflow id", ())
+        _require_non_empty_str(data.get("path"), "workflow path", ())
+        _require_non_empty_str(data.get("event"), "workflow event", ())
+        _require_commit(data.get("head_sha"), "workflow-run head_sha", ())
+        _require_positive_int(data.get("check_suite_id"), "workflow check-suite id", ())
         return data
-
-    def _check_suite_workflow_run(self, suite_id: int) -> Mapping:
-        endpoint = "repos/{0}/check-suites/{1}".format(self._repository, suite_id)
-        data = self._api_json(endpoint, label="GitHub check-suite API")
-        workflow_run = data.get("workflow_run")
-        if not isinstance(workflow_run, Mapping):
-            raise SourceMalformed("check-suite does not identify a workflow run")
-        if workflow_run.get("check_suite_id") is not None and _require_positive_int(
-            workflow_run.get("check_suite_id"), "workflow check-suite id", ()
-        ) != suite_id:
-            raise SourceMalformed("check-suite/workflow-run identity mismatch")
-        return workflow_run
 
     def _check_run_candidate(
         self,
@@ -1434,12 +1434,10 @@ class GitHubSource:
                 raise SourceMalformed("candidate check-suite identity is missing")
             suite_id = _require_positive_int(suite.get("id"), "check-suite id", ())
             cache = workflow_cache if workflow_cache is not None else {}
-            workflow = cache.get(("suite", suite_id))
+            workflow = cache.get(("run", run_id))
             if workflow is None:
-                workflow = self._check_suite_workflow_run(suite_id)
-                cache[("suite", suite_id)] = workflow
-            if _require_positive_int(workflow.get("id"), "workflow run id", ()) != run_id:
-                raise SourceMalformed("check-suite/workflow-run identity mismatch")
+                workflow = self._workflow_run(run_id)
+                cache[("run", run_id)] = workflow
             base_workflow_id = _require_positive_int(workflow.get("workflow_id"), "workflow id", ())
             actual_workflow_path = _require_non_empty_str(workflow.get("path"), "workflow path", ())
             event = _require_non_empty_str(workflow.get("event"), "workflow event/action", ())
@@ -1447,16 +1445,49 @@ class GitHubSource:
             if run_head != head_oid or workflow_head != head_oid:
                 raise SourceMalformed("workflow/check candidate head does not match PR head")
             run_attempt = _require_positive_int(workflow.get("run_attempt"), "run attempt", ())
-            attempt_workflow = cache.get((run_id, run_attempt))
-            if attempt_workflow is None:
-                attempt_workflow = self._workflow_run(run_id, run_attempt)
-                cache[(run_id, run_attempt)] = attempt_workflow
+            attempts = []
+            for attempt_number in range(1, run_attempt + 1):
+                attempt_workflow = cache.get((run_id, attempt_number))
+                if attempt_workflow is None:
+                    attempt_workflow = self._workflow_run(run_id, attempt_number)
+                    cache[(run_id, attempt_number)] = attempt_workflow
+                attempts.append(attempt_workflow)
+            current_attempt = attempts[-1]
+            if _require_positive_int(
+                current_attempt.get("check_suite_id"),
+                "current workflow check-suite id",
+                (),
+            ) != _require_positive_int(
+                workflow.get("check_suite_id"),
+                "workflow check-suite id",
+                (),
+            ):
+                raise SourceMalformed(
+                    "current workflow attempt does not match current workflow run"
+                )
+            matching_attempts = [
+                attempt_workflow
+                for attempt_workflow in attempts
+                if _require_positive_int(
+                    attempt_workflow.get("check_suite_id"),
+                    "workflow check-suite id",
+                    (),
+                ) == suite_id
+            ]
+            if len(matching_attempts) != 1:
+                raise SourceMalformed(
+                    "check-suite must identify exactly one workflow-run attempt"
+                )
+            attempt_workflow = matching_attempts[0]
+            selected_attempt = _require_positive_int(
+                attempt_workflow.get("run_attempt"), "workflow attempt number", ()
+            )
             if _require_positive_int(attempt_workflow.get("workflow_id"), "workflow id", ()) != base_workflow_id:
                 raise SourceMalformed("workflow attempt id mismatch")
             if _require_positive_int(attempt_workflow.get("check_suite_id"), "workflow check-suite id", ()) != suite_id:
                 raise SourceMalformed("check-suite/workflow-run identity mismatch")
-            if _require_positive_int(workflow.get("check_suite_id"), "workflow check-suite id", ()) != suite_id:
-                raise SourceMalformed("check-suite/workflow-run identity mismatch")
+            if _require_commit(attempt_workflow.get("head_sha"), "workflow attempt head_sha", ()) != head_oid:
+                raise SourceMalformed("workflow attempt head does not match PR head")
             enforce_central = workflow_id is not None and (
                 central_names is None or name in central_names
             )
@@ -1467,6 +1498,8 @@ class GitHubSource:
             if enforce_central and event != workflow_action:
                 raise SourceMalformed("workflow event/action mismatch")
             attempt_path = _require_non_empty_str(attempt_workflow.get("path"), "workflow attempt path", ())
+            if attempt_workflow.get("event") != event:
+                raise SourceMalformed("workflow attempt event mismatch")
             if enforce_central and not _workflow_path_matches(attempt_path, workflow_path):
                 raise SourceMalformed("workflow attempt path mismatch")
             if enforce_central and attempt_workflow.get("event") != workflow_action:
@@ -1491,7 +1524,7 @@ class GitHubSource:
                     workflow_path=actual_workflow_path,
                     workflow_action=event,
                     workflow_event=event,
-                    run_attempt=run_attempt,
+                    run_attempt=selected_attempt,
                 )
             )
         except (SourceMalformed, TypeError, ValueError) as error:
@@ -1656,8 +1689,10 @@ class GitHubSource:
                 "snapshot artifact {0} must resolve exactly once".format(name)
             )
         artifact_id = _require_positive_int(matches[0].get("id"), "artifact id", ())
-        if matches[0].get("expired") is True:
-            raise SourceMalformed("snapshot artifact {0} is expired".format(name))
+        if type(matches[0].get("expired")) is not bool or matches[0]["expired"] is not False:
+            raise SourceMalformed(
+                "snapshot artifact {0} must provide expired=false".format(name)
+            )
         size_in_bytes = matches[0].get("size_in_bytes")
         if not isinstance(size_in_bytes, int) or isinstance(size_in_bytes, bool) or size_in_bytes < 0:
             raise SourceMalformed("snapshot artifact size is malformed")

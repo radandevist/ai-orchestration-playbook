@@ -79,6 +79,14 @@ def main():
         path = args[1]
         args = args[2:]
     key = " ".join(args)
+    fact_sequence = control.get("facts_sequence")
+    if isinstance(fact_sequence, list) and fact_sequence:
+        fact_calls = control.get("pr_worktree_list_calls", 0)
+        fact_index = min(fact_calls // 4, len(fact_sequence) - 1)
+        fact = fact_sequence[fact_index]
+    else:
+        fact_index = 0
+        fact = {}
     if control.get("log_path"):
         with open(control["log_path"], "a") as handle:
             handle.write(json.dumps([path, key]) + "\n")
@@ -92,7 +100,15 @@ def main():
         if by_path and path in by_path:
             blocks = by_path[path]
         elif "worktrees" in control:
-            blocks = control["worktrees"]
+            blocks = [dict(block) for block in control["worktrees"]]
+            if isinstance(fact_sequence, list) and path == control.get("pr_path"):
+                for block in blocks:
+                    if block.get("path") == path:
+                        block["head"] = fact.get("head", block["head"])
+                        block["branch"] = fact.get("branch", block["branch"])
+                control["pr_worktree_list_calls"] = fact_calls + 1
+                with open(os.environ["FAKE_GIT_CONTROL"], "w") as handle:
+                    json.dump(control, handle)
         else:
             head = control.get("worktree", {}).get("head", "a" * 40)
             branch = control.get("worktree", {}).get("branch", "feature/close")
@@ -106,13 +122,19 @@ def main():
             sys.stdout.write("\n")
         return 0
     if key == "rev-parse HEAD":
-        sys.stdout.write(control.get("rev_parse_head", "a" * 40) + "\n")
+        sys.stdout.write(
+            (fact.get("head") if fact_sequence else control.get("rev_parse_head", "a" * 40))
+            + "\n"
+        )
         return 0
     if key.startswith("rev-parse origin/"):
-        sys.stdout.write(control.get("rev_parse_remote", "a" * 40) + "\n")
+        sys.stdout.write(
+            (fact.get("remote") if fact_sequence else control.get("rev_parse_remote", "a" * 40))
+            + "\n"
+        )
         return 0
     if key == "status --porcelain=v1 --untracked-files=all":
-        sys.stdout.write(control.get("status", ""))
+        sys.stdout.write(fact.get("status", "") if fact_sequence else control.get("status", ""))
         return 0
     sys.stderr.write("fake git: unscripted command: {0}\n".format(key))
     return 127
@@ -213,10 +235,10 @@ def main():
                 }],
             }))
             return 0
-        if "/actions/workflows?" in endpoint:
+        if endpoint.endswith("/actions/workflows/ci.yml"):
             sys.stdout.write(json.dumps({
-                "total_count": 1,
-                "workflows": [{"id": 77, "path": ".github/workflows/ci.yml"}],
+                "id": 77,
+                "path": ".github/workflows/ci.yml",
             }))
             return 0
         if "/commits/" in endpoint and "/check-runs?" in endpoint:
@@ -241,21 +263,6 @@ def main():
                     "check_suite": {"id": 300 + index},
                 })
             sys.stdout.write(json.dumps({"total_count": len(runs), "check_runs": runs}))
-            return 0
-        if "/check-suites/" in endpoint:
-            suite_id = int(endpoint.rsplit("/", 1)[1])
-            run_id = 200 + (suite_id - 300)
-            sys.stdout.write(json.dumps({
-                "workflow_run": {
-                    "id": run_id,
-                    "workflow_id": 77,
-                    "path": ".github/workflows/ci.yml@main",
-                    "event": "pull_request",
-                    "run_attempt": 1,
-                    "head_sha": head,
-                    "check_suite_id": suite_id,
-                }
-            }))
             return 0
         if "/actions/runs/" in endpoint and "/attempts/" in endpoint:
             run_id = int(endpoint.split("/actions/runs/", 1)[1].split("/", 1)[0])
@@ -510,12 +517,15 @@ class CliTestCase(unittest.TestCase):
             control["worktrees_by_path"] = overrides["worktrees_by_path"]
         else:
             control["worktrees"] = [anchor_block, pr_block]
+        control["pr_path"] = self.pr_worktree
         if "remote" in overrides:
             control["rev_parse_remote"] = overrides["remote"]
         if "local" in overrides:
             control["rev_parse_head"] = overrides["local"]
         if "status" in overrides:
             control["status"] = overrides["status"]
+        if "facts_sequence" in overrides:
+            control["facts_sequence"] = overrides["facts_sequence"]
         control["log_path"] = self.git_log
         self._write_json(self.git_control, control)
 
@@ -1575,6 +1585,25 @@ class StatusCommandTests(CliTestCase):
         proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
         self.assertEqual(3, proc.returncode, proc.stdout + proc.stderr)
         self.assertIn("live PR changed", proc.stderr)
+
+    def test_status_final_git_reread_rejects_sequential_commit_branch_or_cleanliness_change(self):
+        for changed in (
+            {"head": COMMIT_B, "branch": BRANCH, "remote": COMMIT_A, "status": ""},
+            {"head": COMMIT_B, "branch": "feature/changed", "remote": COMMIT_A, "status": ""},
+            {"head": COMMIT_B, "branch": BRANCH, "remote": COMMIT_A, "status": " M changed\n"},
+        ):
+            with self.subTest(changed=changed):
+                self.set_git(
+                    facts_sequence=[
+                        {"head": COMMIT_A, "branch": BRANCH, "remote": COMMIT_A, "status": ""},
+                        changed,
+                    ]
+                )
+                self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+                config = self.write_config()
+                proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+                self.assertEqual(3, proc.returncode, proc.stdout + proc.stderr)
+                self.assertTrue(proc.stderr)
 
     def test_status_read_only_repeated_runs_change_nothing(self):
         self.set_git()
