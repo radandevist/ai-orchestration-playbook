@@ -1773,6 +1773,7 @@ class GitHubSource:
             expected_digest=digest,
         )
         expected = {
+            "schema_version",
             "pr_number",
             "head_sha",
             "base_ref_name",
@@ -1789,6 +1790,8 @@ class GitHubSource:
         }
         if set(record) != expected:
             raise SourceMalformed("snapshot artifact has an unexpected JSON shape")
+        if type(record["schema_version"]) is not int or record["schema_version"] != 1:
+            raise SourceMalformed("snapshot schema_version must be the exact integer 1")
         if (
             not isinstance(record["pr_number"], int)
             or isinstance(record["pr_number"], bool)

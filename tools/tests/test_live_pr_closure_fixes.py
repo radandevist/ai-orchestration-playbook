@@ -103,6 +103,7 @@ def run(run_id=201, suite_id=301, attempt=1, path=".github/workflows/ci.yml@main
 
 def snapshot(attempt=1, body="body", event_sha=MERGE_A):
     return {
+        "schema_version": 1,
         "pr_number": 42,
         "head_sha": HEAD_A,
         "base_ref_name": "main",

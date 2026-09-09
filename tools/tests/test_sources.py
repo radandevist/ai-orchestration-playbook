@@ -1011,6 +1011,7 @@ class GitHubLiveCiTests(TempDirTestCase):
 
     def snapshot(self, body="body", event_sha=COMMIT_B):
         return {
+            "schema_version": 1,
             "pr_number": 42,
             "head_sha": COMMIT_A,
             "base_ref_name": "develop",
@@ -1046,6 +1047,49 @@ class GitHubLiveCiTests(TempDirTestCase):
         self.assertEqual(201, facts.workflow_run_id)
         self.assertEqual(COMMIT_A, facts.head_sha)
         self.assertEqual(COMMIT_B, facts.event_sha)
+
+    def test_snapshot_requires_schema_version_one(self):
+        for value in (True, None, "1", 0, 1.0, 2):
+            with self.subTest(value=value):
+                snapshot = self.snapshot()
+                snapshot["schema_version"] = value
+                source = GitHubSource(
+                    "owner/repo",
+                    42,
+                    runner=self.runner(
+                        [{"id": 501, "name": "ci-pr-snapshot-201-1", "expired": False, "size_in_bytes": 256}]
+                    ),
+                    artifact_reader=lambda _run, _name, snapshot=snapshot: snapshot,
+                )
+                with self.assertRaises(SourceMalformed):
+                    source._read_snapshot(201, 1)
+
+    def test_snapshot_requires_schema_version_field(self):
+        snapshot = self.snapshot()
+        del snapshot["schema_version"]
+        source = GitHubSource(
+            "owner/repo",
+            42,
+            runner=self.runner(
+                [{"id": 501, "name": "ci-pr-snapshot-201-1", "expired": False, "size_in_bytes": 256}]
+            ),
+            artifact_reader=lambda _run, _name: snapshot,
+        )
+        with self.assertRaises(SourceMalformed):
+            source._read_snapshot(201, 1)
+
+    def test_snapshot_rejects_unknown_fields(self):
+        snapshot = dict(self.snapshot(), unexpected_field="reject me")
+        source = GitHubSource(
+            "owner/repo",
+            42,
+            runner=self.runner(
+                [{"id": 501, "name": "ci-pr-snapshot-201-1", "expired": False, "size_in_bytes": 256}]
+            ),
+            artifact_reader=lambda _run, _name: snapshot,
+        )
+        with self.assertRaises(SourceMalformed):
+            source._read_snapshot(201, 1)
 
     def test_live_provenance_uses_the_live_context_not_first_required_check(self):
         older_required = {

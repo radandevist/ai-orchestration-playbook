@@ -309,6 +309,7 @@ def main():
             data = control.get("data", {})
             event_sha = data.get("potentialMergeCommit", {}).get("oid", "b" * 40)
             record = {
+                "schema_version": 1,
                 "pr_number": data.get("number", 42),
                 "head_sha": data.get("headRefOid", "a" * 40),
                 "base_ref_name": data.get("baseRefName", "develop"),
@@ -340,6 +341,7 @@ def main():
         data = control.get("data", {})
         event_sha = data.get("potentialMergeCommit", {}).get("oid", "b" * 40)
         record = {
+            "schema_version": 1,
             "pr_number": data.get("number", 42),
             "head_sha": data.get("headRefOid", "a" * 40),
             "base_ref_name": data.get("baseRefName", "develop"),
@@ -1732,6 +1734,7 @@ class StatusCommandTests(CliTestCase):
 
     def _snapshot(self, *, body="", head=COMMIT_A, base="develop", merge=COMMIT_B, draft=False, event=COMMIT_B):
         return {
+            "schema_version": 1,
             "pr_number": PR,
             "head_sha": head,
             "base_ref_name": base,
