@@ -296,5 +296,80 @@ class PolicyConfigTests(unittest.TestCase):
             validate_project_config(raw)
 
 
+def generic_local_ci_config():
+    config = valid_config()
+    config["ci_required_checks_source"] = None
+    config["ci_live_pr_workflow"] = None
+    return config
+
+
+class GenericLocalCiConfigTests(unittest.TestCase):
+    def test_unregistered_generic_local_ci_mode_is_valid_strict_all_rollup(self):
+        config = validate_project_config(generic_local_ci_config())
+        self.assertIsNone(config.ci_required_checks_source)
+        self.assertIsNone(config.ci_live_pr_workflow)
+        self.assertEqual((), config.ci_required_checks)
+        self.assertEqual((), config.ci_live_pr_checks)
+
+    def test_canonical_source_bound_ci_mode_is_unchanged(self):
+        config = validate_project_config(valid_config())
+        self.assertEqual("candidate_tip", config.ci_required_checks_source.pull_request)
+        self.assertEqual(".github/workflows/ci.yml", config.ci_live_pr_workflow.path)
+        for key, bad in (
+            ("ci_required_checks_source", {"pull_request": "event_tip", "merge_group": "event_tip", "push": "event_tip"}),
+            ("ci_live_pr_workflow", {"path": ".github/workflows/test.yml", "action": "pull_request"}),
+            ("ci_required_checks_source", {}),
+            ("ci_live_pr_workflow", "null"),
+        ):
+            with self.subTest(key=key, bad=bad):
+                raw = valid_config()
+                raw[key] = bad
+                with self.assertRaises(ConfigValidationError):
+                    validate_project_config(raw)
+
+    def test_generic_local_ci_mode_rejects_partial_null(self):
+        for key in ("ci_required_checks_source", "ci_live_pr_workflow"):
+            with self.subTest(null_only=key):
+                raw = valid_config()
+                raw[key] = None
+                with self.assertRaisesRegex(ConfigValidationError, "both be null"):
+                    validate_project_config(raw)
+
+    def test_generic_local_ci_mode_rejects_declared_check_names(self):
+        for required, live in ((["ci"], []), (["ci"], ["ci"]), ([], ["ci"])):
+            with self.subTest(required=required, live=live):
+                raw = generic_local_ci_config()
+                raw["ci_required_checks"] = required
+                raw["ci_live_pr_checks"] = live
+                with self.assertRaisesRegex(ConfigValidationError, "empty"):
+                    validate_project_config(raw)
+
+    def test_registered_repository_cannot_downgrade_to_generic_local_ci_mode(self):
+        canonical = active_policy_config()
+        canonical["repository"] = "PublyApp/publyapp"
+        validate_project_config(canonical)
+        downgraded = copy.deepcopy(canonical)
+        downgraded["ci_required_checks_source"] = None
+        downgraded["ci_live_pr_workflow"] = None
+        with self.assertRaisesRegex(ConfigValidationError, "registered repository"):
+            validate_project_config(downgraded)
+
+    def test_generated_schema_accepts_generic_mode_and_rejects_unsafe_pairs(self):
+        validator = Draft202012Validator(project_json_schema())
+        self.assertTrue(validator.is_valid(generic_local_ci_config()))
+        self.assertTrue(validator.is_valid(valid_config()))
+        partial_source = valid_config()
+        partial_source["ci_required_checks_source"] = None
+        partial_workflow = valid_config()
+        partial_workflow["ci_live_pr_workflow"] = None
+        with_required = generic_local_ci_config()
+        with_required["ci_required_checks"] = ["ci"]
+        with_live = generic_local_ci_config()
+        with_live["ci_live_pr_checks"] = ["ci"]
+        for raw in (partial_source, partial_workflow, with_required, with_live):
+            with self.subTest(raw=raw):
+                self.assertFalse(validator.is_valid(raw))
+
+
 if __name__ == "__main__":
     unittest.main()

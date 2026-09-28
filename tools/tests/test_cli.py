@@ -4656,6 +4656,136 @@ class AdapterBoundedOutputTests(CliTestCase):
         self.assertNotIn("all-alpha-leak", proc.stdout + proc.stderr)
 
 
+GENERIC_LOCAL_CI = {
+    "ci_required_checks": [],
+    "ci_live_pr_checks": [],
+    "ci_required_checks_source": None,
+    "ci_live_pr_workflow": None,
+}
+# Any read of this candidate-tip config fails closed as invalid, so a
+# successful status proves the remote config was never fetched.
+POISONED_CANDIDATE_CONFIG = {"bogus": True}
+APPROVED_STATES = {"APPROVED", "APPROVED_WITH_FOLLOW_UPS"}
+
+
+class GenericLocalCiConfigTests(CliTestCase):
+    def _status(self, config):
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def _approved_generic(self, **gh):
+        """Local verification plus an APPROVED review under generic local CI."""
+        self.set_git()
+        gh.setdefault("headRefOid", COMMIT_A)
+        self.set_gh(candidate_config=POISONED_CANDIDATE_CONFIG, **gh)
+        config = self.write_config(overrides=GENERIC_LOCAL_CI)
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        review = self.write_review(commit=COMMIT_A)
+        proc = self.run_cli("import-review", "--config", config, "--pr", str(PR), "--review", review)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        return config
+
+    def test_generic_mode_never_fetches_candidate_tip_config(self):
+        self.set_git()
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            candidate_config=POISONED_CANDIDATE_CONFIG,
+        )
+        config = self.write_config(overrides=GENERIC_LOCAL_CI)
+        payload = self._status(config)
+        self.assertEqual("PASSING", payload["ci_state"])
+        self.assertEqual("UNVERIFIED", payload["state"])
+
+    def test_canonical_mode_still_fetches_candidate_tip_config(self):
+        self.set_git()
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            candidate_config=POISONED_CANDIDATE_CONFIG,
+        )
+        config = self.write_config()
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(3, proc.returncode, proc.stdout)
+        self.assertIn("candidate-tip closure config is invalid", proc.stderr)
+
+    def test_candidate_tip_cannot_downgrade_canonical_config_to_generic_mode(self):
+        self.set_git()
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            candidate_config=dict(BASE_CONFIG, **GENERIC_LOCAL_CI),
+        )
+        config = self.write_config()
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(3, proc.returncode, proc.stdout)
+        self.assertIn("source-bound", proc.stderr)
+
+    def test_registered_repository_cannot_use_generic_mode(self):
+        policy = active_policy_config()
+        overrides = dict(
+            GENERIC_LOCAL_CI,
+            repository="PublyApp/publyapp",
+            model_routes=policy["model_routes"],
+            review_policy=policy["review_policy"],
+        )
+        self.set_git()
+        self.set_gh(headRefOid=COMMIT_A, statusCheckRollup=PASSING_ROLLUP)
+        config = self.write_config(overrides=overrides)
+        proc = self.run_cli("status", "--config", config, "--pr", str(PR), "--json")
+        self.assertEqual(2, proc.returncode, proc.stdout)
+        self.assertIn("registered repository", proc.stderr)
+
+    def test_generic_mode_approves_only_all_green_rollup_with_evidence(self):
+        config = self._approved_generic(statusCheckRollup=PASSING_ROLLUP)
+        payload = self._status(config)
+        self.assertEqual("PASSING", payload["ci_state"])
+        self.assertEqual("APPROVED", payload["state"])
+
+    def test_generic_mode_failed_check_is_red_despite_green_checks_and_approval(self):
+        rollup = PASSING_ROLLUP + [
+            {"__typename": "CheckRun", "name": "react-doctor", "status": "COMPLETED", "conclusion": "FAILURE"}
+        ]
+        payload = self._status(self._approved_generic(statusCheckRollup=rollup))
+        self.assertEqual("BRANCH_FAILURE", payload["ci_state"])
+        self.assertNotIn(payload["state"], APPROVED_STATES)
+
+    def test_generic_mode_pending_or_skipped_checks_are_not_green(self):
+        for rollup, ci_state in (
+            (PASSING_ROLLUP + [{"__typename": "CheckRun", "name": "test", "status": "IN_PROGRESS", "conclusion": None}], "PENDING"),
+            ([{"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SKIPPED"}], "UNKNOWN"),
+        ):
+            with self.subTest(ci_state=ci_state):
+                payload = self._status(self._approved_generic(statusCheckRollup=rollup))
+                self.assertEqual(ci_state, payload["ci_state"])
+                self.assertNotIn(payload["state"], APPROVED_STATES)
+
+    def test_generic_mode_absent_ci_fails_closed_even_with_approval(self):
+        payload = self._status(self._approved_generic(statusCheckRollup=[]))
+        self.assertEqual("UNKNOWN", payload["ci_state"])
+        self.assertNotIn(payload["state"], APPROVED_STATES)
+
+    def test_generic_mode_draft_with_no_checks_is_not_green(self):
+        payload = self._status(self._approved_generic(statusCheckRollup=[], isDraft=True))
+        self.assertEqual("UNKNOWN", payload["ci_state"])
+        self.assertNotIn(payload["state"], APPROVED_STATES)
+
+    def test_generic_mode_green_ci_without_verification_or_review_is_not_approved(self):
+        self.set_git()
+        self.set_gh(
+            headRefOid=COMMIT_A,
+            statusCheckRollup=PASSING_ROLLUP,
+            candidate_config=POISONED_CANDIDATE_CONFIG,
+        )
+        config = self.write_config(overrides=GENERIC_LOCAL_CI)
+        self.assertEqual("UNVERIFIED", self._status(config)["state"])
+        proc = self.run_cli("record-verification", "--config", config, "--pr", str(PR))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual("REVIEW_READY", self._status(config)["state"])
+
+
 if __name__ == "__main__":
 
     unittest.main()

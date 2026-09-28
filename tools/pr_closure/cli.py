@@ -268,6 +268,11 @@ def _resolve_ci_config(config, github, pr):
         raise SourceMalformed("candidate-tip closure config project mismatch")
     if candidate.default_branch != config.default_branch:
         raise SourceMalformed("candidate-tip closure config default branch mismatch")
+    if candidate.ci_required_checks_source is None:
+        raise SourceMalformed(
+            "candidate-tip closure config must stay source-bound; generic local CI "
+            "mode cannot be selected from the PR tip"
+        )
     return replace(
         config,
         ci_required_checks=candidate.ci_required_checks,

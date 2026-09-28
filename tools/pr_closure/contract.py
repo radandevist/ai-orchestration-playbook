@@ -201,6 +201,13 @@ CONFIG_SEMANTIC_ASYMMETRIES = (
         "express a dynamic array-subset relationship, so it validates the member shape "
         "and uniqueness while Python enforces the cross-field subset.",
     ),
+    SemanticAsymmetry(
+        "registered_repository_ci_binding",
+        "generic local CI mode (null ci_required_checks_source and ci_live_pr_workflow) "
+        "is rejected for any repository with a registered policy floor; registry "
+        "membership is a Python lookup, so this schema accepts the null pair for "
+        "registered repositories the Python gate rejects.",
+    ),
 )
 
 V2_SEMANTIC_ASYMMETRIES = (
@@ -411,7 +418,15 @@ def _check_check_name_array(name: str, raw) -> Tuple[str, ...]:
     return tuple(items)
 
 
-def _check_ci_source(name: str, raw) -> CiRequiredChecksSource:
+def _check_ci_source(name: str, raw) -> Optional[CiRequiredChecksSource]:
+    """Validate the canonical source mapping, or ``None`` for generic local CI.
+
+    Pairing with ``ci_live_pr_workflow`` and the empty-check-list requirement
+    of the null mode are cross-field rules enforced in
+    ``validate_project_config``.
+    """
+    if raw is None:
+        return None
     item = require_mapping(raw, name)
     reject_unknown_keys(item, CI_REQUIRED_CHECKS_SOURCE, name)
     require_present(item, CI_REQUIRED_CHECKS_SOURCE, name)
@@ -420,7 +435,9 @@ def _check_ci_source(name: str, raw) -> CiRequiredChecksSource:
     return CiRequiredChecksSource(**CI_REQUIRED_CHECKS_SOURCE)
 
 
-def _check_ci_workflow(name: str, raw) -> CiLiveWorkflow:
+def _check_ci_workflow(name: str, raw) -> Optional[CiLiveWorkflow]:
+    if raw is None:
+        return None
     item = require_mapping(raw, name)
     reject_unknown_keys(item, CI_LIVE_PR_WORKFLOW, name)
     require_present(item, CI_LIVE_PR_WORKFLOW, name)
@@ -802,6 +819,40 @@ def check_follow_up(record, disposition) -> Optional[int]:
     return None
 
 
+def _validate_ci_mode(repository: str, values: Mapping) -> None:
+    """Allow generic local CI only as an all-or-nothing, unregistered mode.
+
+    Generic local CI (both CI identities null) keeps the strict all-rollup
+    classification and never reads a candidate-tip config, so it must not
+    declare check names and must never replace a registered repository's
+    source-bound CI binding.
+    """
+    from pr_closure.registries import RegistryValidationError, policy_floor_for
+
+    source_null = values["ci_required_checks_source"] is None
+    workflow_null = values["ci_live_pr_workflow"] is None
+    if source_null != workflow_null:
+        raise ReviewValidationError(
+            "ci_required_checks_source and ci_live_pr_workflow must both be null "
+            "or both be canonical"
+        )
+    if not source_null:
+        return
+    try:
+        registered = policy_floor_for(repository) is not None
+    except RegistryValidationError as error:
+        raise ReviewValidationError(str(error)) from error
+    if registered:
+        raise ReviewValidationError(
+            "registered repository requires source-bound CI configuration; "
+            "generic local CI mode is not allowed"
+        )
+    if values["ci_required_checks"] or values["ci_live_pr_checks"]:
+        raise ReviewValidationError(
+            "generic local CI mode requires empty ci_required_checks and ci_live_pr_checks"
+        )
+
+
 def validate_project_config(record: Mapping) -> ProjectConfig:
     """Validate a version-1 project closure configuration.
 
@@ -838,6 +889,7 @@ def validate_project_config(record: Mapping) -> ProjectConfig:
             require_policy_floor(record["repository"], review_policy, model_routes)
         except RegistryValidationError as error:
             raise ReviewValidationError(str(error)) from error
+        _validate_ci_mode(record["repository"], values)
     except ReviewValidationError as error:
         raise ConfigValidationError(str(error)) from error
     if not set(values["ci_live_pr_checks"]).issubset(values["ci_required_checks"]):
@@ -902,25 +954,18 @@ def _property_schema(name: str, kind: str, params: Dict) -> Dict:
             "items": dict({"type": "string"}, **NON_BLANK),
             "uniqueItems": True,
         }
-    if kind == "ci_source":
+    if kind in ("ci_source", "ci_workflow"):
+        canonical = CI_REQUIRED_CHECKS_SOURCE if kind == "ci_source" else CI_LIVE_PR_WORKFLOW
         return {
-            "type": "object",
-            "additionalProperties": False,
-            "required": list(CI_REQUIRED_CHECKS_SOURCE),
-            "properties": {
-                key: {"const": value}
-                for key, value in CI_REQUIRED_CHECKS_SOURCE.items()
-            },
-        }
-    if kind == "ci_workflow":
-        return {
-            "type": "object",
-            "additionalProperties": False,
-            "required": list(CI_LIVE_PR_WORKFLOW),
-            "properties": {
-                key: {"const": value}
-                for key, value in CI_LIVE_PR_WORKFLOW.items()
-            },
+            "anyOf": [
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": list(canonical),
+                    "properties": {key: {"const": value} for key, value in canonical.items()},
+                },
+                {"type": "null"},
+            ]
         }
     if kind == "follow_up":
         schema = {"type": "integer"}
@@ -1192,6 +1237,22 @@ def project_json_schema() -> Dict:
                         },
                     },
                 },
+            },
+        ],
+        "anyOf": [
+            {
+                "properties": {
+                    "ci_required_checks_source": {"type": "object"},
+                    "ci_live_pr_workflow": {"type": "object"},
+                }
+            },
+            {
+                "properties": {
+                    "ci_required_checks_source": {"type": "null"},
+                    "ci_live_pr_workflow": {"type": "null"},
+                    "ci_required_checks": {"maxItems": 0},
+                    "ci_live_pr_checks": {"maxItems": 0},
+                }
             },
         ],
         "$defs": {

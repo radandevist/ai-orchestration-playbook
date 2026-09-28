@@ -67,6 +67,14 @@ names — `schema_version`, `project`, `repository`, `repo_path`, `default_branc
 `tools/schemas/project-closure-v1.json`). The fields above are the declarative project bindings the
 harness resolves against; the gate itself reads only the `closure_config` JSON.
 
+**CI binding modes.** Either `ci_required_checks_source` and `ci_live_pr_workflow` both carry
+their canonical values (source-bound: CI policy is re-read from `.ai/project-closure-v1.json` at
+the PR candidate tip, which must itself stay source-bound), or both are `null` with empty
+`ci_required_checks` and `ci_live_pr_checks` (generic local mode for unregistered projects whose
+closure config is local-only: no candidate-tip read, and every check in the PR rollup must pass —
+an empty, pending, skipped, or failed rollup is never green). Generic mode is rejected for any
+repository with a registered policy floor (for example `PublyApp/publyapp`).
+
 **Safe tracking-projection boundary.** `tracking_projection` is the explicit board mapping
 identifier (for example `trello:publyapp`) or `none`; it is mapping data passed to the projection
 executable, never an executable itself. When it is non-`none`, the gate requires the separate

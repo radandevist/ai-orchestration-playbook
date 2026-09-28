@@ -952,6 +952,44 @@ def config_agreement_corpus():
         False,
         "ci_live_checks_subset",
     )
+    generic_ci = {"ci_required_checks_source": None, "ci_live_pr_workflow": None}
+    add("generic local ci mode", lambda c: c.update(generic_ci), True, True)
+    add(
+        "null ci_required_checks_source only",
+        lambda c: c.update({"ci_required_checks_source": None}),
+        False,
+        False,
+    )
+    add(
+        "null ci_live_pr_workflow only",
+        lambda c: c.update({"ci_live_pr_workflow": None}),
+        False,
+        False,
+    )
+    add(
+        "generic local ci mode with required checks",
+        lambda c: c.update(dict(generic_ci, ci_required_checks=["ci"])),
+        False,
+        False,
+    )
+    add(
+        "generic local ci mode with live checks",
+        lambda c: c.update(dict(generic_ci, ci_required_checks=["ci"], ci_live_pr_checks=["ci"])),
+        False,
+        False,
+    )
+    add(
+        "registered repository generic local ci mode",
+        lambda c: c.update(dict(
+            generic_ci,
+            repository="PublyApp/publyapp",
+            model_routes=copy.deepcopy(active_policy_config()["model_routes"]),
+            review_policy=copy.deepcopy(active_policy_config()["review_policy"]),
+        )),
+        True,
+        False,
+        "registered_repository_ci_binding",
+    )
 
     add("unknown top-level key", lambda c: c.update({"rogue": "x"}), False, False)
     add("missing schema_version", lambda c: c.pop("schema_version"), False, False)
@@ -1461,8 +1499,8 @@ class ConfigCorpusShapeTests(unittest.TestCase):
                 "null_projection": 1,
                 "required_valid": 1,
                 "required_empty": 1,
-                "structural": 49,
-                "asymmetric": 16,
+                "structural": 54,
+                "asymmetric": 17,
             },
             counts,
         )
