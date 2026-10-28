@@ -1048,6 +1048,125 @@ class GitHubLiveCiTests(TempDirTestCase):
         self.assertEqual(COMMIT_A, facts.head_sha)
         self.assertEqual(COMMIT_B, facts.event_sha)
 
+    BASE = "d" * 40
+    TREE = "e" * 40
+    OTHER_TREE = "f" * 40
+
+    def remint_snapshot(self, **overrides):
+        snapshot = self.snapshot(event_sha=COMMIT_C)
+        snapshot["potential_merge_commit_oid"] = COMMIT_C
+        snapshot["event_merge_tree"] = self.TREE
+        snapshot["event_merge_parents"] = [self.BASE, COMMIT_A]
+        snapshot.update(overrides)
+        return snapshot
+
+    def live_ci_with_merge(self, snapshot, *, tree=None, parents=None):
+        runner = self.runner(
+            [{"id": 501, "name": "ci-pr-snapshot-201-1", "expired": False, "size_in_bytes": 256}]
+        )
+        runner.responses["gh api repos/owner/repo/commits/" + COMMIT_B] = (
+            0,
+            json.dumps({
+                "commit": {"tree": {"sha": tree or self.TREE}},
+                "parents": [{"sha": sha} for sha in (parents or (self.BASE, COMMIT_A))],
+            }),
+            "",
+        )
+        source = GitHubSource(
+            "owner/repo", 42, runner=runner, artifact_reader=lambda _run, _name: snapshot
+        )
+        facts = source.read_live_ci(
+            self.pr(),
+            required_checks=("ci-final-gate",),
+            live_checks=("ci-final-gate",),
+            workflow_path=".github/workflows/ci.yml",
+            workflow_action="pull_request",
+        )
+        return facts, runner
+
+    def test_equal_oids_pass_without_commit_lookup(self):
+        facts, runner = self.live_ci_with_merge(self.snapshot())
+        self.assertEqual(CiState.PASSING, facts.ci_state)
+        self.assertFalse(any("/commits/" + COMMIT_B in " ".join(c) for c in runner.calls))
+
+    def test_remerged_same_content_passes(self):
+        facts, runner = self.live_ci_with_merge(self.remint_snapshot())
+        self.assertEqual(CiState.PASSING, facts.ci_state)
+        self.assertTrue(any("/commits/" + COMMIT_B in " ".join(c) for c in runner.calls))
+
+    def test_remerged_content_with_potential_fields_passes(self):
+        snapshot = self.remint_snapshot(
+            potential_merge_tree=self.TREE, potential_merge_parents=[self.BASE, COMMIT_A]
+        )
+        facts, _ = self.live_ci_with_merge(snapshot)
+        self.assertEqual(CiState.PASSING, facts.ci_state)
+
+    def test_remerged_different_tree_rejected(self):
+        facts, _ = self.live_ci_with_merge(self.remint_snapshot(), tree=self.OTHER_TREE)
+        self.assertNotEqual(CiState.PASSING, facts.ci_state)
+
+    def test_remerged_moved_base_rejected(self):
+        facts, _ = self.live_ci_with_merge(
+            self.remint_snapshot(), parents=(COMMIT_C, COMMIT_A)
+        )
+        self.assertNotEqual(CiState.PASSING, facts.ci_state)
+
+    def test_remerged_moved_head_rejected(self):
+        facts, _ = self.live_ci_with_merge(
+            self.remint_snapshot(), parents=(self.BASE, COMMIT_C)
+        )
+        self.assertNotEqual(CiState.PASSING, facts.ci_state)
+
+    def test_snapshot_head_not_second_parent_rejected(self):
+        snapshot = self.remint_snapshot(event_merge_parents=[self.BASE, COMMIT_C])
+        facts, _ = self.live_ci_with_merge(snapshot, parents=(self.BASE, COMMIT_C))
+        self.assertNotEqual(CiState.PASSING, facts.ci_state)
+
+    def test_different_oid_without_content_fields_rejected(self):
+        snapshot = self.remint_snapshot()
+        del snapshot["event_merge_tree"]
+        del snapshot["event_merge_parents"]
+        facts, _ = self.live_ci_with_merge(snapshot)
+        self.assertNotEqual(CiState.PASSING, facts.ci_state)
+
+    def test_malformed_content_fields_rejected(self):
+        bad = {
+            "event_merge_tree": ("short", 5, None),
+            "event_merge_parents": (
+                [self.BASE], [self.BASE, COMMIT_A, COMMIT_B], [self.BASE, "x"],
+                "ab", {"a": 1}, None,
+            ),
+            "potential_merge_tree": ("short",),
+            "potential_merge_parents": ([self.BASE],),
+        }
+        for key, values in bad.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    snapshot = self.remint_snapshot(**{key: value})
+                    source = GitHubSource(
+                        "owner/repo",
+                        42,
+                        runner=self.runner(
+                            [{"id": 501, "name": "ci-pr-snapshot-201-1", "expired": False, "size_in_bytes": 256}]
+                        ),
+                        artifact_reader=lambda _run, _name, snapshot=snapshot: snapshot,
+                    )
+                    with self.assertRaises(SourceMalformed):
+                        source._read_snapshot(201, 1)
+
+    def test_unknown_snapshot_key_still_rejected(self):
+        snapshot = self.remint_snapshot(extra_field="x")
+        source = GitHubSource(
+            "owner/repo",
+            42,
+            runner=self.runner(
+                [{"id": 501, "name": "ci-pr-snapshot-201-1", "expired": False, "size_in_bytes": 256}]
+            ),
+            artifact_reader=lambda _run, _name: snapshot,
+        )
+        with self.assertRaises(SourceMalformed):
+            source._read_snapshot(201, 1)
+
     def test_snapshot_requires_schema_version_one(self):
         for value in (True, None, "1", 0, 1.0, 2):
             with self.subTest(value=value):

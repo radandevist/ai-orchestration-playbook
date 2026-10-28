@@ -701,6 +701,35 @@ class LivePrSnapshot:
     workflow_action: str
     run_id: int
     run_attempt: int
+    event_merge_tree: Optional[str] = None
+    event_merge_parents: Optional[Tuple[str, str]] = None
+    potential_merge_tree: Optional[str] = None
+    potential_merge_parents: Optional[Tuple[str, str]] = None
+
+    def needs_live_merge_content(self, potential_merge_commit_oid: str) -> bool:
+        """True when a live merge-commit content read could change the verdict."""
+        return (
+            self.potential_merge_commit_oid != potential_merge_commit_oid
+            or self.event_sha != potential_merge_commit_oid
+        ) and (
+            self.event_merge_tree is not None
+            and self.event_merge_parents is not None
+        )
+
+    def _binds_merge(
+        self,
+        snapshot_oid: str,
+        tree: Optional[str],
+        parents: Optional[Tuple[str, str]],
+        live_oid: str,
+        live_content: Optional[Tuple[str, Tuple[str, str]]],
+    ) -> bool:
+        if snapshot_oid == live_oid:
+            return True
+        if tree is None or parents is None or live_content is None:
+            return False
+        # parents are [base tip, PR head]; the head must be this snapshot's head.
+        return live_content == (tree, tuple(parents)) and parents[1] == self.head_sha
 
     def matches_live(
         self,
@@ -716,16 +745,34 @@ class LivePrSnapshot:
         workflow_action: str,
         run_id: int,
         run_attempt: int,
+        live_merge_content: Optional[Tuple[str, Tuple[str, str]]] = None,
     ) -> bool:
+        potential_tree = self.potential_merge_tree
+        potential_parents = self.potential_merge_parents
+        if potential_tree is None or potential_parents is None:
+            potential_tree = self.event_merge_tree
+            potential_parents = self.event_merge_parents
         return (
             self.pr_number == pr_number
             and self.head_sha == head_sha
             and self.base_ref_name == base_ref_name
-            and self.potential_merge_commit_oid == potential_merge_commit_oid
+            and self._binds_merge(
+                self.potential_merge_commit_oid,
+                potential_tree,
+                potential_parents,
+                potential_merge_commit_oid,
+                live_merge_content,
+            )
             and self.body_sha256 == hashlib.sha256(body.encode("utf-8")).hexdigest()
             and self.is_draft is is_draft
             and self.event_name == "pull_request"
-            and self.event_sha == potential_merge_commit_oid
+            and self._binds_merge(
+                self.event_sha,
+                self.event_merge_tree,
+                self.event_merge_parents,
+                potential_merge_commit_oid,
+                live_merge_content,
+            )
             and self.workflow_path == workflow_path
             and self.workflow_id == workflow_id
             and self.workflow_action == workflow_action
@@ -1788,8 +1835,26 @@ class GitHubSource:
             "run_id",
             "run_attempt",
         }
-        if set(record) != expected:
+        optional = {
+            "event_merge_tree",
+            "event_merge_parents",
+            "potential_merge_tree",
+            "potential_merge_parents",
+        }
+        if not expected <= set(record) <= expected | optional:
             raise SourceMalformed("snapshot artifact has an unexpected JSON shape")
+        content = {}
+        for key in ("event_merge_tree", "potential_merge_tree"):
+            if key in record:
+                content[key] = _require_commit(record[key], "snapshot " + key, ())
+        for key in ("event_merge_parents", "potential_merge_parents"):
+            if key in record:
+                value = record[key]
+                if not isinstance(value, list) or len(value) != 2:
+                    raise SourceMalformed("snapshot {0} must list exactly 2 commit ids".format(key))
+                content[key] = tuple(
+                    _require_commit(item, "snapshot " + key, ()) for item in value
+                )
         if type(record["schema_version"]) is not int or record["schema_version"] != 1:
             raise SourceMalformed("snapshot schema_version must be the exact integer 1")
         if (
@@ -1839,6 +1904,28 @@ class GitHubSource:
             workflow_action=record["workflow_action"],
             run_id=snapshot_run_id,
             run_attempt=snapshot_attempt,
+            **content,
+        )
+
+    def read_merge_content(self, oid: str) -> Tuple[str, Tuple[str, str]]:
+        """Read (tree, (base tip, head)) of one live merge commit."""
+        oid = _require_commit(oid, "merge commit oid", ())
+        data = self._api_json(
+            "repos/{0}/commits/{1}".format(self._repository, oid),
+            label="GitHub Commits API",
+        )
+        commit = data.get("commit")
+        tree = commit.get("tree") if isinstance(commit, Mapping) else None
+        tree_sha = _require_commit(
+            tree.get("sha") if isinstance(tree, Mapping) else None, "merge tree sha", ()
+        )
+        parents = data.get("parents")
+        if not isinstance(parents, list) or len(parents) != 2 or not all(
+            isinstance(item, Mapping) for item in parents
+        ):
+            raise SourceMalformed("merge commit must have exactly 2 parents")
+        return tree_sha, tuple(
+            _require_commit(item.get("sha"), "merge parent sha", ()) for item in parents
         )
 
     def read_live_ci(
@@ -1882,6 +1969,11 @@ class GitHubSource:
                 continue
             try:
                 snapshot = self._read_snapshot(check.workflow_run_id, check.run_attempt)
+                live_merge_content = (
+                    self.read_merge_content(pr.potential_merge_commit_oid)
+                    if snapshot.needs_live_merge_content(pr.potential_merge_commit_oid)
+                    else None
+                )
                 if not snapshot.matches_live(
                     pr_number=pr.number,
                     head_sha=pr.head_oid,
@@ -1894,6 +1986,7 @@ class GitHubSource:
                     workflow_action=workflow_action,
                     run_id=check.workflow_run_id,
                     run_attempt=check.run_attempt,
+                    live_merge_content=live_merge_content,
                 ):
                     reasons.append("live PR snapshot does not match current PR state")
                 else:
