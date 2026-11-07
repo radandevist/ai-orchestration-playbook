@@ -2,6 +2,10 @@
 
 All notable changes to the AI Orchestration Playbook are recorded here. This is a **living document** — it is updated from real use, as sessions expose new failure modes and better patterns. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.1] - 2026-11-07 — review stop rule
+
+- Run loop step 4: **at most two review rounds** (first review + one re-review of the fixes), a third only for a remaining BLOCKER; then merge on Radan's go and send MINOR/NOTE findings to a follow-up list. Severity is graded in the product's real context (MAJOR = breaks a real use or loses data). New holes in a mechanism the fix added mean simplify or fix the one wrong default, not another round. Origin: ShopKartOS 2026-11-07, three hostile rounds with falling severity on a deploy script that kept growing (same pattern as PublyApp PR #806 and the 2026-08-08 guard PRs).
+
 ## [0.3.0] - 2026-11-07 — Claude Code captain, `dsh-go` packets
 
 - Rewrote `PLAYBOOK.md` for **Claude Code as the default captain** (363 → 208 lines, English): who does what, nine non-negotiables, the captain boundary, and a run loop from "go" to merged.

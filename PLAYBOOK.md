@@ -1,6 +1,6 @@
 # AI Orchestration Playbook
 
-> v0.3.0 — 2026-11-07. Written for **Claude Code as the captain**. Read it once before a run, then bind
+> v0.3.1 — 2026-11-07. Written for **Claude Code as the captain**. Read it once before a run, then bind
 > it to the repo through `.ai/orchestration-adapter.md` (§5). The optional PR-closure state machine
 > lives in [`appendix-pr-closure.md`](./appendix-pr-closure.md).
 
@@ -103,8 +103,14 @@ stop for it. **Full adapter already there:** don't rewrite it; fix only what wen
    may not install), then dispatch each packet into its own worktree (§3, §7). Keep 3–5 packets ready.
 3. **Verify** yourself: rerun the tests, read the diff, run `acceptance_cmd` — "done" is a claim, not
    evidence — then push the branch so review and CI bind to that exact tip.
-4. **Review** on the exact pushed commit, by another model. Blocking finding → fix packet → re-review;
-   no maximum number of reviews.
+4. **Review** on the exact pushed commit, by a fresh session. Blocking finding → fix packet → re-review.
+   **Stop rule (Owner rule, 2026-11-07):** at most **two** review rounds (the first review + one re-review
+   of the fixes); a third only if a BLOCKER is left. After that, merge on Radan's go and send every
+   remaining MINOR/NOTE to a follow-up list, never to another round. The reviewer grades severity **in
+   the product's real context** (users, processes, deploy frequency from the adapter): MAJOR = breaks a
+   real use or loses data; a theoretical scenario is MINOR at most. When a round finds new holes in the
+   *mechanism the fix added* (not new instances), stop adding mechanism: simplify, or fix the one wrong
+   default behind them (see the 2026-08-08 guard-PRs lesson), never another patch per instance.
 5. **Close** — the seven points of §8, all on the same commit.
 6. **Merge**, only with the go: rebase if needed → full acceptance gate → remove the worktree →
    squash-merge (body file to the run folder) → sync the default branch. Run `gh pr merge` from the clone.
