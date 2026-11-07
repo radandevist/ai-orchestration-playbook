@@ -1,6 +1,6 @@
 # AI Orchestration Playbook
 
-> v0.3.2 — 2026-11-07. Written for **Claude Code as the captain**. Read it once before a run, then bind
+> v0.3.3 — 2026-11-07. Written for **Claude Code as the captain**. Read it once before a run, then bind
 > it to the repo through `.ai/orchestration-adapter.md` (§5). The optional PR-closure state machine
 > lives in [`appendix-pr-closure.md`](./appendix-pr-closure.md).
 
@@ -111,6 +111,16 @@ stop for it. **Full adapter already there:** don't rewrite it; fix only what wen
    MEDIUM = a real but contained defect; a theoretical scenario is MINOR at most. When a round finds new
    holes in the *mechanism the fix added* (not new instances), stop adding mechanism: simplify, or fix the
    one wrong default behind them (see the 2026-08-08 guard-PRs lesson), never another patch per instance.
+   **Severity rubric (Owner rule, 2026-11-07 — reviewers inflate severity; paste it into every review brief):**
+   - CRITICAL = data loss or leak, security hole, app broken for everyone.
+   - MAJOR = a real user cannot do a normal task, or sees wrong information.
+   - MEDIUM = it works, but a real user will hit a visible problem (wrong day shown, a control that does
+     nothing in a common case).
+   - MINOR = everything else: style, test strength, theoretical cases, a few pixels, docs.
+   **No scenario, no severity:** a finding above MINOR states the concrete real-use scenario (who does
+   what, what breaks); without one it is MINOR automatically. **The captain re-checks** every MEDIUM-or-above
+   finding at its file:line before dispatching a fix; if the scenario does not hold, it is downgraded to
+   MINOR and the downgrade is written in the report.
 5. **Close** — the seven points of §8, all on the same commit.
 6. **Merge**, only with the go: rebase if needed → full acceptance gate → remove the worktree →
    squash-merge (body file to the run folder) → sync the default branch. Run `gh pr merge` from the clone.

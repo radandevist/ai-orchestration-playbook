@@ -2,6 +2,10 @@
 
 All notable changes to the AI Orchestration Playbook are recorded here. This is a **living document** — it is updated from real use, as sessions expose new failure modes and better patterns. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.3] - 2026-11-07 — severity rubric
+
+- Added a severity rubric to the merge gate (§5 step 4): concrete CRITICAL/MAJOR/MEDIUM/MINOR definitions pasted into every reviewer brief; "no scenario, no severity" (above MINOR needs a concrete real-use scenario); the captain re-checks every MEDIUM-or-above finding at its file:line before dispatching a fix and downgrades it to MINOR, in writing, when the scenario does not hold. Reason: reviewers inflate severity.
+
 ## [0.3.2] - 2026-11-07 — merge gate by severity
 
 - Replaced the 0.3.1 two-round cap (Radan changed his mind the same day): no merge while a review has a CRITICAL, MAJOR or MEDIUM finding; only MINOR findings may be dismissed or go to a follow-up list. Severity still graded in the product's real context; the "simplify instead of patching new mechanism" lesson is kept.
