@@ -11,7 +11,7 @@
 | **Owner** | Radan | Scope decisions, the merge go (per PR), the deploy go. |
 | **Captain** | one Claude Code session per board | Decomposing, briefing, dispatching, verifying, reading diffs, all git work (commit, push, PR, rebase/merge, conflicts), the durable record. |
 | **Implementer** | `dsh-go` headless packet — DeepSeek v4.1 Flash | Writing code, running its tests, leaving the changes **uncommitted**, writing a report. |
-| **Reviewer** | `dsh-go` headless packet — Muse Spark 1.3 (1.2 as fallback) | Reading a diff it did not write, returning a verdict with its blocking findings. |
+| **Reviewer** | `dsh-go` headless packet — Muse Spark 1.3 (1.2 as fallback) | Reading a diff it did not write, returning a verdict with its blocking findings. **Weak model:** its brief MUST follow `~/.claude/skills/agent-brief/brief-strict.md`; no verdict counts without a verdict file and the diff on disk. |
 
 A `dsh-go` packet has **no git access**: it writes files and a report. The captain is the only writer of
 durable state — commits, PRs, ledger, vault, memory.
@@ -141,8 +141,10 @@ Seven points, all true on the same commit before saying a PR is ready:
 `pr-closure` is not needed for this checklist; it sits in `tools/` and its state machine is documented in
 [`appendix-pr-closure.md`](./appendix-pr-closure.md), to be used only if Radan asks.
 
-The ledger is one `ledger.md` per run folder, one line per dispatch — date, task, implementer, reviewer:
-`2026-11-07 | P1 playbook rewrite | impl deepseek-v4.1-flash | review muse-spark-1.3`. The detailed JSONL
+The ledger is one `ledger.md` per run folder, one line per dispatch — date, task, implementer, reviewer,
+strict brief: `2026-11-07 | P1 playbook rewrite | impl deepseek-v4.1-flash | review muse-spark-1.3 | strict yes`.
+`strict` is mandatory: `yes` for every model other than DeepSeek (Owner rule, 2026-11-02: only DeepSeek v4.1
+Flash is reliable; the other OpenCode Go models get `brief-strict.md`), `n/a` for DeepSeek. The detailed JSONL
 ledger is optional.
 
 ## 9 — Situation → skill
