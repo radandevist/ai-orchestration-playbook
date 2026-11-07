@@ -1,119 +1,91 @@
 # Captain Board + Packet Template
 
-Use this when one captain coordinates several clones/worktrees. Keep the board small; old packets belong in the run artifact directory, not in the hot prompt.
+One captain, a run folder, a few packets in flight. Save packets in the run folder
+(`~/orchestration-runs/<YYYY-MM-DD-topic>/`), never in the session temp directory. Agent reports live in
+the packet's worktree (`.reports/`), not in the run folder — the sandbox cannot write outside the worktree.
 
 ## Board
 
 - **Goal:** `<one sentence>`
-- **Captain root:** `<absolute parent/coordination directory>`
-- **Stable prefix already distilled:** `<playbook, adapter, repo rules, standing constraints>`
-- **Provider lanes:** `<DeepSeek implementation roles>; <GPT-5.6 Luna review roles>; <local roles>`
-- **Hot backlog target:** `3-5 ready packets`
+- **Captain:** one Claude Code session; **run folder:** `<absolute path>`
+- **Lanes:** implementer DeepSeek v4.1 Flash; reviewer Muse Spark 1.3; local lane for prep and checks
+- **Packets ready:** 3–5
 
-| Packet | Lane | Target clone/worktree | Status | Notes |
+| Packet | Model patch | Worktree | Status | Report |
 |---|---|---|---|---|
-| `<P1>` | `<deepseek|openai-review|local>` | `<absolute path>` | `queued` | `<short note>` |
+| `P1` | `go-deepseek-v4.1-flash.yml` | `<absolute path>` | `queued` | `<worktree>/.reports/P1-report.md` |
 
 ## Packet
 
-Save each packet as its own Markdown file under the run artifact directory.
-
 ```markdown
-# Packet <id>: <short name>
+# Packet P1 — <short name>
 
-## Header
+## Goal
+<one paragraph; Radan's decision quoted word for word>
 
-- **Lane:** <deepseek|openai-review|local>
-- **Target clone/worktree:** <absolute path>
-- **Effort:** <low|medium|high> (`xhigh` only with ledgered escalation)
-- **Start checkpoint:** <branch + commit or explicit WIP note>
+## Where
+- Repo / clone: <absolute path>
+- Branch: <branch> — Worktree: <absolute path>
+- Start checkpoint: <commit>
 
-## Distilled Context
+## Scope
+- Change: <exact files and symbols>
+- Do not touch: <files, folders, generated output>
 
-- <Only stable facts needed for this packet>
+## Acceptance
+- `<test_cmd>` — expect <result>
+- `<acceptance_cmd>` — expect <result>
 
-## Required Reading
+(No setup command here: the captain runs the adapter's `setup_cmd` before launch; the packet may not
+install.)
 
-- `<absolute path>:<line or symbol>` - <why>
+## Secrets
+Never read `.env*`, never print a token.
 
-## Work
+## Writes
+No git command. No vault, no memory, no GitHub/Trello, no install, no network unless listed here: <none>.
 
-- <Concrete task scoped to exact files/symbols>
+## Report
+Create `<worktree>/.reports/P1-report.md` within 10 minutes; update it after each file.
+Final answer: first line `STATUS DONE` or `STATUS BLOCKED`, then files changed,
+verification output, concerns.
 
-## Expected Artifact
+## Time limit
+<2–4 h>. Do the work ONCE. If something fails twice the same way, write BLOCKED and stop.
 
-- <diff, review report, design note, verification report, PR body, etc.>
+## Commit and PR
+<pre-written commit message and PR body; Refs or Closes decided here>
 
-## Verification
-
-- `<exact command>` - expect <result>
-
-## STOP Conditions
-
+## STOP
 - <condition that means report instead of guessing>
-
-## Return Payload
-
-Implementation packets return all of the following, or the lane is a failure even with exit 0:
-
-- **Exact pushed commit** — the 40-hex SHA of the tip actually pushed and verified
-- **Starting derived state** — the closure state the packet began from (playbook §2.6)
-- **Blocking finding IDs closed** — every `BLOCKS_PR` finding ID this packet resolves
-- **Root-cause history** — the normalized `root_cause` and every prior repair strategy already attempted
-- **Paired proof** — the failing escape and the legitimate control for each claimed fix
-- **Gates run** — exact commands and results, tied to the pushed commit
-- **Expected transition** — the exact closure state this packet expects to reach
-- **Structured result marker** — the machine-readable marker written to the configured output path
-- **Brief statements found wrong** — any statement in the brief that turned out to be false
-- Changed files, remaining risks/blockers, and a suggested next packet if obvious
-
-## Reviewer Return
-
-Independent adversarial reviews return the following. Empty, undersized, or markerless review output
-is a failure even with exit 0; unresolved evidence is a loud refusal, not a silent pass or an
-unsupported accusation.
-
-- **Exact commit/range reviewed** — the reviewed commit (40-hex) plus base commit or comparison range
-- **Model families** — implementer family and reviewer family (must differ, playbook §2.6)
-- **Verdict** — exactly one of `CHANGES_REQUIRED`, `APPROVED_WITH_FOLLOW_UPS`, `APPROVED`, `INCONCLUSIVE`; `INCONCLUSIVE` blocks approval without automatically accusing the code
-- **Findings** — one entry per finding with: unique ID, root cause, severity, disposition, scope, evidence, paired bad-case/good-case proof, and the follow-up issue number where required
-- **Intentionally-not-a-finding notes** — explicit records of checked-and-cleared concerns
-- **Structured JSON output** — written to the required path per the review schema (`review_schema` in the adapter)
 ```
 
-## Launch Shapes
+## Launch
 
-Every lane is launched with an explicit model selection — no unspecified `<model>` command is an
-active shape. Non-OpenAI models (for example `deepseek-v4-flash`) resolve through the host's
-OpenModel provider wiring (the project harness pattern); OpenAI-family models use their catalog id.
-
-DeepSeek implementation packet into a clone/worktree:
+The captain creates the branch and worktree first, runs the adapter's `setup_cmd` there (the packet may
+not install), then dispatches; the packet has no git access. Prompt on stdin from a file:
 
 ```bash
-codex exec --ephemeral --skip-git-repo-check \
-  --dangerously-bypass-approvals-and-sandbox \
-  -c model="deepseek-v4-flash" \
-  -c model_provider="openmodel" \
-  -c model_reasoning_effort="max" \
-  -C /absolute/target/clone \
-  - < /absolute/run/packet.md
+R=~/orchestration-runs/2026-11-07-<topic>; X=P1
+printf 'Read %s/%s-brief.md first, then do it.\n' "$R" "$X" > "$R/$X-prompt.txt"
+
+setsid -f bash -c "eval \"\$(fnm env)\"; cd <worktree>; nice -n 10 ionice -c3 \
+  timeout 10800 dsh-go --profile headless \
+  --patch ~/.dsh/patches/go-deepseek-v4.1-flash.yml - \
+  < $R/$X-prompt.txt > $R/$X-answer.md 2> $R/$X-err.log; echo exit=\$? > $R/$X-done"
+
+until [ -f "$R/$X-done" ]; do sleep 60; done; cat "$R/$X-done"
 ```
 
-OpenAI review packet (GPT-5.6 Luna at `xhigh` — record the ledgered escalation reason, playbook
-§1.5/§2.6):
+Review packet: same command with `--patch ~/.dsh/patches/go-muse-spark-1.3-contributor.yml` and
+`timeout 2700`. Local lane: run the command from the packet directly in the clone.
 
-```bash
-codex exec --ephemeral --skip-git-repo-check \
-  --dangerously-bypass-approvals-and-sandbox \
-  -c model="gpt-5.6-luna" \
-  -c model_reasoning_effort="xhigh" \
-  -C /absolute/target/clone \
-  - < /absolute/run/packet.md
-```
+`exit=0` plus a report plus a real diff is a result; `exit=124` is a timeout to rescue.
 
-Local/cheap lane packet:
+## Return payload (review packet)
 
-```bash
-cd /absolute/target/clone &&
-<exact grep/test/log command from the packet>
-```
+- Exact commit reviewed (40-hex) and the base it was compared to.
+- Model families on both sides (they must differ).
+- Verdict: `CHANGES_REQUIRED`, `APPROVED_WITH_FOLLOW_UPS`, `APPROVED` or `INCONCLUSIVE`.
+- One entry per finding: ID, root cause, severity, disposition, evidence, bad-case/good-case proof.
+- Explicit "checked and cleared" notes, so the captain knows what was covered.

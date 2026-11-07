@@ -2,6 +2,21 @@
 
 All notable changes to the AI Orchestration Playbook are recorded here. This is a **living document** — it is updated from real use, as sessions expose new failure modes and better patterns. Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.0] - 2026-11-07 — Claude Code captain, `dsh-go` packets
+
+- Rewrote `PLAYBOOK.md` for **Claude Code as the default captain** (363 → 208 lines, English): who does what, nine non-negotiables, the captain boundary, and a run loop from "go" to merged.
+- Replaced the old launch material with the exact `dsh-go` command: durable run folder under `~/orchestration-runs/<date-topic>/`, prompt on stdin from a file, `setsid` + `timeout`, the background wait loop on the `done` marker, and `exit=124` meaning timeout. Code/review pair: DeepSeek v4.1 Flash codes, Muse Spark 1.3 reviews (1.2 as fallback). The Claude window (Sonnet codes, Opus reviews) opens only when Radan says so in the current session.
+- Stated that the captain creates the branch and worktree before launch (packets have no git access) and that the captain never edits product code: a defect found in verification is a new packet.
+- Aligned the brief contract: goal with Radan's decision quoted, scope, exact acceptance commands, Secrets block, Writes block, report file inside the worktree's gitignored report dir within 10 minutes, `STATUS DONE`/`STATUS BLOCKED`, realistic time limit, "do it ONCE else BLOCKED". The captain runs `setup_cmd` in the fresh worktree before dispatch, since packets may not install.
+- Moved the §2.6 PR-closure state machine to the optional [`appendix-pr-closure.md`](./appendix-pr-closure.md); the body now carries a **seven-point closure checklist** (CI on the pushed commit, full acceptance gate on that commit, review by another model on that commit, no open blocker, a new commit invalidates review and verification, no deferred blocker, Radan's go).
+- Simplified the ledger to one `ledger.md` per run folder, one line per dispatch (date, task, implementer, reviewer); the detailed JSONL ledger is optional.
+- Added the **situation → skill** table built from the skills actually installed, plus the "no matching skill → work without one, never stop" rule; added the non-code-work rule (two hostile reviews by two different models, verify on the real extracted images) and a "working with Radan" section.
+- Added the known pitfalls: silent timeout, agent loops, agent merge/rebase as a patch, build-rewritten generated files, `pkill`/`pgrep` matching itself, `gh pr merge` from a worktree, session temp folder wiped at close, `"${VAR:?}"`; agent cannot write the run folder (worktree `.reports/`); fresh worktree without `setup_cmd` goes red.
+- Shortened `adapter-template.md` to seven fields (`default_branch`, `setup_cmd`, `test_cmd`, `acceptance_cmd`, `worktree_root`, `report_dir`, `known_quirks`); a missing adapter is created by the captain on first pass, and existing full adapters are patched (stale model/launch lines), not rewritten.
+- Rewrote `captain-packet-template.md` around the `dsh-go` launch shape and the new brief contract; shortened `README.md` in the same spirit.
+- Kept Radan's earlier additions: "keep safe capacity occupied" in the body, and the single canonical `record-verification` gate in the appendix.
+- Removed the obsolete agent-specific material: old CLI launch commands, Hermes paths and the kanban ledger path, the Luna/Sol model-policy exception, and the Caveman/RTK measurements.
+
 ## [0.2.0] - 2026-08-09 — Mechanical PR closure gate
 
 - Added §2.6 PR closure state machine as a mandatory gate: one derived state per PR, exact terminal states (`APPROVED`, `APPROVED_WITH_FOLLOW_UPS`), stale-approval invalidation, design reset, stagnation and infrastructure-retry escalation, and `pr-closure check-transition` as a mandatory precondition before every state-changing closure action.

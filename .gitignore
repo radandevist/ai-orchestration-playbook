@@ -6,3 +6,4 @@ __pycache__/
 
 # Runtime dispatch ledgers (run data, not playbook content)
 orchestration/
+.reports/

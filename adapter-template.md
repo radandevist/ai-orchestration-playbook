@@ -1,91 +1,40 @@
 # Orchestration Adapter
 
 <!--
-  HOW TO USE:
-  1. Copy this file to <repo>/.ai/orchestration-adapter.md and fill EVERY field below.
-  2. Add a one-line pointer under an "AI Orchestration" heading in the repo's AGENTS.md, e.g.:
+  Copy to <repo>/.ai/orchestration-adapter.md and fill every field.
+  Add a one-line pointer to it under an "AI Orchestration" heading in the repo's AGENTS.md:
 
-        ## AI Orchestration
-        Orchestrated multi-task work follows `.ai/orchestration-adapter.md` (binds the AI Orchestration Playbook to this repo).
+      ## AI Orchestration
+      Orchestrated work follows `.ai/orchestration-adapter.md`.
 
-  Field names must match the playbook's §4 contract exactly, including the PR closure fields below
-  (playbook §2.6). Leave no field blank; use `none` where a field genuinely does not apply. Missing
-  closure fields are a preflight STOP for orchestrated PR work. Adapters remain declarative: they
-  name commands and limits; they never reimplement the closure state machine.
+  Short form on purpose: seven fields. Add more only when a run proves it needs them.
 -->
 
-- **default_branch:** `<protected main/integration branch — never pushed/committed directly>`
-- **setup_cmd:** `<fresh-worktree bootstrap command(s): restore/install/sync>`
-- **build_cmd:** `<command that builds the project>`
-- **test_cmd:** `<command(s) to run the relevant tests, incl. filtering syntax if any>`
-- **lint_cmd:** `<lint / type-check / format-check command(s)>`
-- **acceptance_cmd:** `<full post-rebase / pre-merge gate>`
-- **client_regen_cmd:** `<API-client / generated-artifact regen command, or none>`
-- **worktree_root:** `<isolated-worktree path convention, e.g. .worktrees/<short-name>>`
-- **captain_root:** `<absolute parent/coordination directory for one captain, or repo root>`
-- **clone_roots:** `<sibling clone/worktree roots the captain may dispatch into, or none>`
-- **host_parallelism:** `<safe heavy-resource concurrency rule for this repo/host>`
-- **executor:** `<which executor to dispatch + default effort (≤ high)>`
-- **model_ladder:** `<fallback order when the primary model/provider rate-limits or hits quota>`
-- **provider_lanes:** `<approved DeepSeek/OpenAI/local lanes and their default roles; no new Claude model calls>`
-- **hot_backlog:** `<target ready packet count, usually 3-5, plus durable board/packet path if any>`
-- **packet_template:** `<repo-specific template path, or ~/ai-orchestration-playbook/captain-packet-template.md>`
-- **push_guard:** `<actual push/merge enforcement path: hook, CI gate, soft gate, or none>`
-- **known_quirks:** `<HIGHEST-VALUE FIELD: hard-won host/tooling failure modes + their fixes. Add to this whenever a run exposes a new one.>`
-- **additive_merge_files:** `<files whose merge conflicts are resolved additively (keep both sides); anything else → STOP>`
-- **dump_dir:** `<where squash bodies + working artifacts are written>`
-- **issue_hierarchy:** `<epic structure + the sub-issue linking convention/command>`
+- **default_branch:** `<protected branch — never committed or pushed directly>`
+- **setup_cmd:** `<fresh-worktree bootstrap: restore / install / sync>`
+- **test_cmd:** `<targeted tests, with filtering syntax>`
+- **acceptance_cmd:** `<full gate: run after a rebase, before merge>`
+- **worktree_root:** `<where worktrees live, e.g. .worktrees/pr<NUMBER>>`
+- **report_dir:** `<gitignored directory inside the worktree where agent reports are written, e.g. .reports/>`
+- **known_quirks:** `<hard-won failure modes and their fix — the highest-value field; grow it after every run>`
 
-## PR closure fields (playbook §2.6 — mandatory for orchestrated PR work)
+The captain makes sure `report_dir` is gitignored — a report must never reach a commit or a PR.
 
-- **closure_config:** `<absolute path to the machine-readable project-closure-v1.json (schema: tools/schemas/project-closure-v1.json), or none if the repo never opens PRs>`
-- **ci_status_cmd:** `<read current required GitHub checks for the exact pull-request tip, including live baseRefName and potentialMergeCommit; PR closure uses the candidate-tip config source and never a checked-out/default-branch override>`
-- **ci_rerun_cmd:** `<bounded rerun command for proven infrastructure failures, or none>`
-- **local_review_ready_commands:** `<the minimum local gate(s) before an adversarial review may start — exact closure_config key>`
-- **closure_acceptance_commands:** `<the full gate(s) required for approval — exact closure_config key>`
-- **verification_command_timeout_seconds:** `<positive per-command timeout shared by both verification phases — exact closure_config key>`
-- **closure_state_dir:** `<durable absolute project run directory — never /tmp or a session-owned folder — exact closure_config key>`
-- **ci_required_checks:** `<optional exact GitHub check names that are authoritative for CI closure; absent or empty keeps strict all-rollup behavior — exact closure_config key>`
-- **review_schema:** `<supported review-record schema version, currently 1>`
-- **review_publication_cmd:** `<publish a compact review link/summary on the PR, or none>`
-- **follow_up_issue_cmd:** `<create and verify a linked follow-up issue>`
-- **tracking_projection:** `<explicit project-board mapping identifier (e.g. trello:publyapp), or none — exact closure_config key; see the safe projection boundary below>`
-- **projection_adapter:** `<absolute, non-symlink path to the projection executable — harness binding passed to pr-closure sync as --projection-adapter; required only when tracking_projection is non-none>`
-- **infra_retry_budget:** `<maximum automatic reruns of proven infrastructure failures before NEEDS_OWNER — exact closure_config key>`
-- **stagnation_budget_minutes:** `<maximum time without a qualifying progress event before STALLED — exact closure_config key>`
-- **lane_liveness_cmd:** `<output-growth or CPU-time advancement check for lane liveness>`
-- **lane_output_floor:** `<minimum valid result size plus structured-result requirement>`
-- **heavy_job_limit:** `<mechanical concurrency limit for full builds / e2e / API suites — exact closure_config key>`
-- **central_claim_rules:** `<project-specific claims that may never be deferred>`
+## Discovery
 
-The machine-readable `closure_config` carries the mechanically enforced subset with its exact key
-names — `schema_version`, `project`, `repository`, `repo_path`, `default_branch`,
-`closure_state_dir`, `local_review_ready_commands`, `closure_acceptance_commands`,
-`verification_command_timeout_seconds`, `ci_required_checks`,
-`ci_live_pr_checks`, `ci_required_checks_source`, `ci_live_pr_workflow`,
-`infra_retry_budget`, `stagnation_budget_minutes`, `heavy_job_limit`, `tracking_projection` (see
-`tools/schemas/project-closure-v1.json`). The fields above are the declarative project bindings the
-harness resolves against; the gate itself reads only the `closure_config` JSON.
+An agent reads `<repo>/.ai/orchestration-adapter.md` at the start of every run. The one-line pointer in
+`AGENTS.md` is what makes it findable by an agent that does not know the `.ai/` convention.
 
-**CI binding modes.** Either `ci_required_checks_source` and `ci_live_pr_workflow` both carry
-their canonical values (source-bound: CI policy is re-read from `.ai/project-closure-v1.json` at
-the PR candidate tip, which must itself stay source-bound), or both are `null` with empty
-`ci_required_checks` and `ci_live_pr_checks` (generic local mode for unregistered projects whose
-closure config is local-only: no candidate-tip read, and every check in the PR rollup must pass —
-an empty, pending, skipped, or failed rollup is never green). Generic mode is rejected for any
-repository with a registered policy floor (for example `PublyApp/publyapp`).
+## Missing or stale
 
-**Safe tracking-projection boundary.** `tracking_projection` is the explicit board mapping
-identifier (for example `trello:publyapp`) or `none`; it is mapping data passed to the projection
-executable, never an executable itself. When it is non-`none`, the gate requires the separate
-`--projection-adapter /absolute/non-symlink/executable` argument (the adapter doc binds that path in
-`projection_adapter`). The gate invokes that executable as an argv list — never through a shell —
-over a versioned, bounded JSON protocol (deadline and output caps included), passing the mapping as
-`--mapping`. The adapter never emits secrets on stdout. The gate distinguishes dry-run (`sync`
-without `--apply`) from apply (`sync --apply`), and the project board is selected explicitly by the
-mapping, never guessed. For a `trello:*` mapping, every active or newly created delivery card must
-have a detailed description with `Objectif`, `État actuel`, `Périmètre / ce qui change`, `Liens`
-(issue/PR when available), and `Comment tester` with observable steps. The adapter must verify the
-resulting descriptions and return `delivery_cards_complete: true`; otherwise `sync` fails closed.
-This attestation proves only projection completeness, never approval. A projection failure never
-mutates authoritative closure evidence.
+- **Missing adapter:** the captain creates this short file on the first pass, continues, and says so in
+  the report. Never stop for it.
+- **Full adapter already in place:** do not rewrite it. Fix only what went stale — model names, launch
+  lines — and leave the rest.
+
+## Using `pr-closure`
+
+Optional, and only at Radan's request. A project that uses it adds the closure fields documented in
+[`appendix-pr-closure.md`](./appendix-pr-closure.md): `closure_config`, `ci_status_cmd`,
+`local_review_ready_commands`, `closure_acceptance_commands`, `closure_state_dir`, `review_schema`, and
+the rest. A project that never opens PRs answers `none` and needs nothing more.
