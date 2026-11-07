@@ -10,8 +10,8 @@
 |---|---|---|
 | **Owner** | Radan | Scope decisions, the merge go (per PR), the deploy go. |
 | **Captain** | one Claude Code session per board | Decomposing, briefing, dispatching, verifying, reading diffs, all git work (commit, push, PR, rebase/merge, conflicts), the durable record. |
-| **Implementer** | `dsh-go` headless packet — DeepSeek v4.1 Flash | Writing code, running its tests, leaving the changes **uncommitted**, writing a report. |
-| **Reviewer** | `dsh-go` headless packet — Muse Spark 1.3 (1.2 as fallback) | Reading a diff it did not write, returning a verdict with its blocking findings. **Weak model:** its brief MUST follow `~/.claude/skills/agent-brief/brief-strict.md`; no verdict counts without a verdict file and the diff on disk. |
+| **Implementer** | `dsh-go` headless packet — DeepSeek v4.1 Flash two tasks out of three, Muse Spark 1.2/1.3 one task out of three (Owner rule, 2026-11-07) | Writing code, running its tests, leaving the changes **uncommitted**, writing a report. **Muse is a weak model:** its brief MUST follow `~/.claude/skills/agent-brief/brief-strict.md`; give it the smaller, well-bounded task of the three. |
+| **Reviewer** | `dsh-go` headless packet — always DeepSeek v4.1 Flash (Owner rule, 2026-11-07) | Reading a diff, returning a verdict with its blocking findings. A **fresh** session with a hostile brief: it gets the diff and the issue, never the implementer's report or reasoning. No verdict counts without a verdict file and the diff on disk. |
 
 A `dsh-go` packet has **no git access**: it writes files and a report. The captain is the only writer of
 durable state — commits, PRs, ledger, vault, memory.
@@ -23,8 +23,9 @@ durable state — commits, PRs, ledger, vault, memory.
 2. **Never commit or push the default branch.** Every change happens on a feature branch in a worktree.
 3. **Merge only on Radan's explicit go, one PR at a time.** A previous go never covers the next PR;
    deploys are the same.
-4. **Every result is reviewed by a model that did not write it** before integration: DeepSeek codes,
-   Muse reviews; in a Claude window, Sonnet codes and Opus reviews. Findings go back until nothing blocking
+4. **Every result is reviewed by a fresh session that did not write it** before integration: DeepSeek
+   reviews everything, including DeepSeek's own code (new session, hostile brief, no implementer report);
+   in a Claude window, Sonnet codes and Opus reviews. Findings go back until nothing blocking
    is left.
 5. **Every brief is self-contained.** An agent with zero prior context must act correctly from it alone.
 6. **One captain per board.** Speed comes from packets and lanes, not two captains re-reading the same world.
@@ -63,7 +64,8 @@ until [ -f "$R/$X-done" ]; do sleep 60; done; cat "$R/$X-done"
 ```
 
 - Implementer: `go-deepseek-v4.1-flash.yml`, timeout 10800 s (2–4 h for a big task).
-- Reviewer: `go-muse-spark-1.3-contributor.yml` (1.2 if 1.3 is unavailable), timeout 2700 s (~45 min).
+- Implementer, one task in three: `go-muse-spark-1.2-contributor.yml` (1.3 if 1.2 is unavailable), strict brief, ≤ 45 min tasks.
+- Reviewer: `go-deepseek-v4.1-flash.yml`, timeout 2700 s (~45 min).
 - `exit=0` plus a report plus a real diff is a result. `exit=124` means **timeout**: no result, rescue
   the packet (§6). A full answer with `exit=0` but no report is still a failure — read the answer, the
   error log and the report; the exit code alone proves nothing.
@@ -179,7 +181,7 @@ No skill matches? Work without one — **never stop and never ask which skill to
 ## 10 — Non-code work
 
 Videos, Word documents and annotated captures go through their skills (§9), which carry the pipeline and
-the conventions. Common rule: two hostile reviews by two different models (DeepSeek and Muse), and
+the conventions. Common rule: two hostile reviews by two fresh DeepSeek sessions, and
 verification **on the real extracted images** — frames, pages, screenshots — not on the description of
 what should be there.
 
