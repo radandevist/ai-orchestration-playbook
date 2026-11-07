@@ -65,7 +65,7 @@ until [ -f "$R/$X-done" ]; do sleep 60; done; cat "$R/$X-done"
 
 - Implementer: `go-deepseek-v4.1-flash.yml`, timeout 10800 s (2–4 h for a big task).
 - Implementer, one task in three: `go-muse-spark-1.2-contributor.yml` (1.3 if 1.2 is unavailable), strict brief, ≤ 45 min tasks.
-- Reviewer: `go-deepseek-v4.1-flash.yml`, timeout 2700 s (~45 min).
+- Reviewer: `go-deepseek-v4.1-flash-high.yml` (same model, `reasoningEffort: high`, compensates for dropping Muse as reviewer), fresh session, timeout 2700 s (~45 min). Implementers keep the default patch. `xhigh`/`max` only with an escalation reason written in the ledger.
 - `exit=0` plus a report plus a real diff is a result. `exit=124` means **timeout**: no result, rescue
   the packet (§6). A full answer with `exit=0` but no report is still a failure — read the answer, the
   error log and the report; the exit code alone proves nothing.
