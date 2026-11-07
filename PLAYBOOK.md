@@ -69,8 +69,8 @@ Each phase below states a portable **principle**, the **why**, a tagged **exampl
 
 ### 2.3 Dispatch
 
-**Principle.** Run N executors concurrently, each in its **own isolated worktree**, each handed one **self-contained brief** (§3).
-**Why.** Isolation prevents executors from colliding on the working tree; self-contained briefs keep an executor from needing context it doesn't have.
+**Principle.** Run N executors concurrently, each in its **own isolated worktree**, each handed one **self-contained brief** (§3). Keep safe capacity occupied: while a critical implementation, review, CI run, or heavy gate is waiting, dispatch independent read-only preparation, audit, impact-map, backlog, or cleanup packets instead of idling the board.
+**Why.** Isolation prevents executors from colliding on the working tree; self-contained briefs keep an executor from needing context it doesn't have. Serializing one heavy Docker/build/test lane protects the host but must never be misread as serializing lightweight agent work.
 If the run must outlive the current orchestrator session (overnight work, disconnect-prone client, quota-reset wait), make it **durable**: materialize a run directory with prompts, reports, status markers, and a monitor entrypoint, then launch only as many concurrent executors as the adapter says the host can sustain.
 For multi-clone work, start one captain from the adapter `captain_root` (usually the parent directory above sibling clones), keep a hot backlog of 3-5 ready packets, and dispatch bounded one-shot workers into `clone_roots`. Use provider lanes, not free-for-all sessions: each heavy lane takes the next surgical packet that fits its role and current headroom — the DeepSeek V4 Flash implementation lane and the GPT-5.6 Luna `xhigh` independent-review lane for default cross-family work (§2.6; the review `xhigh` is ledgered per §1.5), while the exact owner-authorized OpenAI GPT-5.6 Luna implementer → OpenAI GPT-5.6 Sol reviewer exception requires its exact policy, provenance, and activation evidence; the local lane handles prep, tests, logs, summaries, and mechanical checks. Burst heavy concurrency only when packets are independently briefable (file-disjoint edits, independent review passes, competing design probes, or separated debugging probes).
 **Name each worktree after the pull request it produces, never after the issue** (`pr<NUMBER>`, e.g. `pr994`). One issue routinely spawns several competing implementations, and the moment it does, issue-named directories collide and the human can no longer tell which tree holds which attempt. The PR number is also what a reviewer actually searches for. Because that number does not exist until the branch is pushed, create the worktree under a provisional slug, push and open the PR immediately, then `git worktree move` it onto its `pr<NUMBER>` name — the provisional window is minutes, not days.
@@ -299,6 +299,8 @@ Decomposition, planning, spec review, and routine dispatch use fast/cheap models
 
 ### 5.2 Targeted verification
 Per-task inner loops use focused test runs (targeted files, --last-failed, smoke checks). The full acceptance gate runs once after rebase (rebase can invalidate per-task results). These are sequential gates, not alternatives. Neither skips the other.
+
+When `pr-closure record-verification` executes the configured full acceptance command, it is the single canonical full gate: do not run that same full command manually immediately beforehand. Run focused preflight checks, then invoke `record-verification` directly; duplicating its acceptance command adds latency without adding independent evidence.
 
 ### 5.3 Milestone batching
 Batch low-risk edits into a milestone before running verification, rather than running the full gate after every sub-task.
