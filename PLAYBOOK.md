@@ -135,7 +135,7 @@ stop for it. **Full adapter already there:** don't rewrite it; fix only what wen
 6. **Merge**, only with the go: rebase if needed → full acceptance gate → remove the worktree →
    squash-merge (body file to the run folder) → sync the default branch. Run `gh pr merge` from the clone.
 7. **Rescue** a dead or timed-out packet with a fresh one inheriting its on-disk work, written into the
-   new brief; never finish it by hand.
+   new brief; never finish it by hand. **Minors (Owner rule, 2026-11-08):** a MINOR is dismissed by default, with one line in the review log saying why. Open an issue only when a real user could actually hit it one day. Never open a « follow-ups from review » issue that just collects minors.
 
 ## 7 — Brief contract
 
