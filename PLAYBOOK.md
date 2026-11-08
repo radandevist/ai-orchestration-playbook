@@ -23,10 +23,9 @@ durable state — commits, PRs, ledger, vault, memory.
 2. **Never commit or push the default branch.** Every change happens on a feature branch in a worktree.
 3. **Merge only on Radan's explicit go, one PR at a time.** A previous go never covers the next PR;
    deploys are the same.
-4. **Every result is reviewed by a fresh session that did not write it** before integration: DeepSeek
-   reviews everything, including DeepSeek's own code (new session, hostile brief, no implementer report);
-   in a Claude window, Sonnet codes and Opus reviews. Findings go back until nothing blocking
-   is left.
+4. **Every result is reviewed by TWO fresh sessions that did not write it** before integration (owner,
+   2026-11-08): the next two models of the review rotation, in parallel, hostile brief, no implementer
+   report (see §1 Reviewer row). Findings go back until neither reports a CRITICAL/MAJOR/MEDIUM.
 5. **Every brief is self-contained.** An agent with zero prior context must act correctly from it alone.
 6. **One captain per board.** Speed comes from packets and lanes, not two captains re-reading the same world.
 7. **Dispatch only from a clean, named checkpoint**: committed, or explicitly stashed and described, with
@@ -35,6 +34,13 @@ durable state — commits, PRs, ledger, vault, memory.
 9. **Keep safe capacity occupied.** While a build, a CI run or a long review is in flight, dispatch
    independent read-only work (prep, audit, impact map) instead of idling. Heavy jobs stay serialized —
    one build/e2e suite at a time; CPU and Docker are the limit, not headcount.
+10. **Visual consistency, no concession (owner, 2026-11-08, all products).** The same element kind
+    (skeleton, card, pill, toast, empty state) looks the same on every page: no page-local variant, change
+    the shared component instead. PublyApp and ShopKartOS share one visual language. Every UI brief and
+    every UI review brief carries this line.
+11. **A redesign screen is judged on the screen, not on a score.** Measured fidelity ≥ 97 % counts only if
+    the measurement compares content (a placeholder where the prototype shows data fails), and the captain
+    looks at the side-by-side captures before believing the number (#2339: 96 % measured, screen far off).
 
 ## 3 — Launching an executor
 
