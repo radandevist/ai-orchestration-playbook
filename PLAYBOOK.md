@@ -41,6 +41,10 @@ durable state — commits, PRs, ledger, vault, memory.
 11. **A redesign screen is judged on the screen, not on a score.** Measured fidelity ≥ 97 % counts only if
     the measurement compares content (a placeholder where the prototype shows data fails), and the captain
     looks at the side-by-side captures before believing the number (#2339: 96 % measured, screen far off).
+12. **Composition + Compound Components everywhere (owner, 2026-11-08, PublyApp and ShopKartOS).** UI is
+    composed through `children`; a component with parts is a compound (`Card.Header`, `Card.Body`…,
+    shared state through context); never a growing list of boolean/config props. Every UI brief and UI
+    review brief carries this line.
 
 ## 3 — Launching an executor
 
