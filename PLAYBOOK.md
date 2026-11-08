@@ -24,7 +24,7 @@ durable state — commits, PRs, ledger, vault, memory.
 3. **Merge only on Radan's explicit go, one PR at a time.** A previous go never covers the next PR;
    deploys are the same.
 4. **Every result is reviewed by TWO fresh sessions that did not write it** before integration (owner,
-   2026-11-08): the next two models of the review rotation, in parallel, hostile brief, no implementer
+   2026-11-08): two reviewers from the roster (§1 Reviewer row: mimo + hy4 first), in parallel, hostile brief, no implementer
    report (see §1 Reviewer row). Findings go back until neither reports a CRITICAL/MAJOR/MEDIUM.
 5. **Every brief is self-contained.** An agent with zero prior context must act correctly from it alone.
 6. **One captain per board.** Speed comes from packets and lanes, not two captains re-reading the same world.
