@@ -10,7 +10,7 @@
 |---|---|---|
 | **Owner** | Radan | Scope decisions, the merge go (per PR), the deploy go. |
 | **Captain** | one Claude Code session per board | Decomposing, briefing, dispatching, verifying, reading diffs, all git work (commit, push, PR, rebase/merge, conflicts), the durable record. |
-| **Implementer** | `dsh-go` headless packet — DeepSeek v4.1 Flash two tasks out of three, Muse Spark 1.2/1.3 one task out of three (Owner rule, 2026-11-07) | Writing code, running its tests, leaving the changes **uncommitted**, writing a report. **Muse is a weak model:** its brief MUST follow `~/.claude/skills/agent-brief/brief-strict.md`; give it the smaller, well-bounded task of the three. |
+| **Implementer** | `dsh-go` headless packet — DeepSeek v4.1 Flash two tasks out of three, the third task rotates among MiMo v2.6 Pro/Flash, Qwen 3.7 Plus and GLM 5.3 Flash (Owner rule, 2026-11-08: Muse dropped after stopping 2 times out of 2) | Writing code, running its tests, leaving the changes **uncommitted**, writing a report. **Any model other than DeepSeek is weak until proven:** its brief MUST follow `~/.claude/skills/agent-brief/brief-strict.md`; give it the smaller, well-bounded task of the three. |
 | **Reviewer** | `dsh-go` headless packet — always DeepSeek v4.1 Flash (Owner rule, 2026-11-07) | Reading a diff, returning a verdict with its blocking findings. A **fresh** session with a hostile brief: it gets the diff and the issue, never the implementer's report or reasoning. No verdict counts without a verdict file and the diff on disk. |
 
 A `dsh-go` packet has **no git access**: it writes files and a report. The captain is the only writer of
@@ -64,7 +64,7 @@ until [ -f "$R/$X-done" ]; do sleep 60; done; cat "$R/$X-done"
 ```
 
 - Implementer: `go-deepseek-v4.1-flash.yml`, timeout 10800 s (2–4 h for a big task).
-- Implementer, one task in three: `go-muse-spark-1.2-contributor.yml` (1.3 if 1.2 is unavailable), strict brief, ≤ 45 min tasks.
+- Implementer, one task in three: `go-mimo-v2.6-pro.yml`, `go-mimo-v2.6-flash.yml`, `go-qwen3.7-plus.yml` or `go-glm-5.3-flash.yml` in rotation (declared in `~/.dsh/cordis.patch.yml`), strict brief, ≤ 45 min tasks; record each trial in `agent-brief/modeles.md`; rescue an early stop with DeepSeek.
 - Reviewer: `go-deepseek-v4.1-flash-high.yml` (same model, `reasoningEffort: high`, compensates for dropping Muse as reviewer), fresh session, timeout 2700 s (~45 min). Implementers keep the default patch. `xhigh`/`max` only with an escalation reason written in the ledger.
 - `exit=0` plus a report plus a real diff is a result. `exit=124` means **timeout**: no result, rescue
   the packet (§6). A full answer with `exit=0` but no report is still a failure — read the answer, the
